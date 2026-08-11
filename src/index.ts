@@ -1678,6 +1678,36 @@ async function saveStructuredResultToD1(
   };
 }
 
+async function getActiveUnpaidEventPaymentsForPractice(
+  db: D1Database,
+  practiceDate: string
+): Promise<ParsedPayment[]> {
+  const rows = await db
+    .prepare(
+      `SELECT payment_type, amount, payee, due_date
+       FROM payments
+       WHERE practice_date = ?1
+         AND billing_scope = 'event'
+         AND status = 'unpaid'
+         AND voided_at IS NULL
+       ORDER BY id ASC`
+    )
+    .bind(practiceDate)
+    .all<{
+      payment_type: PaymentType;
+      amount: number | null;
+      payee: string | null;
+      due_date: string | null;
+    }>();
+
+  return (rows.results ?? []).map((row) => ({
+    type: row.payment_type,
+    amount: row.amount,
+    payee: row.payee,
+    due_date: row.due_date
+  }));
+}
+
 function formatStructuredResultForLine(sourceLabel: string, result: StructuredLineResult): string {
   const lines: string[] = [];
 
@@ -2176,7 +2206,22 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       console.error("D1 save failed", { errorType });
     }
 
-    const formatted = formatStructuredResultForLine(sourceLabel, standingApplied.result);
+    let replyResult: StructuredLineResult = standingApplied.result;
+    if (
+      isDispatchOrChangeKind(standingApplied.result.message_kind) &&
+      standingApplied.result.practice_date
+    ) {
+      const activeEventPayments = await getActiveUnpaidEventPaymentsForPractice(
+        env.DB,
+        standingApplied.result.practice_date
+      );
+      replyResult = {
+        ...standingApplied.result,
+        payments: activeEventPayments
+      };
+    }
+
+    const formatted = formatStructuredResultForLine(sourceLabel, replyResult);
     const messages: LineReplyMessage[] = [{ type: "text", text: formatted }];
     if (saveResult.reviewWarnings.length > 0) {
       messages.push({ type: "text", text: saveResult.reviewWarnings[0] });
