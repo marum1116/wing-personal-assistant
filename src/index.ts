@@ -2,6 +2,7 @@ interface Env {
   LINE_CHANNEL_SECRET: string;
   LINE_CHANNEL_ACCESS_TOKEN: string;
   OPENAI_API_KEY: string;
+  DB: D1Database;
   STATE: KVNamespace;
   PAIRING: DurableObjectNamespace;
 }
@@ -72,6 +73,14 @@ type ParsedPayment = {
   amount: number | null;
   payee: string | null;
   due_date: string | null;
+};
+
+type BillingScope = "event" | "monthly" | "other";
+type PaymentDirection = "outbound" | "return" | "none";
+
+type PaymentForStorage = ParsedPayment & {
+  billing_scope: BillingScope;
+  direction: PaymentDirection;
 };
 
 type StructuredLineResult = {
@@ -350,54 +359,82 @@ function formatPaymentLine(payment: ParsedPayment): string {
   return `・${payment.type}（${details.join("、")}）`;
 }
 
-function hasSamePayment(payments: ParsedPayment[], candidate: ParsedPayment): boolean {
-  return payments.some(
-    (payment) =>
-      payment.type === candidate.type &&
-      payment.amount === candidate.amount &&
-      payment.payee === candidate.payee
-  );
+function paymentIdentityKey(payment: Pick<ParsedPayment, "type" | "amount" | "payee">): string {
+  const amount = payment.amount === null ? "null" : String(payment.amount);
+  const payee = payment.payee ?? "null";
+  return `${payment.type}|${amount}|${payee}`;
+}
+
+function buildStandingRuleEventCandidates(result: StructuredLineResult): PaymentForStorage[] {
+  const candidates: PaymentForStorage[] = [];
+  if (result.outbound_transport.type === "車") {
+    candidates.push({
+      type: "車同乗代",
+      amount: 100,
+      payee: result.outbound_transport.person,
+      due_date: null,
+      billing_scope: "event",
+      direction: "outbound"
+    });
+  }
+  if (result.return_transport.type === "車") {
+    candidates.push({
+      type: "車同乗代",
+      amount: 100,
+      payee: result.return_transport.person,
+      due_date: null,
+      billing_scope: "event",
+      direction: "return"
+    });
+  }
+  if (result.return_transport.type === "バス" && result.bus_guide !== null) {
+    candidates.push({
+      type: "バス引率代",
+      amount: 100,
+      payee: result.bus_guide,
+      due_date: null,
+      billing_scope: "event",
+      direction: "return"
+    });
+  }
+  return candidates;
 }
 
 function applyStandingPaymentRules(
   result: StructuredLineResult
 ): { result: StructuredLineResult; addedPaymentCount: number } {
   const mergedPayments = [...result.payments];
+  const existingCounts = new Map<string, number>();
+  for (const payment of mergedPayments) {
+    const key = paymentIdentityKey(payment);
+    existingCounts.set(key, (existingCounts.get(key) ?? 0) + 1);
+  }
+
+  const requiredCandidates = buildStandingRuleEventCandidates(result);
+  const requiredCounts = new Map<string, number>();
+  for (const candidate of requiredCandidates) {
+    const key = paymentIdentityKey(candidate);
+    requiredCounts.set(key, (requiredCounts.get(key) ?? 0) + 1);
+  }
+
   let addedPaymentCount = 0;
-
-  const tryAddPayment = (payment: ParsedPayment): void => {
-    if (hasSamePayment(mergedPayments, payment)) {
-      return;
+  const usedAdditionalCounts = new Map<string, number>();
+  for (const candidate of requiredCandidates) {
+    const key = paymentIdentityKey(candidate);
+    const requiredCount = requiredCounts.get(key) ?? 0;
+    const existingCount = existingCounts.get(key) ?? 0;
+    const currentAdded = usedAdditionalCounts.get(key) ?? 0;
+    if (existingCount + currentAdded >= requiredCount) {
+      continue;
     }
-    mergedPayments.push(payment);
+    mergedPayments.push({
+      type: candidate.type,
+      amount: candidate.amount,
+      payee: candidate.payee,
+      due_date: candidate.due_date
+    });
+    usedAdditionalCounts.set(key, currentAdded + 1);
     addedPaymentCount += 1;
-  };
-
-  if (result.outbound_transport.type === "車") {
-    tryAddPayment({
-      type: "車同乗代",
-      amount: 100,
-      payee: result.outbound_transport.person,
-      due_date: null
-    });
-  }
-
-  if (result.return_transport.type === "車") {
-    tryAddPayment({
-      type: "車同乗代",
-      amount: 100,
-      payee: result.return_transport.person,
-      due_date: null
-    });
-  }
-
-  if (result.return_transport.type === "バス" && result.bus_guide !== null) {
-    tryAddPayment({
-      type: "バス引率代",
-      amount: 100,
-      payee: result.bus_guide,
-      due_date: null
-    });
   }
 
   return {
@@ -406,6 +443,233 @@ function applyStandingPaymentRules(
       payments: mergedPayments
     },
     addedPaymentCount
+  };
+}
+
+function classifyBillingScope(paymentType: PaymentType): BillingScope {
+  switch (paymentType) {
+    case "車同乗代":
+    case "バス引率代":
+      return "event";
+    default:
+      return "other";
+  }
+}
+
+function mapPaymentsForStorage(result: StructuredLineResult): PaymentForStorage[] {
+  const eventCandidateMap = new Map<string, PaymentDirection[]>();
+  for (const candidate of buildStandingRuleEventCandidates(result)) {
+    const key = paymentIdentityKey(candidate);
+    const current = eventCandidateMap.get(key) ?? [];
+    current.push(candidate.direction);
+    eventCandidateMap.set(key, current);
+  }
+
+  return result.payments.map((payment) => {
+    const billing_scope = classifyBillingScope(payment.type);
+    let direction: PaymentDirection = "none";
+
+    if (billing_scope === "event") {
+      const key = paymentIdentityKey(payment);
+      const directions = eventCandidateMap.get(key);
+      if (directions && directions.length > 0) {
+        direction = directions.shift() ?? "none";
+      }
+    }
+
+    return {
+      ...payment,
+      billing_scope,
+      direction
+    };
+  });
+}
+
+function nonUnknownText(newValue: string | null, fallback: string | null): string | null {
+  if (newValue === null) {
+    return fallback;
+  }
+  const trimmed = newValue.trim();
+  if (trimmed.length === 0) {
+    return fallback;
+  }
+  if (trimmed === "不明") {
+    return fallback;
+  }
+  return newValue;
+}
+
+function nonUnknownTransportType(newValue: TransportType, fallback: TransportType): TransportType {
+  if (newValue === "不明") {
+    return fallback;
+  }
+  return newValue;
+}
+
+async function savePracticeToD1(env: Env, sourceLabel: string, result: StructuredLineResult): Promise<boolean> {
+  if (!result.practice_date) {
+    return false;
+  }
+
+  const now = new Date().toISOString();
+  const existing = await env.DB.prepare(
+    `SELECT attendance, outbound_type, outbound_person, return_type, return_person, bus_guide, notes
+     FROM practices
+     WHERE practice_date = ?1`
+  )
+    .bind(result.practice_date)
+    .first<{
+      attendance: Attendance;
+      outbound_type: TransportType;
+      outbound_person: string | null;
+      return_type: TransportType;
+      return_person: string | null;
+      bus_guide: string | null;
+      notes: string | null;
+    }>();
+
+  const attendance =
+    result.attendance !== "不明" ? result.attendance : existing?.attendance ?? result.attendance;
+  const outboundType = nonUnknownTransportType(
+    result.outbound_transport.type,
+    existing?.outbound_type ?? "不明"
+  );
+  const returnType = nonUnknownTransportType(result.return_transport.type, existing?.return_type ?? "不明");
+  const outboundPerson = nonUnknownText(result.outbound_transport.person, existing?.outbound_person ?? null);
+  const returnPerson = nonUnknownText(result.return_transport.person, existing?.return_person ?? null);
+  const busGuide = nonUnknownText(result.bus_guide, existing?.bus_guide ?? null);
+  const notes = nonUnknownText(result.notes, existing?.notes ?? null);
+
+  await env.DB.prepare(
+    `INSERT INTO practices (
+      practice_date,
+      attendance,
+      outbound_type,
+      outbound_person,
+      return_type,
+      return_person,
+      bus_guide,
+      source,
+      notes,
+      created_at,
+      updated_at
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+    ON CONFLICT(practice_date) DO UPDATE SET
+      attendance = excluded.attendance,
+      outbound_type = excluded.outbound_type,
+      outbound_person = excluded.outbound_person,
+      return_type = excluded.return_type,
+      return_person = excluded.return_person,
+      bus_guide = excluded.bus_guide,
+      source = excluded.source,
+      notes = excluded.notes,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      result.practice_date,
+      attendance,
+      outboundType,
+      outboundPerson,
+      returnType,
+      returnPerson,
+      busGuide,
+      sourceLabel,
+      notes,
+      now
+    )
+    .run();
+
+  return true;
+}
+
+async function upsertPaymentToD1(
+  env: Env,
+  practiceDate: string,
+  sourceLabel: string,
+  payment: PaymentForStorage
+): Promise<void> {
+  const now = new Date().toISOString();
+  const existing = await env.DB.prepare(
+    `SELECT id, status
+     FROM payments
+     WHERE practice_date = ?1
+       AND payment_type = ?2
+       AND billing_scope = ?3
+       AND direction = ?4
+       AND ((amount IS NULL AND ?5 IS NULL) OR amount = ?5)
+       AND ((payee IS NULL AND ?6 IS NULL) OR payee = ?6)
+     LIMIT 1`
+  )
+    .bind(
+      practiceDate,
+      payment.type,
+      payment.billing_scope,
+      payment.direction,
+      payment.amount,
+      payment.payee
+    )
+    .first<{ id: number; status: "unpaid" | "paid" }>();
+
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE payments
+       SET due_date = COALESCE(?1, due_date),
+           source = ?2,
+           updated_at = ?3
+       WHERE id = ?4`
+    )
+      .bind(payment.due_date, sourceLabel, now, existing.id)
+      .run();
+    return;
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO payments (
+      practice_date,
+      payment_type,
+      amount,
+      payee,
+      due_date,
+      status,
+      billing_scope,
+      direction,
+      source,
+      created_at,
+      updated_at
+    ) VALUES (?1, ?2, ?3, ?4, ?5, 'unpaid', ?6, ?7, ?8, ?9, ?9)`
+  )
+    .bind(
+      practiceDate,
+      payment.type,
+      payment.amount,
+      payment.payee,
+      payment.due_date,
+      payment.billing_scope,
+      payment.direction,
+      sourceLabel,
+      now
+    )
+    .run();
+}
+
+async function saveStructuredResultToD1(
+  env: Env,
+  sourceLabel: string,
+  result: StructuredLineResult
+): Promise<{ practiceSaved: boolean; paymentCount: number }> {
+  const practiceSaved = await savePracticeToD1(env, sourceLabel, result);
+  if (!result.practice_date) {
+    return { practiceSaved, paymentCount: 0 };
+  }
+
+  const paymentsForStorage = mapPaymentsForStorage(result);
+  for (const payment of paymentsForStorage) {
+    await upsertPaymentToD1(env, result.practice_date, sourceLabel, payment);
+  }
+
+  return {
+    practiceSaved,
+    paymentCount: paymentsForStorage.length
   };
 }
 
@@ -557,13 +821,8 @@ async function callOpenAIForStructuredResult(
 
   try {
     const parsed = JSON.parse(outputText) as StructuredLineResult;
-    const withStandingRules = applyStandingPaymentRules(parsed);
-    console.log({
-      stage: "standing_payment_rules_applied",
-      addedPaymentCount: withStandingRules.addedPaymentCount
-    });
     console.log({ stage: "openai_output_parsed" });
-    return withStandingRules.result;
+    return parsed;
   } catch {
     console.error("OpenAI structured output parse failed");
     throw new Error("openai_output_parse_error");
@@ -719,14 +978,33 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   const sourceLabel = sourceIdToLabel(selectedSourceId);
   try {
     const receivedAtIso = new Date(event.timestamp ?? Date.now()).toISOString();
-    const structured = await callOpenAIForStructuredResult(
+    const parsed = await callOpenAIForStructuredResult(
       inputText,
       sourceLabel,
       receivedAtIso,
       imageDataUrl,
       env
     );
-    const formatted = formatStructuredResultForLine(sourceLabel, structured);
+    const standingApplied = applyStandingPaymentRules(parsed);
+    console.log({
+      stage: "standing_payment_rules_applied",
+      addedPaymentCount: standingApplied.addedPaymentCount
+    });
+
+    console.log({ stage: "d1_save_start" });
+    try {
+      const saveResult = await saveStructuredResultToD1(env, sourceLabel, standingApplied.result);
+      console.log({
+        stage: "d1_save_success",
+        practiceSaved: saveResult.practiceSaved,
+        paymentCount: saveResult.paymentCount
+      });
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "unknown";
+      console.error("D1 save failed", { errorType });
+    }
+
+    const formatted = formatStructuredResultForLine(sourceLabel, standingApplied.result);
     console.log({ stage: "line_reply_start" });
     const lineStatus = await replyMessages(
       event.replyToken,

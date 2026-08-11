@@ -10,6 +10,11 @@ head_sampling_rate = 1
 binding = "STATE"
 id = "c1670557042b4c79bfe975fe00d78fc7"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "wing-personal-assistant"
+database_id = "d3a67bee-7dbf-4375-8b2e-dd4c328b5ee3"
+
 [[durable_objects.bindings]]
 name = "PAIRING"
 class_name = "PairingSession"
