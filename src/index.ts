@@ -324,6 +324,8 @@ async function callOpenAIForStructuredResult(
   receivedAtIso: string,
   env: Env
 ): Promise<StructuredLineResult> {
+  console.log({ stage: "openai_request_start" });
+
   const nowIso = new Date().toISOString();
   const systemPrompt =
     "あなたはLINE本文の情報抽出器です。必ずJSON Schemaに従って厳密なJSONのみを返してください。" +
@@ -387,6 +389,8 @@ async function callOpenAIForStructuredResult(
     throw new Error("openai_api_error");
   }
 
+  console.log({ stage: "openai_request_success", status: response.status });
+
   const apiResponse = (await response.json()) as unknown;
   const outputText = extractResponseText(apiResponse);
   if (!outputText) {
@@ -395,7 +399,9 @@ async function callOpenAIForStructuredResult(
   }
 
   try {
-    return JSON.parse(outputText) as StructuredLineResult;
+    const parsed = JSON.parse(outputText) as StructuredLineResult;
+    console.log({ stage: "openai_output_parsed" });
+    return parsed;
   } catch {
     console.error("OpenAI structured output parse failed");
     throw new Error("openai_output_parse_error");
@@ -406,7 +412,7 @@ async function replyMessages(
   replyToken: string,
   messages: LineReplyMessage[],
   accessToken: string
-): Promise<void> {
+): Promise<number | undefined> {
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
@@ -421,7 +427,10 @@ async function replyMessages(
 
   if (!response.ok) {
     console.error("LINE reply API request failed", { status: response.status });
+    return undefined;
   }
+
+  return response.status;
 }
 
 async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<void> {
@@ -467,13 +476,19 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     return;
   }
 
+  console.log({ stage: "text_received" });
+
   const inputText = event.message.text;
   if (MENU_TRIGGERS.has(inputText)) {
-    await replyMessages(
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
       event.replyToken,
       [buildSourceQuickReply("情報源を選んでください。")],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+    }
     return;
   }
 
@@ -488,12 +503,21 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   }
 
   const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
+  console.log({
+    stage: "source_loaded",
+    hasSelectedSource: typeof selectedSourceId === "string" && selectedSourceId.length > 0
+  });
+
   if (!selectedSourceId || !isSourceId(selectedSourceId)) {
-    await replyMessages(
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
       event.replyToken,
       [buildSourceQuickReply("先に情報源を選んでください。")],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+    }
     return;
   }
 
@@ -502,18 +526,26 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     const receivedAtIso = new Date(event.timestamp ?? Date.now()).toISOString();
     const structured = await callOpenAIForStructuredResult(inputText, sourceLabel, receivedAtIso, env);
     const formatted = formatStructuredResultForLine(sourceLabel, structured);
-    await replyMessages(
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
       event.replyToken,
       [{ type: "text", text: formatted }],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+    }
     return;
   } catch {
-    await replyMessages(
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
       event.replyToken,
       [{ type: "text", text: "解析できませんでした。もう一度送ってください。" }],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+    }
     return;
   }
 
