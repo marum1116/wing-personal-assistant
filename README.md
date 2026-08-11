@@ -38,10 +38,17 @@ curl -X POST http://127.0.0.1:8787/webhook
 
 - `LINE_CHANNEL_SECRET`
 - `LINE_CHANNEL_ACCESS_TOKEN`
+- `OPENAI_API_KEY`
 
 ## 必要なKV binding
 
 - `STATE` (`wing-personal-assistant-state` namespace を割り当てる)
+
+## AI解析について
+
+- 使用モデル: `gpt-5.6-luna`（OpenAI Responses API）
+- 受信したLINE本文は構造化解析してLINEへ返信する
+- 解析結果はこの段階では外部保存せず、返信のみ行う
 
 ローカルでの設定例（値そのものは記載しない）:
 
