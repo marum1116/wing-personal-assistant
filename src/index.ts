@@ -350,6 +350,65 @@ function formatPaymentLine(payment: ParsedPayment): string {
   return `・${payment.type}（${details.join("、")}）`;
 }
 
+function hasSamePayment(payments: ParsedPayment[], candidate: ParsedPayment): boolean {
+  return payments.some(
+    (payment) =>
+      payment.type === candidate.type &&
+      payment.amount === candidate.amount &&
+      payment.payee === candidate.payee
+  );
+}
+
+function applyStandingPaymentRules(
+  result: StructuredLineResult
+): { result: StructuredLineResult; addedPaymentCount: number } {
+  const mergedPayments = [...result.payments];
+  let addedPaymentCount = 0;
+
+  const tryAddPayment = (payment: ParsedPayment): void => {
+    if (hasSamePayment(mergedPayments, payment)) {
+      return;
+    }
+    mergedPayments.push(payment);
+    addedPaymentCount += 1;
+  };
+
+  if (result.outbound_transport.type === "車") {
+    tryAddPayment({
+      type: "車同乗代",
+      amount: 100,
+      payee: result.outbound_transport.person,
+      due_date: null
+    });
+  }
+
+  if (result.return_transport.type === "車") {
+    tryAddPayment({
+      type: "車同乗代",
+      amount: 100,
+      payee: result.return_transport.person,
+      due_date: null
+    });
+  }
+
+  if (result.return_transport.type === "バス" && result.bus_guide !== null) {
+    tryAddPayment({
+      type: "バス引率代",
+      amount: 100,
+      payee: result.bus_guide,
+      due_date: null
+    });
+  }
+
+  return {
+    result: {
+      ...result,
+      payments: mergedPayments
+    },
+    addedPaymentCount
+  };
+}
+
 function formatStructuredResultForLine(sourceLabel: string, result: StructuredLineResult): string {
   const lines: string[] = [];
 
@@ -498,8 +557,13 @@ async function callOpenAIForStructuredResult(
 
   try {
     const parsed = JSON.parse(outputText) as StructuredLineResult;
+    const withStandingRules = applyStandingPaymentRules(parsed);
+    console.log({
+      stage: "standing_payment_rules_applied",
+      addedPaymentCount: withStandingRules.addedPaymentCount
+    });
     console.log({ stage: "openai_output_parsed" });
-    return parsed;
+    return withStandingRules.result;
   } catch {
     console.error("OpenAI structured output parse failed");
     throw new Error("openai_output_parse_error");
