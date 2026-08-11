@@ -258,21 +258,35 @@ function transportToLineLabel(transport: ParsedTransport): string {
 }
 
 function formatPaymentLine(payment: ParsedPayment): string {
-  const amount = typeof payment.amount === "number" ? `${payment.amount}円` : "金額不明";
-  const payee = payment.payee ?? "不明";
-  const dueDate = payment.due_date ?? "不明";
-  return `・${payment.type} ${amount}（支払先：${payee}、期限：${dueDate}）`;
+  const details: string[] = [];
+  if (typeof payment.amount === "number") {
+    details.push(`${payment.amount}円`);
+  }
+  if (payment.payee) {
+    details.push(`支払先：${payment.payee}`);
+  }
+  if (payment.due_date) {
+    details.push(`期限：${payment.due_date}`);
+  }
+  if (details.length === 0) {
+    return `・${payment.type}`;
+  }
+  return `・${payment.type}（${details.join("、")}）`;
 }
 
 function formatStructuredResultForLine(sourceLabel: string, result: StructuredLineResult): string {
   const lines: string[] = [];
 
   lines.push("読み取り結果", "", `情報源：${sourceLabel}`);
-  lines.push(`対象日：${result.practice_date ?? "不明"}`);
+  if (result.practice_date) {
+    lines.push(`対象日：${result.practice_date}`);
+  }
   lines.push(`参加：${result.attendance}`);
   lines.push(`行き：${transportToLineLabel(result.outbound_transport)}`);
   lines.push(`帰り：${transportToLineLabel(result.return_transport)}`);
-  lines.push(`バス引率：${result.bus_guide ?? "なし"}`);
+  if (result.bus_guide) {
+    lines.push(`バス引率：${result.bus_guide}`);
+  }
   lines.push("");
 
   if (result.payments.length === 0) {
