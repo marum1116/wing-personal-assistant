@@ -119,6 +119,34 @@ type ReminderPaymentRow = {
   reminder_sent_on: string | null;
 };
 
+type PracticeTypeBasis = "explicit" | "weekday_default" | "unknown";
+
+type PracticeRow = {
+  practice_date: string;
+  attendance: Attendance;
+  outbound_type: TransportType;
+  outbound_person: string | null;
+  return_type: TransportType;
+  return_person: string | null;
+  bus_guide: string | null;
+  source: string;
+  notes: string | null;
+  practice_type: PracticeType | null;
+  practice_type_basis: PracticeTypeBasis | null;
+  practice_type_priority: number | null;
+  attendance_priority: number | null;
+  outbound_priority: number | null;
+  return_priority: number | null;
+  bus_guide_priority: number | null;
+  last_message_kind: MessageKind | null;
+};
+
+type SaveStructuredResultOutcome = {
+  practiceSaved: boolean;
+  paymentCount: number;
+  reviewWarnings: string[];
+};
+
 type StructuredLineResult = {
   message_kind: MessageKind;
   practice_type: PracticeType;
@@ -455,11 +483,46 @@ function inferPracticeTypeByWeekday(practiceDate: string | null): PracticeType {
   return "不明";
 }
 
-function resolvePracticeType(result: StructuredLineResult): PracticeType {
+function resolvePracticeType(result: StructuredLineResult): {
+  practiceType: PracticeType;
+  basis: PracticeTypeBasis;
+  priority: number;
+} {
   if (result.practice_type !== "不明") {
-    return result.practice_type;
+    return {
+      practiceType: result.practice_type,
+      basis: "explicit",
+      priority: 1000
+    };
   }
-  return inferPracticeTypeByWeekday(result.practice_date);
+  const inferred = inferPracticeTypeByWeekday(result.practice_date);
+  if (inferred !== "不明") {
+    return {
+      practiceType: inferred,
+      basis: "weekday_default",
+      priority: 100
+    };
+  }
+  return {
+    practiceType: "不明",
+    basis: "unknown",
+    priority: 0
+  };
+}
+
+function messagePriority(messageKind: MessageKind): number {
+  switch (messageKind) {
+    case "same_day_change":
+      return 400;
+    case "dispatch_confirmed":
+      return 300;
+    case "schedule":
+      return 200;
+    case "dispatch_candidate":
+      return 100;
+    default:
+      return 0;
+  }
 }
 
 function shouldDropAiPayments(messageKind: MessageKind): boolean {
@@ -520,8 +583,15 @@ function buildStandingRuleEventCandidates(
 
 function applyStandingPaymentRules(
   result: StructuredLineResult
-): { result: StructuredLineResult; addedPaymentCount: number; resolvedPracticeType: PracticeType } {
-  const resolvedPracticeType = resolvePracticeType(result);
+): {
+  result: StructuredLineResult;
+  addedPaymentCount: number;
+  resolvedPracticeType: PracticeType;
+  practiceTypeBasis: PracticeTypeBasis;
+  practiceTypePriority: number;
+} {
+  const resolvedPractice = resolvePracticeType(result);
+  const resolvedPracticeType = resolvedPractice.practiceType;
   const basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
   const mergedPayments = [...basePayments];
   const existingCounts = new Map<string, number>();
@@ -564,7 +634,9 @@ function applyStandingPaymentRules(
       payments: mergedPayments
     },
     addedPaymentCount,
-    resolvedPracticeType
+    resolvedPracticeType,
+    practiceTypeBasis: resolvedPractice.basis,
+    practiceTypePriority: resolvedPractice.priority
   };
 }
 
@@ -580,7 +652,7 @@ function classifyBillingScope(paymentType: PaymentType): BillingScope {
 
 function mapPaymentsForStorage(result: StructuredLineResult): PaymentForStorage[] {
   const eventCandidateMap = new Map<string, PaymentDirection[]>();
-  const resolvedPracticeType = resolvePracticeType(result);
+  const resolvedPracticeType = resolvePracticeType(result).practiceType;
   for (const candidate of buildStandingRuleEventCandidates(result, resolvedPracticeType)) {
     const key = paymentIdentityKey(candidate);
     const current = eventCandidateMap.get(key) ?? [];
@@ -756,9 +828,11 @@ async function getUnpaidPayments(
   db: D1Database,
   limit: number
 ): Promise<{ totalCount: number; payments: UnpaidPaymentRow[] }> {
-  const totalRow = await db.prepare("SELECT COUNT(*) AS count FROM payments WHERE status = 'unpaid'").first<{
-    count: number;
-  }>();
+  const totalRow = await db
+    .prepare("SELECT COUNT(*) AS count FROM payments WHERE status = 'unpaid' AND voided_at IS NULL")
+    .first<{
+      count: number;
+    }>();
   const totalCount = Number(totalRow?.count ?? 0);
 
   const paymentsResult = await db
@@ -766,6 +840,7 @@ async function getUnpaidPayments(
       `SELECT id, practice_date, payment_type, amount, payee, due_date, status
        FROM payments
        WHERE status = 'unpaid'
+         AND voided_at IS NULL
        ORDER BY (due_date IS NULL) ASC, due_date ASC, practice_date ASC, id ASC
        LIMIT ?1`
     )
@@ -781,7 +856,7 @@ async function getUnpaidPayments(
 async function markPaymentPaid(
   db: D1Database,
   paymentId: number
-): Promise<{ outcome: "updated" | "already_paid" | "not_found"; payment?: UnpaidPaymentRow }> {
+): Promise<{ outcome: "updated" | "already_paid" | "not_found" | "voided"; payment?: UnpaidPaymentRow }> {
   const payment = await db
     .prepare(
       `SELECT id, practice_date, payment_type, amount, payee, due_date, status
@@ -800,6 +875,19 @@ async function markPaymentPaid(
     return { outcome: "already_paid", payment };
   }
 
+  const voidedRow = await db
+    .prepare(
+      `SELECT voided_at
+       FROM payments
+       WHERE id = ?1
+       LIMIT 1`
+    )
+    .bind(paymentId)
+    .first<{ voided_at: string | null }>();
+  if (voidedRow && voidedRow.voided_at !== null) {
+    return { outcome: "voided", payment };
+  }
+
   const now = new Date().toISOString();
   const updateResult = await db
     .prepare(
@@ -807,7 +895,8 @@ async function markPaymentPaid(
        SET status = 'paid',
            updated_at = ?1
        WHERE id = ?2
-         AND status = 'unpaid'`
+         AND status = 'unpaid'
+         AND voided_at IS NULL`
     )
     .bind(now, paymentId)
     .run();
@@ -835,6 +924,19 @@ async function markPaymentPaid(
     return { outcome: "already_paid", payment: current };
   }
 
+  const currentVoided = await db
+    .prepare(
+      `SELECT voided_at
+       FROM payments
+       WHERE id = ?1
+       LIMIT 1`
+    )
+    .bind(paymentId)
+    .first<{ voided_at: string | null }>();
+  if (currentVoided && currentVoided.voided_at !== null) {
+    return { outcome: "voided", payment: current };
+  }
+
   return { outcome: "not_found" };
 }
 
@@ -848,6 +950,7 @@ async function getReminderTargets(
       `SELECT id, practice_date, payment_type, amount, payee, due_date, status, reminder_sent_on
        FROM payments
        WHERE status = 'unpaid'
+         AND voided_at IS NULL
          AND (
            (due_date IS NOT NULL AND due_date = ?1)
            OR
@@ -880,6 +983,7 @@ async function markReminderSentOn(
              updated_at = ?2
          WHERE id = ?3
            AND status = 'unpaid'
+           AND voided_at IS NULL
            AND (reminder_sent_on IS NULL OR reminder_sent_on <> ?1)`
       )
       .bind(todayJst, now, paymentId)
@@ -972,60 +1076,174 @@ async function handlePaymentReminderScheduled(
   console.log({ stage: "payment_reminder_marked_sent", updatedCount });
 }
 
-function nonUnknownText(newValue: string | null, fallback: string | null): string | null {
-  if (newValue === null) {
-    return fallback;
-  }
-  const trimmed = newValue.trim();
-  if (trimmed.length === 0) {
-    return fallback;
-  }
-  if (trimmed === "不明") {
-    return fallback;
-  }
-  return newValue;
-}
-
-function nonUnknownTransportType(newValue: TransportType, fallback: TransportType): TransportType {
-  if (newValue === "不明") {
-    return fallback;
-  }
-  return newValue;
-}
-
-async function savePracticeToD1(env: Env, sourceLabel: string, result: StructuredLineResult): Promise<boolean> {
-  if (!result.practice_date) {
+function isConcreteText(value: string | null): value is string {
+  if (value === null) {
     return false;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed !== "不明";
+}
+
+function isConcreteTransportType(value: TransportType): boolean {
+  return value !== "不明";
+}
+
+function isDispatchOrChangeKind(messageKind: MessageKind): boolean {
+  return messageKind === "dispatch_confirmed" || messageKind === "same_day_change";
+}
+
+function formatPaymentSummaryLine(payment: {
+  practice_date: string;
+  payment_type: string;
+  amount: number | null;
+  payee: string | null;
+}): string {
+  const amountPart = typeof payment.amount === "number" ? `${payment.amount}円` : "金額不明";
+  const payeePart = payment.payee ? `${payment.payee} ` : "";
+  return `${formatDateForLine(payment.practice_date)} ${payeePart}${payment.payment_type}${amountPart}`;
+}
+
+function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResult {
+  return {
+    message_kind: "dispatch_confirmed",
+    practice_type: practice.practice_type ?? "不明",
+    practice_date: practice.practice_date,
+    attendance: practice.attendance,
+    outbound_transport: {
+      type: practice.outbound_type,
+      person: practice.outbound_person
+    },
+    return_transport: {
+      type: practice.return_type,
+      person: practice.return_person
+    },
+    bus_guide: practice.bus_guide,
+    payments: [],
+    notes: practice.notes,
+    needs_confirmation: false,
+    uncertain_points: []
+  };
+}
+
+async function getPracticeByDate(db: D1Database, practiceDate: string): Promise<PracticeRow | null> {
+  const row = await db
+    .prepare(
+      `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide, source, notes,
+              practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
+              bus_guide_priority, last_message_kind
+       FROM practices
+       WHERE practice_date = ?1
+       LIMIT 1`
+    )
+    .bind(practiceDate)
+    .first<PracticeRow>();
+  return row ?? null;
+}
+
+async function savePracticeToD1(
+  env: Env,
+  sourceLabel: string,
+  result: StructuredLineResult,
+  practiceTypeBasis: PracticeTypeBasis,
+  practiceTypePriority: number
+): Promise<{
+  practiceSaved: boolean;
+  shouldReconcileEventPayments: boolean;
+  messagePriorityValue: number;
+}> {
+  if (!result.practice_date) {
+    return { practiceSaved: false, shouldReconcileEventPayments: false, messagePriorityValue: 0 };
   }
 
   const now = new Date().toISOString();
-  const existing = await env.DB.prepare(
-    `SELECT attendance, outbound_type, outbound_person, return_type, return_person, bus_guide, notes
-     FROM practices
-     WHERE practice_date = ?1`
-  )
-    .bind(result.practice_date)
-    .first<{
-      attendance: Attendance;
-      outbound_type: TransportType;
-      outbound_person: string | null;
-      return_type: TransportType;
-      return_person: string | null;
-      bus_guide: string | null;
-      notes: string | null;
-    }>();
+  const messagePriorityValue = messagePriority(result.message_kind);
+  const existing = await getPracticeByDate(env.DB, result.practice_date);
+  const fallback: PracticeRow = existing ?? {
+    practice_date: result.practice_date,
+    attendance: "不明",
+    outbound_type: "不明",
+    outbound_person: null,
+    return_type: "不明",
+    return_person: null,
+    bus_guide: null,
+    source: sourceLabel,
+    notes: null,
+    practice_type: "不明",
+    practice_type_basis: "unknown",
+    practice_type_priority: 0,
+    attendance_priority: 0,
+    outbound_priority: 0,
+    return_priority: 0,
+    bus_guide_priority: 0,
+    last_message_kind: null
+  };
 
-  const attendance =
-    result.attendance !== "不明" ? result.attendance : existing?.attendance ?? result.attendance;
-  const outboundType = nonUnknownTransportType(
-    result.outbound_transport.type,
-    existing?.outbound_type ?? "不明"
-  );
-  const returnType = nonUnknownTransportType(result.return_transport.type, existing?.return_type ?? "不明");
-  const outboundPerson = nonUnknownText(result.outbound_transport.person, existing?.outbound_person ?? null);
-  const returnPerson = nonUnknownText(result.return_transport.person, existing?.return_person ?? null);
-  const busGuide = nonUnknownText(result.bus_guide, existing?.bus_guide ?? null);
-  const notes = nonUnknownText(result.notes, existing?.notes ?? null);
+  let attendance = fallback.attendance;
+  let attendancePriority = fallback.attendance_priority ?? 0;
+  let outboundType = fallback.outbound_type;
+  let outboundPerson = fallback.outbound_person;
+  let outboundPriority = fallback.outbound_priority ?? 0;
+  let returnType = fallback.return_type;
+  let returnPerson = fallback.return_person;
+  let returnPriority = fallback.return_priority ?? 0;
+  let busGuide = fallback.bus_guide;
+  let busGuidePriority = fallback.bus_guide_priority ?? 0;
+  let notes = fallback.notes;
+  let practiceType = fallback.practice_type ?? "不明";
+  let storedPracticeTypeBasis = fallback.practice_type_basis ?? "unknown";
+  let storedPracticeTypePriority = fallback.practice_type_priority ?? 0;
+
+  let shouldReconcileEventPayments = false;
+
+  if (
+    (result.attendance === "参加" || result.attendance === "不参加") &&
+    messagePriorityValue >= attendancePriority
+  ) {
+    attendance = result.attendance;
+    attendancePriority = messagePriorityValue;
+    shouldReconcileEventPayments = true;
+  }
+
+  if (isConcreteTransportType(result.outbound_transport.type) && messagePriorityValue >= outboundPriority) {
+    outboundType = result.outbound_transport.type;
+    outboundPerson = isConcreteText(result.outbound_transport.person) ? result.outbound_transport.person : null;
+    outboundPriority = messagePriorityValue;
+    shouldReconcileEventPayments = true;
+  }
+
+  let returnUpdated = false;
+  if (isConcreteTransportType(result.return_transport.type) && messagePriorityValue >= returnPriority) {
+    returnType = result.return_transport.type;
+    returnPerson = isConcreteText(result.return_transport.person) ? result.return_transport.person : null;
+    returnPriority = messagePriorityValue;
+    returnUpdated = true;
+    shouldReconcileEventPayments = true;
+  }
+
+  if (returnUpdated) {
+    if (returnType === "バス" && isConcreteText(result.bus_guide)) {
+      busGuide = result.bus_guide;
+      busGuidePriority = messagePriorityValue;
+    } else {
+      busGuide = null;
+      busGuidePriority = messagePriorityValue;
+    }
+  } else if (isConcreteText(result.bus_guide) && messagePriorityValue >= busGuidePriority) {
+    busGuide = result.bus_guide;
+    busGuidePriority = messagePriorityValue;
+    shouldReconcileEventPayments = true;
+  }
+
+  if (isConcreteText(result.notes)) {
+    notes = result.notes;
+  }
+
+  if (practiceTypePriority >= storedPracticeTypePriority) {
+    practiceType = result.practice_type;
+    storedPracticeTypeBasis = practiceTypeBasis;
+    storedPracticeTypePriority = practiceTypePriority;
+    shouldReconcileEventPayments = true;
+  }
 
   await env.DB.prepare(
     `INSERT INTO practices (
@@ -1038,9 +1256,17 @@ async function savePracticeToD1(env: Env, sourceLabel: string, result: Structure
       bus_guide,
       source,
       notes,
+      practice_type,
+      practice_type_basis,
+      practice_type_priority,
+      attendance_priority,
+      outbound_priority,
+      return_priority,
+      bus_guide_priority,
+      last_message_kind,
       created_at,
       updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
     ON CONFLICT(practice_date) DO UPDATE SET
       attendance = excluded.attendance,
       outbound_type = excluded.outbound_type,
@@ -1050,6 +1276,14 @@ async function savePracticeToD1(env: Env, sourceLabel: string, result: Structure
       bus_guide = excluded.bus_guide,
       source = excluded.source,
       notes = excluded.notes,
+      practice_type = excluded.practice_type,
+      practice_type_basis = excluded.practice_type_basis,
+      practice_type_priority = excluded.practice_type_priority,
+      attendance_priority = excluded.attendance_priority,
+      outbound_priority = excluded.outbound_priority,
+      return_priority = excluded.return_priority,
+      bus_guide_priority = excluded.bus_guide_priority,
+      last_message_kind = excluded.last_message_kind,
       updated_at = excluded.updated_at`
   )
     .bind(
@@ -1062,14 +1296,270 @@ async function savePracticeToD1(env: Env, sourceLabel: string, result: Structure
       busGuide,
       sourceLabel,
       notes,
+      practiceType,
+      storedPracticeTypeBasis,
+      storedPracticeTypePriority,
+      attendancePriority,
+      outboundPriority,
+      returnPriority,
+      busGuidePriority,
+      result.message_kind,
       now
     )
     .run();
 
-  return true;
+  return {
+    practiceSaved: true,
+    shouldReconcileEventPayments: shouldReconcileEventPayments && isDispatchOrChangeKind(result.message_kind),
+    messagePriorityValue
+  };
 }
 
-async function upsertPaymentToD1(
+function buildExpectedEventPayments(practice: PracticeRow): PaymentForStorage[] {
+  return buildStandingRuleEventCandidates(
+    toPracticeRowForCalculation(practice),
+    practice.practice_type ?? "不明"
+  );
+}
+
+function paymentMatchesExpected(
+  payment: {
+    payment_type: string;
+    amount: number | null;
+    payee: string | null;
+    direction: PaymentDirection;
+    rule_key: string | null;
+  },
+  expected: PaymentForStorage & { rule_key: string }
+): boolean {
+  return (
+    payment.payment_type === expected.type &&
+    payment.amount === expected.amount &&
+    payment.payee === expected.payee &&
+    payment.direction === expected.direction &&
+    payment.rule_key === expected.rule_key
+  );
+}
+
+function eventRuleKey(direction: PaymentDirection, paymentType: PaymentType): string | null {
+  if (paymentType === "車同乗代" && direction === "outbound") {
+    return "transport:outbound:car";
+  }
+  if (paymentType === "車同乗代" && direction === "return") {
+    return "transport:return:car";
+  }
+  if (paymentType === "バス引率代" && direction === "return") {
+    return "transport:return:bus";
+  }
+  return null;
+}
+
+async function reconcileEventPayments(
+  env: Env,
+  practice: PracticeRow,
+  sourceLabel: string
+): Promise<{ paymentCount: number; reviewWarnings: string[] }> {
+  const now = new Date().toISOString();
+  const expected = buildExpectedEventPayments(practice).map((payment) => ({
+    ...payment,
+    rule_key: eventRuleKey(payment.direction, payment.type)
+  }));
+
+  const existingRows = await env.DB
+    .prepare(
+      `SELECT id, payment_type, amount, payee, due_date, status, direction, rule_key, voided_at, needs_review
+       FROM payments
+       WHERE practice_date = ?1
+         AND billing_scope = 'event'
+         AND (
+           rule_key IN ('transport:outbound:car', 'transport:return:car', 'transport:return:bus')
+           OR
+           (rule_key IS NULL AND payment_type IN ('車同乗代', 'バス引率代'))
+         )
+       ORDER BY id ASC`
+    )
+    .bind(practice.practice_date)
+    .all<{
+      id: number;
+      payment_type: PaymentType;
+      amount: number | null;
+      payee: string | null;
+      due_date: string | null;
+      status: PaymentStatus;
+      direction: PaymentDirection;
+      rule_key: string | null;
+      voided_at: string | null;
+      needs_review: number;
+    }>();
+
+  const existing = existingRows.results ?? [];
+  const matchedIds = new Set<number>();
+  const reviewWarnings: string[] = [];
+
+  for (const expectedPayment of expected) {
+    if (!expectedPayment.rule_key) {
+      continue;
+    }
+    const expectedWithRuleKey = {
+      ...expectedPayment,
+      rule_key: expectedPayment.rule_key
+    };
+
+    const activeMatch = existing.find(
+      (row) => row.voided_at === null && paymentMatchesExpected(row, expectedWithRuleKey)
+    );
+    if (activeMatch) {
+      matchedIds.add(activeMatch.id);
+      if (activeMatch.needs_review === 1) {
+        await env.DB.prepare(
+          `UPDATE payments
+           SET needs_review = 0,
+               review_reason = NULL,
+               updated_at = ?1
+           WHERE id = ?2`
+        )
+          .bind(now, activeMatch.id)
+          .run();
+      }
+      continue;
+    }
+
+    const voidedReusable = existing.find(
+      (row) =>
+        row.status === "unpaid" &&
+        row.voided_at !== null &&
+        paymentMatchesExpected(row, expectedWithRuleKey)
+    );
+    if (voidedReusable) {
+      matchedIds.add(voidedReusable.id);
+      await env.DB.prepare(
+        `UPDATE payments
+         SET voided_at = NULL,
+             needs_review = 0,
+             review_reason = NULL,
+             source = ?1,
+             updated_at = ?2
+         WHERE id = ?3`
+      )
+        .bind(sourceLabel, now, voidedReusable.id)
+        .run();
+      continue;
+    }
+
+    const insertResult = await env.DB.prepare(
+      `INSERT OR IGNORE INTO payments (
+        practice_date,
+        payment_type,
+        amount,
+        payee,
+        due_date,
+        status,
+        billing_scope,
+        direction,
+        rule_key,
+        source,
+        created_at,
+        updated_at,
+        needs_review
+      ) VALUES (?1, ?2, ?3, ?4, NULL, 'unpaid', 'event', ?5, ?6, ?7, ?8, ?8, 0)`
+    )
+      .bind(
+        practice.practice_date,
+        expectedPayment.type,
+        expectedPayment.amount,
+        expectedPayment.payee,
+        expectedPayment.direction,
+        expectedPayment.rule_key,
+        sourceLabel,
+        now
+      )
+      .run();
+
+    if (Number(insertResult.meta.changes ?? 0) > 0) {
+      const inserted = await env.DB.prepare(
+        `SELECT id FROM payments
+         WHERE practice_date = ?1
+           AND payment_type = ?2
+           AND direction = ?3
+           AND rule_key = ?4
+           AND ((amount IS NULL AND ?5 IS NULL) OR amount = ?5)
+           AND ((payee IS NULL AND ?6 IS NULL) OR payee = ?6)
+         ORDER BY id DESC
+         LIMIT 1`
+      )
+        .bind(
+          practice.practice_date,
+          expectedWithRuleKey.type,
+          expectedWithRuleKey.direction,
+          expectedWithRuleKey.rule_key,
+          expectedWithRuleKey.amount,
+          expectedWithRuleKey.payee
+        )
+        .first<{ id: number }>();
+      if (inserted) {
+        matchedIds.add(inserted.id);
+      }
+    }
+  }
+
+  for (const row of existing) {
+    if (matchedIds.has(row.id) || row.voided_at !== null) {
+      continue;
+    }
+
+    if (row.status === "unpaid") {
+      await env.DB.prepare(
+        `UPDATE payments
+         SET voided_at = ?1,
+             updated_at = ?1
+         WHERE id = ?2
+           AND status = 'unpaid'
+           AND voided_at IS NULL`
+      )
+        .bind(now, row.id)
+        .run();
+      continue;
+    }
+
+    if (row.status === "paid") {
+      const reason = "最新の配車と支払済み内容が一致しません";
+      await env.DB.prepare(
+        `UPDATE payments
+         SET needs_review = 1,
+             review_reason = ?1,
+             updated_at = ?2
+         WHERE id = ?3`
+      )
+        .bind(reason, now, row.id)
+        .run();
+      reviewWarnings.push(
+        `⚠️ 支払いの確認が必要です\nすでに支払済みの「${formatPaymentSummaryLine({
+          practice_date: practice.practice_date,
+          payment_type: row.payment_type,
+          amount: row.amount,
+          payee: row.payee
+        })}」と、最新の配車内容が一致していません。`
+      );
+    }
+  }
+
+  const paymentCountRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM payments
+     WHERE practice_date = ?1
+       AND billing_scope = 'event'
+       AND voided_at IS NULL`
+  )
+    .bind(practice.practice_date)
+    .first<{ count: number }>();
+
+  return {
+    paymentCount: Number(paymentCountRow?.count ?? 0),
+    reviewWarnings
+  };
+}
+
+async function upsertNonEventPaymentToD1(
   env: Env,
   practiceDate: string,
   sourceLabel: string,
@@ -1077,7 +1567,7 @@ async function upsertPaymentToD1(
 ): Promise<void> {
   const now = new Date().toISOString();
   const existing = await env.DB.prepare(
-    `SELECT id, status
+    `SELECT id
      FROM payments
      WHERE practice_date = ?1
        AND payment_type = ?2
@@ -1095,7 +1585,7 @@ async function upsertPaymentToD1(
       payment.amount,
       payment.payee
     )
-    .first<{ id: number; status: "unpaid" | "paid" }>();
+    .first<{ id: number }>();
 
   if (existing) {
     await env.DB.prepare(
@@ -1142,21 +1632,49 @@ async function upsertPaymentToD1(
 async function saveStructuredResultToD1(
   env: Env,
   sourceLabel: string,
-  result: StructuredLineResult
-): Promise<{ practiceSaved: boolean; paymentCount: number }> {
-  const practiceSaved = await savePracticeToD1(env, sourceLabel, result);
+  result: StructuredLineResult,
+  practiceTypeBasis: PracticeTypeBasis,
+  practiceTypePriority: number
+): Promise<SaveStructuredResultOutcome> {
+  const practiceSave = await savePracticeToD1(env, sourceLabel, result, practiceTypeBasis, practiceTypePriority);
   if (!result.practice_date) {
-    return { practiceSaved, paymentCount: 0 };
+    return { practiceSaved: practiceSave.practiceSaved, paymentCount: 0, reviewWarnings: [] };
+  }
+
+  const latestPractice = await getPracticeByDate(env.DB, result.practice_date);
+  if (!latestPractice) {
+    return { practiceSaved: practiceSave.practiceSaved, paymentCount: 0, reviewWarnings: [] };
   }
 
   const paymentsForStorage = mapPaymentsForStorage(result);
-  for (const payment of paymentsForStorage) {
-    await upsertPaymentToD1(env, result.practice_date, sourceLabel, payment);
+  const paymentsToUpsert = isDispatchOrChangeKind(result.message_kind)
+    ? paymentsForStorage.filter((payment) => payment.billing_scope !== "event")
+    : paymentsForStorage;
+  for (const payment of paymentsToUpsert) {
+    await upsertNonEventPaymentToD1(env, result.practice_date, sourceLabel, payment);
   }
 
+  if (!practiceSave.shouldReconcileEventPayments) {
+    const paymentCountRow = await env.DB.prepare(
+      `SELECT COUNT(*) AS count
+       FROM payments
+       WHERE practice_date = ?1
+         AND voided_at IS NULL`
+    )
+      .bind(result.practice_date)
+      .first<{ count: number }>();
+    return {
+      practiceSaved: practiceSave.practiceSaved,
+      paymentCount: Number(paymentCountRow?.count ?? 0),
+      reviewWarnings: []
+    };
+  }
+
+  const reconciliation = await reconcileEventPayments(env, latestPractice, sourceLabel);
   return {
-    practiceSaved,
-    paymentCount: paymentsForStorage.length
+    practiceSaved: practiceSave.practiceSaved,
+    paymentCount: reconciliation.paymentCount,
+    reviewWarnings: reconciliation.reviewWarnings
   };
 }
 
@@ -1415,6 +1933,20 @@ async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, payment
     return;
   }
 
+  if (markResult.outcome === "voided") {
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "この支払いは現在の配車では不要になっています。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
   if (markResult.outcome === "already_paid") {
     console.log({ stage: "unpaid_list_start" });
     const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
@@ -1621,8 +2153,19 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     });
 
     console.log({ stage: "d1_save_start" });
+    let saveResult: SaveStructuredResultOutcome = {
+      practiceSaved: false,
+      paymentCount: 0,
+      reviewWarnings: []
+    };
     try {
-      const saveResult = await saveStructuredResultToD1(env, sourceLabel, standingApplied.result);
+      saveResult = await saveStructuredResultToD1(
+        env,
+        sourceLabel,
+        standingApplied.result,
+        standingApplied.practiceTypeBasis,
+        standingApplied.practiceTypePriority
+      );
       console.log({
         stage: "d1_save_success",
         practiceSaved: saveResult.practiceSaved,
@@ -1634,10 +2177,14 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     }
 
     const formatted = formatStructuredResultForLine(sourceLabel, standingApplied.result);
+    const messages: LineReplyMessage[] = [{ type: "text", text: formatted }];
+    if (saveResult.reviewWarnings.length > 0) {
+      messages.push({ type: "text", text: saveResult.reviewWarnings[0] });
+    }
     console.log({ stage: "line_reply_start" });
     const lineStatus = await replyMessages(
       event.replyToken,
-      [{ type: "text", text: formatted }],
+      messages,
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
     if (typeof lineStatus === "number") {
