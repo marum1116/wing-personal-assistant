@@ -337,7 +337,7 @@ async function callOpenAIForStructuredResult(
     },
     body: JSON.stringify({
       model: OPENAI_MODEL,
-      reasoning: { effort: "minimal" },
+      reasoning: { effort: "none" },
       input: [
         {
           role: "system",
