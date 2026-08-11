@@ -334,7 +334,12 @@ async function callOpenAIForStructuredResult(
     "不確定ならdue_dateをnullにしてuncertain_pointsへ理由を入れてください。" +
     "同一本文の複数支払いはすべてpaymentsへ含めてください。" +
     "渡辺塁/塁/塁くん/ルイくんは同一人物です。無関係情報しかない場合はneeds_confirmation=trueにしてください。" +
-    "変更・訂正を示す文言がある場合はnotesまたはuncertain_pointsで変更情報だと分かるようにしてください。";
+    "変更・訂正を示す文言がある場合はnotesまたはuncertain_pointsで変更情報だと分かるようにしてください。" +
+    "『〜の場合』『必要になった場合』『〜なら』『利用する人は〜』などの条件付き・一般案内は、" +
+    "渡辺塁本人の確定情報として扱わないでください。" +
+    "attendance/outbound_transport/return_transportは、渡辺塁本人について明示または文脈上の確定情報がある場合のみ設定し、" +
+    "判断できなければ必ず不明にしてください。" +
+    "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。";
 
   const userPrompt = JSON.stringify(
     {
