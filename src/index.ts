@@ -38,10 +38,12 @@ type LineWebhookEvent = {
   replyToken?: string;
   timestamp?: number;
   source?: {
+    type?: string;
     userId?: string;
   };
   message?: {
     type: string;
+    id?: string;
     text?: string;
   };
   postback?: {
@@ -543,6 +545,14 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
 
   const tasks: Promise<void>[] = [];
   for (const event of events) {
+    console.log({
+      eventType: event.type,
+      messageType: event.message?.type,
+      sourceType: event.source?.type,
+      hasUserId: typeof event.source?.userId === "string" && event.source.userId.length > 0,
+      hasMessageId: typeof event.message?.id === "string" && event.message.id.length > 0
+    });
+
     if (event.type === "postback") {
       tasks.push(handlePostbackEvent(event, env));
       continue;
