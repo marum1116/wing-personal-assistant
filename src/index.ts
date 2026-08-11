@@ -417,7 +417,12 @@ async function callOpenAIForStructuredResult(
     "渡辺塁本人の確定情報として扱わないでください。" +
     "attendance/outbound_transport/return_transportは、渡辺塁本人について明示または文脈上の確定情報がある場合のみ設定し、" +
     "判断できなければ必ず不明にしてください。" +
-    "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。";
+    "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。" +
+    "配車表などで『○○号』は『○○さんの車』として扱い、渡辺塁本人の割当が『渡辺→丹下号』のように明示される場合は" +
+    "return_transport.type='車'、return_transport.person='丹下さん'のようにpersonまで必ず設定してください。" +
+    "同様に山田号→山田さん、佐藤号→佐藤さんのように扱ってください。" +
+    "本人の帰りが車などでバスを使わないことが確定している場合、条件付きの一般案内を根拠にbus_guideを設定せず、bus_guideはnullにしてください。" +
+    "そのような全体向け条件情報は必要ならnotesへ記載し、本人に適用されない条件付き支払い・引率に関する不明点をuncertain_pointsへ追加しないでください。";
 
   const userPrompt = JSON.stringify(
     {
