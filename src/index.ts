@@ -441,31 +441,46 @@ async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<v
   const postbackData = event.postback?.data ?? "";
   const sourceId = parseSourceIdFromPostback(postbackData);
   if (!sourceId) {
-    await replyMessages(
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
       event.replyToken,
       [buildSourceQuickReply("先に情報源を選んでください。")],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
     return;
   }
 
   const userId = event.source?.userId;
   if (!userId) {
-    await replyMessages(
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
       event.replyToken,
       [{ type: "text", text: "先に情報源を選んでください。" }],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
     return;
   }
 
   await env.STATE.put(selectedSourceKey(userId), sourceId);
   const sourceLabel = sourceIdToLabel(sourceId);
-  await replyMessages(
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
     event.replyToken,
     [{ type: "text", text: `${sourceLabel}として受け付けます。\n記録したいメッセージを送ってください。` }],
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
 }
 
 async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promise<void> {
@@ -488,6 +503,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     );
     if (typeof lineStatus === "number") {
       console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
     }
     return;
   }
@@ -517,6 +533,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     );
     if (typeof lineStatus === "number") {
       console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
     }
     return;
   }
@@ -534,6 +551,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     );
     if (typeof lineStatus === "number") {
       console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
     }
     return;
   } catch {
@@ -545,13 +563,25 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     );
     if (typeof lineStatus === "number") {
       console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
     }
     return;
   }
 
 }
 
-async function handleWebhook(request: Request, env: Env): Promise<Response> {
+async function processEventInBackground(event: LineWebhookEvent, env: Env): Promise<void> {
+  console.log({ stage: "background_processing_start" });
+  if (event.type === "postback") {
+    await handlePostbackEvent(event, env);
+    return;
+  }
+  if (event.type === "message") {
+    await handleTextMessageEvent(event, env);
+  }
+}
+
+async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const signature = request.headers.get("x-line-signature");
   if (!signature) {
     return new Response("Unauthorized", { status: 401 });
@@ -575,7 +605,6 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
     return new Response("OK", { status: 200 });
   }
 
-  const tasks: Promise<void>[] = [];
   for (const event of events) {
     console.log({
       eventType: event.type,
@@ -585,21 +614,22 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
       hasMessageId: typeof event.message?.id === "string" && event.message.id.length > 0
     });
 
-    if (event.type === "postback") {
-      tasks.push(handlePostbackEvent(event, env));
-      continue;
-    }
-    if (event.type === "message") {
-      tasks.push(handleTextMessageEvent(event, env));
+    if (event.type === "postback" || event.type === "message") {
+      ctx.waitUntil(
+        processEventInBackground(event, env).catch((error) => {
+          const errorType = error instanceof Error ? error.name : "unknown";
+          console.error("Background event processing failed", { eventType: event.type, errorType });
+        })
+      );
+      console.log({ stage: "webhook_ack_scheduled" });
     }
   }
 
-  await Promise.all(tasks);
   return new Response("OK", { status: 200 });
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
@@ -610,7 +640,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/webhook") {
-      return handleWebhook(request, env);
+      return handleWebhook(request, env, ctx);
     }
 
     return new Response("Not Found", {
