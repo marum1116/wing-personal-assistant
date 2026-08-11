@@ -17,9 +17,11 @@ const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
 ];
 
 const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
+const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
+const MAX_UNPAID_DISPLAY_COUNT = 10;
 
 type LineReplyMessage = {
   type: "text";
@@ -81,6 +83,18 @@ type PaymentDirection = "outbound" | "return" | "none";
 type PaymentForStorage = ParsedPayment & {
   billing_scope: BillingScope;
   direction: PaymentDirection;
+};
+
+type PaymentStatus = "unpaid" | "paid";
+
+type UnpaidPaymentRow = {
+  id: number;
+  practice_date: string;
+  payment_type: string;
+  amount: number | null;
+  payee: string | null;
+  due_date: string | null;
+  status: PaymentStatus;
 };
 
 type StructuredLineResult = {
@@ -485,6 +499,175 @@ function mapPaymentsForStorage(result: StructuredLineResult): PaymentForStorage[
   });
 }
 
+function formatDateForLine(dateString: string): string {
+  const [year, month, day] = dateString.split("-");
+  if (!year || !month || !day) {
+    return dateString;
+  }
+  return `${Number(month)}/${Number(day)}`;
+}
+
+function buildPaymentItemLine(payment: UnpaidPaymentRow, index: number): string[] {
+  const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+  const prefix = circledNumbers[index] ?? `${index + 1}.`;
+  const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
+  const lines = [`${prefix} ${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`];
+  if (payment.payee) {
+    lines.push(`　支払先：${payment.payee}`);
+  }
+  if (payment.due_date) {
+    lines.push(`　期限：${formatDateForLine(payment.due_date)}`);
+  }
+  return lines;
+}
+
+function buildUnpaidListMessage(payments: UnpaidPaymentRow[], totalCount: number): LineReplyMessage {
+  if (totalCount === 0) {
+    return {
+      type: "text",
+      text: "未払いはありません。"
+    };
+  }
+
+  const lines: string[] = [`未払い：${totalCount}件`, ""];
+  if (totalCount > payments.length) {
+    lines.push(`未払いは${totalCount}件あります。`);
+    lines.push(`先頭${payments.length}件を表示しています。`);
+    lines.push("");
+  }
+
+  payments.forEach((payment, index) => {
+    lines.push(...buildPaymentItemLine(payment, index));
+  });
+  lines.push("", "下のボタンから支払済みにできます。");
+
+  const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+  return {
+    type: "text",
+    text: lines.join("\n"),
+    quickReply: {
+      items: payments.map((payment, index) => ({
+        type: "action",
+        action: {
+          type: "postback",
+          label: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`,
+          data: `action=mark_paid&payment_id=${payment.id}`,
+          displayText: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`
+        }
+      }))
+    }
+  };
+}
+
+function buildPaidConfirmationMessage(payment: UnpaidPaymentRow): string {
+  const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
+  const lines = ["支払済みにしました。", "", `${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`];
+  if (payment.payee) {
+    lines.push(`支払先：${payment.payee}`);
+  }
+  return lines.join("\n");
+}
+
+function parsePositiveInt(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+async function getUnpaidPayments(
+  db: D1Database,
+  limit: number
+): Promise<{ totalCount: number; payments: UnpaidPaymentRow[] }> {
+  const totalRow = await db.prepare("SELECT COUNT(*) AS count FROM payments WHERE status = 'unpaid'").first<{
+    count: number;
+  }>();
+  const totalCount = Number(totalRow?.count ?? 0);
+
+  const paymentsResult = await db
+    .prepare(
+      `SELECT id, practice_date, payment_type, amount, payee, due_date, status
+       FROM payments
+       WHERE status = 'unpaid'
+       ORDER BY (due_date IS NULL) ASC, due_date ASC, practice_date ASC, id ASC
+       LIMIT ?1`
+    )
+    .bind(limit)
+    .all<UnpaidPaymentRow>();
+
+  return {
+    totalCount,
+    payments: paymentsResult.results ?? []
+  };
+}
+
+async function markPaymentPaid(
+  db: D1Database,
+  paymentId: number
+): Promise<{ outcome: "updated" | "already_paid" | "not_found"; payment?: UnpaidPaymentRow }> {
+  const payment = await db
+    .prepare(
+      `SELECT id, practice_date, payment_type, amount, payee, due_date, status
+       FROM payments
+       WHERE id = ?1
+       LIMIT 1`
+    )
+    .bind(paymentId)
+    .first<UnpaidPaymentRow>();
+
+  if (!payment) {
+    return { outcome: "not_found" };
+  }
+
+  if (payment.status === "paid") {
+    return { outcome: "already_paid", payment };
+  }
+
+  const now = new Date().toISOString();
+  const updateResult = await db
+    .prepare(
+      `UPDATE payments
+       SET status = 'paid',
+           updated_at = ?1
+       WHERE id = ?2
+         AND status = 'unpaid'`
+    )
+    .bind(now, paymentId)
+    .run();
+
+  const changed = Number(updateResult.meta.changes ?? 0);
+  if (changed > 0) {
+    return { outcome: "updated", payment };
+  }
+
+  const current = await db
+    .prepare(
+      `SELECT id, practice_date, payment_type, amount, payee, due_date, status
+       FROM payments
+       WHERE id = ?1
+       LIMIT 1`
+    )
+    .bind(paymentId)
+    .first<UnpaidPaymentRow>();
+
+  if (!current) {
+    return { outcome: "not_found" };
+  }
+
+  if (current.status === "paid") {
+    return { outcome: "already_paid", payment: current };
+  }
+
+  return { outcome: "not_found" };
+}
+
 function nonUnknownText(newValue: string | null, fallback: string | null): string | null {
   if (newValue === null) {
     return fallback;
@@ -854,12 +1037,131 @@ async function replyMessages(
   return response.status;
 }
 
+async function replyUnpaidList(
+  replyToken: string,
+  env: Env
+): Promise<{ totalCount: number; displayedCount: number; lineStatus?: number }> {
+  console.log({ stage: "unpaid_list_start" });
+  const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+  console.log({
+    stage: "unpaid_list_success",
+    unpaidCount: unpaid.totalCount,
+    displayedCount: unpaid.payments.length
+  });
+
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    replyToken,
+    [buildUnpaidListMessage(unpaid.payments, unpaid.totalCount)],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+  }
+  return {
+    totalCount: unpaid.totalCount,
+    displayedCount: unpaid.payments.length,
+    lineStatus
+  };
+}
+
+async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, paymentIdRaw: string | null): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+
+  console.log({ stage: "mark_paid_start" });
+  const paymentId = parsePositiveInt(paymentIdRaw);
+  if (!paymentId) {
+    console.log({ stage: "mark_paid_success", updated: false });
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "該当する支払いが見つかりませんでした。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
+  const markResult = await markPaymentPaid(env.DB, paymentId);
+  console.log({ stage: "mark_paid_success", updated: markResult.outcome === "updated" });
+
+  if (markResult.outcome === "not_found") {
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "該当する支払いが見つかりませんでした。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
+  if (markResult.outcome === "already_paid") {
+    console.log({ stage: "unpaid_list_start" });
+    const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+    console.log({
+      stage: "unpaid_list_success",
+      unpaidCount: unpaid.totalCount,
+      displayedCount: unpaid.payments.length
+    });
+
+    const messages: LineReplyMessage[] = [{ type: "text", text: "この支払いはすでに支払済みです。" }];
+    messages.push(buildUnpaidListMessage(unpaid.payments, unpaid.totalCount));
+
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(event.replyToken, messages, env.LINE_CHANNEL_ACCESS_TOKEN);
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
+  console.log({ stage: "unpaid_list_start" });
+  const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+  console.log({
+    stage: "unpaid_list_success",
+    unpaidCount: unpaid.totalCount,
+    displayedCount: unpaid.payments.length
+  });
+
+  const messages: LineReplyMessage[] = [];
+  if (markResult.payment) {
+    messages.push({ type: "text", text: buildPaidConfirmationMessage(markResult.payment) });
+  } else {
+    messages.push({ type: "text", text: "支払済みにしました。" });
+  }
+  messages.push(buildUnpaidListMessage(unpaid.payments, unpaid.totalCount));
+
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(event.replyToken, messages, env.LINE_CHANNEL_ACCESS_TOKEN);
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
+}
+
 async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<void> {
   if (!event.replyToken) {
     return;
   }
 
   const postbackData = event.postback?.data ?? "";
+  const params = new URLSearchParams(postbackData);
+  const action = params.get("action");
+  if (action === "mark_paid") {
+    await handleMarkPaidPostback(event, env, params.get("payment_id"));
+    return;
+  }
+
   const sourceId = parseSourceIdFromPostback(postbackData);
   if (!sourceId) {
     console.log({ stage: "line_reply_start" });
@@ -915,6 +1217,14 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   console.log({ stage: "text_received" });
 
   const inputText = event.message.text;
+  if (UNPAID_COMMANDS.has(inputText)) {
+    const replyResult = await replyUnpaidList(event.replyToken, env);
+    if (typeof replyResult.lineStatus === "number") {
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
   if (MENU_TRIGGERS.has(inputText)) {
     console.log({ stage: "line_reply_start" });
     const lineStatus = await replyMessages(
