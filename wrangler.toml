@@ -9,3 +9,11 @@ head_sampling_rate = 1
 [[kv_namespaces]]
 binding = "STATE"
 id = "c1670557042b4c79bfe975fe00d78fc7"
+
+[[durable_objects.bindings]]
+name = "PAIRING"
+class_name = "PairingSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PairingSession"]

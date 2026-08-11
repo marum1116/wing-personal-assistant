@@ -3,6 +3,7 @@ interface Env {
   LINE_CHANNEL_ACCESS_TOKEN: string;
   OPENAI_API_KEY: string;
   STATE: KVNamespace;
+  PAIRING: DurableObjectNamespace;
 }
 
 type SourceId = "wing" | "parents_r8" | "first_grade" | "tange";
@@ -16,6 +17,8 @@ const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
 
 const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
 const OPENAI_MODEL = "gpt-5.6-luna";
+const PAIR_WINDOW_MS = 5000;
+const PAIR_WAIT_MS = 1200;
 
 type LineReplyMessage = {
   type: "text";
@@ -81,6 +84,11 @@ type StructuredLineResult = {
   notes: string | null;
   needs_confirmation: boolean;
   uncertain_points: string[];
+};
+
+type PairingCandidate = {
+  messageId: string;
+  timestamp: number;
 };
 
 const STRUCTURED_OUTPUT_SCHEMA = {
@@ -211,6 +219,72 @@ function selectedSourceKey(userId: string): string {
   return `selected_source:${userId}`;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function saveImageCandidateToPairing(
+  env: Env,
+  userId: string,
+  candidate: PairingCandidate
+): Promise<void> {
+  const stub = env.PAIRING.getByName(userId);
+  await stub.fetch("https://pairing/save-image", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(candidate)
+  });
+}
+
+async function takeNearestImageCandidateFromPairing(
+  env: Env,
+  userId: string,
+  textTimestamp: number
+): Promise<PairingCandidate | null> {
+  const stub = env.PAIRING.getByName(userId);
+  const response = await stub.fetch("https://pairing/take-nearest", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      timestamp: textTimestamp,
+      maxDiffMs: PAIR_WINDOW_MS
+    })
+  });
+  if (!response.ok) {
+    return null;
+  }
+  const result = (await response.json()) as { found: boolean; messageId?: string; timestamp?: number };
+  if (!result.found || typeof result.messageId !== "string" || typeof result.timestamp !== "number") {
+    return null;
+  }
+  return { messageId: result.messageId, timestamp: result.timestamp };
+}
+
+async function fetchLineImageDataUrl(messageId: string, env: Env): Promise<string | null> {
+  console.log({ stage: "line_image_fetch_start" });
+  const response = await fetch(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
+    method: "GET",
+    headers: {
+      authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`
+    }
+  });
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!response.ok) {
+    console.error("LINE image fetch failed", { status: response.status });
+    return null;
+  }
+  if (!contentType.startsWith("image/")) {
+    console.error("LINE image content type invalid", { contentType });
+    return null;
+  }
+
+  const imageBuffer = await response.arrayBuffer();
+  const base64 = toBase64(imageBuffer);
+  console.log({ stage: "line_image_fetch_success", status: response.status, contentType });
+  return `data:${contentType};base64,${base64}`;
+}
+
 function extractResponseText(apiResponse: unknown): string | null {
   if (typeof apiResponse !== "object" || apiResponse === null) {
     return null;
@@ -322,9 +396,13 @@ async function callOpenAIForStructuredResult(
   inputText: string,
   sourceLabel: string,
   receivedAtIso: string,
+  imageDataUrl: string | null,
   env: Env
 ): Promise<StructuredLineResult> {
   console.log({ stage: "openai_request_start" });
+  if (imageDataUrl) {
+    console.log({ stage: "openai_multimodal_request_start" });
+  }
 
   const nowIso = new Date().toISOString();
   const systemPrompt =
@@ -352,6 +430,16 @@ async function callOpenAIForStructuredResult(
     2
   );
 
+  const userContent: Array<{ type: "input_text"; text: string } | { type: "input_image"; image_url: string }> = [
+    { type: "input_text", text: userPrompt }
+  ];
+  if (imageDataUrl) {
+    userContent.push({
+      type: "input_image",
+      image_url: imageDataUrl
+    });
+  }
+
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
@@ -368,7 +456,7 @@ async function callOpenAIForStructuredResult(
         },
         {
           role: "user",
-          content: [{ type: "input_text", text: userPrompt }]
+          content: userContent
         }
       ],
       text: {
@@ -523,6 +611,22 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     return;
   }
 
+  await sleep(PAIR_WAIT_MS);
+  console.log({ stage: "pair_lookup_start" });
+  let imageDataUrl: string | null = null;
+  const textTimestamp = event.timestamp ?? Date.now();
+  const pairedImage = await takeNearestImageCandidateFromPairing(env, userId, textTimestamp);
+  if (pairedImage) {
+    console.log({ stage: "paired_image_found" });
+    try {
+      imageDataUrl = await fetchLineImageDataUrl(pairedImage.messageId, env);
+    } catch {
+      imageDataUrl = null;
+    }
+  } else {
+    console.log({ stage: "paired_image_not_found" });
+  }
+
   const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
   console.log({
     stage: "source_loaded",
@@ -546,7 +650,13 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   const sourceLabel = sourceIdToLabel(selectedSourceId);
   try {
     const receivedAtIso = new Date(event.timestamp ?? Date.now()).toISOString();
-    const structured = await callOpenAIForStructuredResult(inputText, sourceLabel, receivedAtIso, env);
+    const structured = await callOpenAIForStructuredResult(
+      inputText,
+      sourceLabel,
+      receivedAtIso,
+      imageDataUrl,
+      env
+    );
     const formatted = formatStructuredResultForLine(sourceLabel, structured);
     console.log({ stage: "line_reply_start" });
     const lineStatus = await replyMessages(
@@ -575,6 +685,22 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
 }
 
+async function handleImageMessageEvent(event: LineWebhookEvent, env: Env): Promise<void> {
+  console.log({ stage: "pair_image_received" });
+  const userId = event.source?.userId;
+  const messageId = event.message?.id;
+  const timestamp = event.timestamp;
+  if (!userId || !messageId || typeof timestamp !== "number") {
+    return;
+  }
+
+  await saveImageCandidateToPairing(env, userId, {
+    messageId,
+    timestamp
+  });
+  console.log({ stage: "pair_image_saved" });
+}
+
 async function processEventInBackground(event: LineWebhookEvent, env: Env): Promise<void> {
   console.log({ stage: "background_processing_start" });
   if (event.type === "postback") {
@@ -582,6 +708,10 @@ async function processEventInBackground(event: LineWebhookEvent, env: Env): Prom
     return;
   }
   if (event.type === "message") {
+    if (event.message?.type === "image") {
+      await handleImageMessageEvent(event, env);
+      return;
+    }
     await handleTextMessageEvent(event, env);
   }
 }
@@ -654,3 +784,56 @@ export default {
     });
   }
 };
+
+export class PairingSession implements DurableObject {
+  private readonly state: DurableObjectState;
+
+  constructor(state: DurableObjectState) {
+    this.state = state;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    if (url.pathname === "/save-image") {
+      const payload = (await request.json()) as PairingCandidate;
+      if (typeof payload.messageId !== "string" || typeof payload.timestamp !== "number") {
+        return new Response("Bad Request", { status: 400 });
+      }
+      await this.state.storage.put("latest_image", payload);
+      return Response.json({ ok: true });
+    }
+
+    if (url.pathname === "/take-nearest") {
+      const payload = (await request.json()) as { timestamp?: number; maxDiffMs?: number };
+      if (typeof payload.timestamp !== "number" || typeof payload.maxDiffMs !== "number") {
+        return new Response("Bad Request", { status: 400 });
+      }
+
+      const latest = await this.state.storage.get<PairingCandidate>("latest_image");
+      if (!latest) {
+        return Response.json({ found: false });
+      }
+
+      const diff = Math.abs(latest.timestamp - payload.timestamp);
+      if (diff <= payload.maxDiffMs) {
+        await this.state.storage.delete("latest_image");
+        return Response.json({
+          found: true,
+          messageId: latest.messageId,
+          timestamp: latest.timestamp
+        });
+      }
+
+      if (latest.timestamp <= payload.timestamp || diff > payload.maxDiffMs) {
+        await this.state.storage.delete("latest_image");
+      }
+      return Response.json({ found: false });
+    }
+
+    return new Response("Not Found", { status: 404 });
+  }
+}
