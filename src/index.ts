@@ -75,6 +75,8 @@ type MessageKind =
   | "general_rule"
   | "other";
 type PracticeType = "通常練習" | "個人練習" | "不明";
+type MonthlyType = "regular_training_total" | "shimura_car_fee";
+type PaymentMethod = "PayPay" | "現金" | "楽天Pay" | "その他" | "不明";
 
 type ParsedTransport = {
   type: TransportType;
@@ -86,6 +88,16 @@ type ParsedPayment = {
   amount: number | null;
   payee: string | null;
   due_date: string | null;
+};
+
+type MonthlyCharge = {
+  billing_month: string;
+  monthly_type: MonthlyType;
+  amount: number;
+  payee: string | null;
+  due_date: string | null;
+  payment_method: PaymentMethod;
+  breakdown_text: string | null;
 };
 
 type BillingScope = "event" | "monthly" | "other";
@@ -107,6 +119,30 @@ type UnpaidPaymentRow = {
   due_date: string | null;
   status: PaymentStatus;
 };
+
+type UnifiedUnpaidItem =
+  | {
+      payment_kind: "event";
+      id: number;
+      practice_date: string;
+      payment_type: string;
+      amount: number | null;
+      payee: string | null;
+      due_date: string | null;
+      sort_date: string;
+    }
+  | {
+      payment_kind: "monthly";
+      id: number;
+      billing_month: string;
+      monthly_type: MonthlyType;
+      amount: number;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: PaymentMethod | null;
+      breakdown_text: string | null;
+      sort_date: string;
+    };
 
 type ReminderPaymentRow = {
   id: number;
@@ -145,11 +181,21 @@ type SaveStructuredResultOutcome = {
   practiceSaved: boolean;
   paymentCount: number;
   reviewWarnings: string[];
+  savedMonthlyCharges: Array<{
+    billing_month: string;
+    monthly_type: MonthlyType;
+    amount: number;
+    payee: string | null;
+    due_date: string | null;
+    payment_method: PaymentMethod | null;
+    breakdown_text: string | null;
+  }>;
 };
 
 type StructuredLineResult = {
   message_kind: MessageKind;
   practice_type: PracticeType;
+  monthly_charges: MonthlyCharge[];
   practice_date: string | null;
   attendance: Attendance;
   outbound_transport: ParsedTransport;
@@ -183,6 +229,31 @@ const STRUCTURED_OUTPUT_SCHEMA = {
       ]
     },
     practice_type: { type: "string", enum: ["通常練習", "個人練習", "不明"] },
+    monthly_charges: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          billing_month: { type: "string" },
+          monthly_type: { type: "string", enum: ["regular_training_total", "shimura_car_fee"] },
+          amount: { type: "number" },
+          payee: { type: ["string", "null"] },
+          due_date: { type: ["string", "null"] },
+          payment_method: { type: "string", enum: ["PayPay", "現金", "楽天Pay", "その他", "不明"] },
+          breakdown_text: { type: ["string", "null"] }
+        },
+        required: [
+          "billing_month",
+          "monthly_type",
+          "amount",
+          "payee",
+          "due_date",
+          "payment_method",
+          "breakdown_text"
+        ]
+      }
+    },
     practice_date: { type: ["string", "null"] },
     attendance: { type: "string", enum: ["参加", "不参加", "不明"] },
     outbound_transport: {
@@ -228,6 +299,7 @@ const STRUCTURED_OUTPUT_SCHEMA = {
   required: [
     "message_kind",
     "practice_type",
+    "monthly_charges",
     "practice_date",
     "attendance",
     "outbound_transport",
@@ -688,6 +760,25 @@ function formatDateForLine(dateString: string): string {
   return `${Number(month)}/${Number(day)}`;
 }
 
+function formatBillingMonthForLine(billingMonth: string): string {
+  const matched = /^(\d{4})-(\d{2})$/.exec(billingMonth);
+  if (!matched) {
+    return billingMonth;
+  }
+  return `${Number(matched[1])}年${Number(matched[2])}月`;
+}
+
+function monthlyTypeToLabel(monthlyType: MonthlyType): string {
+  switch (monthlyType) {
+    case "regular_training_total":
+      return "通常練習分";
+    case "shimura_car_fee":
+      return "志村さんお車代";
+    default:
+      return monthlyType;
+  }
+}
+
 function buildPaymentItemLine(payment: UnpaidPaymentRow, index: number): string[] {
   const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
   const prefix = circledNumbers[index] ?? `${index + 1}.`;
@@ -702,7 +793,37 @@ function buildPaymentItemLine(payment: UnpaidPaymentRow, index: number): string[
   return lines;
 }
 
-function buildUnpaidListMessage(payments: UnpaidPaymentRow[], totalCount: number): LineReplyMessage {
+function buildUnifiedPaymentItemLine(item: UnifiedUnpaidItem, index: number): string[] {
+  const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+  const prefix = circledNumbers[index] ?? `${index + 1}.`;
+
+  if (item.payment_kind === "event") {
+    const amountPart = typeof item.amount === "number" ? ` ${item.amount}円` : "";
+    const lines = [`${prefix} ${formatDateForLine(item.practice_date)} ${item.payment_type}${amountPart}`];
+    if (item.payee) {
+      lines.push(`　支払先：${item.payee}`);
+    }
+    if (item.due_date) {
+      lines.push(`　期限：${formatDateForLine(item.due_date)}`);
+    }
+    return lines;
+  }
+
+  const lines = [
+    `${prefix} ${formatBillingMonthForLine(item.billing_month)} ${monthlyTypeToLabel(item.monthly_type)} ${item.amount.toLocaleString(
+      "ja-JP"
+    )}円`
+  ];
+  if (item.payee) {
+    lines.push(`　支払先：${item.payee}`);
+  }
+  if (item.due_date) {
+    lines.push(`　期限：${formatDateForLine(item.due_date)}`);
+  }
+  return lines;
+}
+
+function buildUnpaidListMessage(payments: UnifiedUnpaidItem[], totalCount: number): LineReplyMessage {
   if (totalCount === 0) {
     return {
       type: "text",
@@ -718,7 +839,7 @@ function buildUnpaidListMessage(payments: UnpaidPaymentRow[], totalCount: number
   }
 
   payments.forEach((payment, index) => {
-    lines.push(...buildPaymentItemLine(payment, index));
+    lines.push(...buildUnifiedPaymentItemLine(payment, index));
   });
   lines.push("", "下のボタンから支払済みにできます。");
 
@@ -732,16 +853,33 @@ function buildUnpaidListMessage(payments: UnpaidPaymentRow[], totalCount: number
   };
 }
 
-function buildPaidConfirmationMessage(payment: UnpaidPaymentRow): string {
-  const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
-  const lines = ["支払済みにしました。", "", `${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`];
+function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
+  if (payment.payment_kind === "event") {
+    const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
+    const lines = ["支払済みにしました。", "", `${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`];
+    if (payment.payee) {
+      lines.push(`支払先：${payment.payee}`);
+    }
+    return lines.join("\n");
+  }
+
+  const lines = [
+    "支払済みにしました。",
+    "",
+    `${formatBillingMonthForLine(payment.billing_month)} ${monthlyTypeToLabel(payment.monthly_type)} ${payment.amount.toLocaleString(
+      "ja-JP"
+    )}円`
+  ];
   if (payment.payee) {
     lines.push(`支払先：${payment.payee}`);
   }
   return lines.join("\n");
 }
 
-function buildMarkPaidQuickReplyItems(payments: Array<{ id: number }>, maxItems: number): NonNullable<
+function buildMarkPaidQuickReplyItems(
+  payments: Array<{ id: number; payment_kind?: "event" | "monthly" }>,
+  maxItems: number
+): NonNullable<
   LineReplyMessage["quickReply"]
 >["items"] {
   const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
@@ -750,13 +888,13 @@ function buildMarkPaidQuickReplyItems(payments: Array<{ id: number }>, maxItems:
     action: {
       type: "postback",
       label: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`,
-      data: `action=mark_paid&payment_id=${payment.id}`,
+      data: `action=mark_paid&payment_kind=${payment.payment_kind ?? "event"}&payment_id=${payment.id}`,
       displayText: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`
     }
   }));
 }
 
-function formatReminderMessage(payments: ReminderPaymentRow[]): LineReplyMessage {
+function formatReminderMessage(payments: UnifiedUnpaidItem[]): LineReplyMessage {
   const displayed = payments.slice(0, MAX_REMINDER_DISPLAY_COUNT);
   const lines: string[] = ["お支払いリマインド", "", "今日お支払い予定のものがあります。", ""];
   const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
@@ -766,21 +904,16 @@ function formatReminderMessage(payments: ReminderPaymentRow[]): LineReplyMessage
   }
 
   displayed.forEach((payment, index) => {
-    const marker = circledNumbers[index] ?? `${index + 1}.`;
-    const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
-    lines.push(`${marker} ${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`);
-    if (payment.payee) {
-      lines.push(`　支払先：${payment.payee}`);
-    }
-    if (payment.due_date) {
-      lines.push(`　期限：${formatDateForLine(payment.due_date)}`);
-    }
+    lines.push(...buildUnifiedPaymentItemLine(payment, index));
     lines.push("");
   });
 
   lines.push("「未払い」と送ると、支払済みにできます。");
 
-  const quickReplyItems = buildMarkPaidQuickReplyItems(displayed, MAX_REMINDER_QUICK_REPLY_COUNT);
+  const quickReplyItems = buildMarkPaidQuickReplyItems(
+    displayed.map((payment) => ({ id: payment.id, payment_kind: payment.payment_kind })),
+    MAX_REMINDER_QUICK_REPLY_COUNT
+  );
   const message: LineReplyMessage = {
     type: "text",
     text: lines.join("\n")
@@ -824,7 +957,7 @@ function parsePositiveInt(value: string | null): number | null {
   return parsed;
 }
 
-async function getUnpaidPayments(
+async function getUnpaidEventPayments(
   db: D1Database,
   limit: number
 ): Promise<{ totalCount: number; payments: UnpaidPaymentRow[] }> {
@@ -853,7 +986,101 @@ async function getUnpaidPayments(
   };
 }
 
-async function markPaymentPaid(
+async function getUnpaidMonthlyPayments(
+  db: D1Database,
+  limit: number
+): Promise<{
+  totalCount: number;
+  payments: Array<{
+    id: number;
+    billing_month: string;
+    monthly_type: MonthlyType;
+    amount: number;
+    payee: string | null;
+    due_date: string | null;
+    payment_method: PaymentMethod | null;
+    breakdown_text: string | null;
+    status: PaymentStatus;
+  }>;
+}> {
+  const totalRow = await db
+    .prepare("SELECT COUNT(*) AS count FROM monthly_payments WHERE status = 'unpaid'")
+    .first<{ count: number }>();
+  const totalCount = Number(totalRow?.count ?? 0);
+
+  const result = await db
+    .prepare(
+      `SELECT id, billing_month, monthly_type, amount, payee, due_date, payment_method, breakdown_text, status
+       FROM monthly_payments
+       WHERE status = 'unpaid'
+       ORDER BY (due_date IS NULL) ASC, due_date ASC, billing_month ASC, id ASC
+       LIMIT ?1`
+    )
+    .bind(limit)
+    .all<{
+      id: number;
+      billing_month: string;
+      monthly_type: MonthlyType;
+      amount: number;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: PaymentMethod | null;
+      breakdown_text: string | null;
+      status: PaymentStatus;
+    }>();
+
+  return {
+    totalCount,
+    payments: result.results ?? []
+  };
+}
+
+async function getUnifiedUnpaidPayments(
+  db: D1Database,
+  limit: number
+): Promise<{ totalCount: number; payments: UnifiedUnpaidItem[] }> {
+  const event = await getUnpaidEventPayments(db, limit);
+  const monthly = await getUnpaidMonthlyPayments(db, limit);
+  const merged: UnifiedUnpaidItem[] = [
+    ...event.payments.map((p) => ({
+      payment_kind: "event" as const,
+      id: p.id,
+      practice_date: p.practice_date,
+      payment_type: p.payment_type,
+      amount: p.amount,
+      payee: p.payee,
+      due_date: p.due_date,
+      sort_date: p.due_date ?? p.practice_date
+    })),
+    ...monthly.payments.map((p) => ({
+      payment_kind: "monthly" as const,
+      id: p.id,
+      billing_month: p.billing_month,
+      monthly_type: p.monthly_type,
+      amount: p.amount,
+      payee: p.payee,
+      due_date: p.due_date,
+      payment_method: p.payment_method,
+      breakdown_text: p.breakdown_text,
+      sort_date: p.due_date ?? `${p.billing_month}-99`
+    }))
+  ];
+
+  merged.sort((a, b) => {
+    const aDueNull = a.due_date === null ? 1 : 0;
+    const bDueNull = b.due_date === null ? 1 : 0;
+    if (aDueNull !== bDueNull) return aDueNull - bDueNull;
+    if (a.sort_date !== b.sort_date) return a.sort_date.localeCompare(b.sort_date);
+    return a.id - b.id;
+  });
+
+  return {
+    totalCount: event.totalCount + monthly.totalCount,
+    payments: merged.slice(0, limit)
+  };
+}
+
+async function markEventPaymentPaid(
   db: D1Database,
   paymentId: number
 ): Promise<{ outcome: "updated" | "already_paid" | "not_found" | "voided"; payment?: UnpaidPaymentRow }> {
@@ -940,6 +1167,62 @@ async function markPaymentPaid(
   return { outcome: "not_found" };
 }
 
+async function markMonthlyPaymentPaid(
+  db: D1Database,
+  paymentId: number
+): Promise<{
+  outcome: "updated" | "already_paid" | "not_found";
+  payment?: {
+    id: number;
+    billing_month: string;
+    monthly_type: MonthlyType;
+    amount: number;
+    payee: string | null;
+    due_date: string | null;
+  };
+}> {
+  const monthly = await db
+    .prepare(
+      `SELECT id, billing_month, monthly_type, amount, payee, due_date, status
+       FROM monthly_payments
+       WHERE id = ?1
+       LIMIT 1`
+    )
+    .bind(paymentId)
+    .first<{
+      id: number;
+      billing_month: string;
+      monthly_type: MonthlyType;
+      amount: number;
+      payee: string | null;
+      due_date: string | null;
+      status: PaymentStatus;
+    }>();
+
+  if (!monthly) {
+    return { outcome: "not_found" };
+  }
+  if (monthly.status === "paid") {
+    return { outcome: "already_paid", payment: monthly };
+  }
+
+  const now = new Date().toISOString();
+  const update = await db
+    .prepare(
+      `UPDATE monthly_payments
+       SET status = 'paid',
+           updated_at = ?1
+       WHERE id = ?2
+         AND status = 'unpaid'`
+    )
+    .bind(now, paymentId)
+    .run();
+
+  return Number(update.meta.changes ?? 0) > 0
+    ? { outcome: "updated", payment: monthly }
+    : { outcome: "not_found" };
+}
+
 async function getReminderTargets(
   db: D1Database,
   todayJst: string,
@@ -967,6 +1250,45 @@ async function getReminderTargets(
   return result.results ?? [];
 }
 
+async function getMonthlyReminderTargets(
+  db: D1Database,
+  todayJst: string
+): Promise<
+  Array<{
+    id: number;
+    billing_month: string;
+    monthly_type: MonthlyType;
+    amount: number;
+    payee: string | null;
+    due_date: string | null;
+    payment_method: PaymentMethod | null;
+  }>
+> {
+  const result = await db
+    .prepare(
+      `SELECT id, billing_month, monthly_type, amount, payee, due_date, payment_method
+       FROM monthly_payments
+       WHERE status = 'unpaid'
+         AND due_date = ?1
+         AND (
+           reminder_sent_on IS NULL
+           OR reminder_sent_on <> ?1
+         )
+       ORDER BY due_date ASC, billing_month ASC, id ASC`
+    )
+    .bind(todayJst)
+    .all<{
+      id: number;
+      billing_month: string;
+      monthly_type: MonthlyType;
+      amount: number;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: PaymentMethod | null;
+    }>();
+  return result.results ?? [];
+}
+
 async function markReminderSentOn(
   db: D1Database,
   paymentIds: number[],
@@ -991,6 +1313,30 @@ async function markReminderSentOn(
     updatedCount += Number(updateResult.meta.changes ?? 0);
   }
 
+  return updatedCount;
+}
+
+async function markMonthlyReminderSentOn(
+  db: D1Database,
+  paymentIds: number[],
+  todayJst: string
+): Promise<number> {
+  const now = new Date().toISOString();
+  let updatedCount = 0;
+  for (const paymentId of paymentIds) {
+    const updateResult = await db
+      .prepare(
+        `UPDATE monthly_payments
+         SET reminder_sent_on = ?1,
+             updated_at = ?2
+         WHERE id = ?3
+           AND status = 'unpaid'
+           AND (reminder_sent_on IS NULL OR reminder_sent_on <> ?1)`
+      )
+      .bind(todayJst, now, paymentId)
+      .run();
+    updatedCount += Number(updateResult.meta.changes ?? 0);
+  }
   return updatedCount;
 }
 
@@ -1050,7 +1396,41 @@ async function handlePaymentReminderScheduled(
   const todayJst = getJstDateString(controller.scheduledTime ?? Date.now());
   const yesterdayJst = shiftYmdByDays(todayJst, -1);
 
-  const targets = await getReminderTargets(env.DB, todayJst, yesterdayJst);
+  const eventTargets = await getReminderTargets(env.DB, todayJst, yesterdayJst);
+  const monthlyTargets = await getMonthlyReminderTargets(env.DB, todayJst);
+  const targets: UnifiedUnpaidItem[] = [
+    ...eventTargets.map((target) => ({
+      payment_kind: "event" as const,
+      id: target.id,
+      practice_date: target.practice_date,
+      payment_type: target.payment_type,
+      amount: target.amount,
+      payee: target.payee,
+      due_date: target.due_date,
+      sort_date: target.due_date ?? target.practice_date
+    })),
+    ...monthlyTargets.map((target) => ({
+      payment_kind: "monthly" as const,
+      id: target.id,
+      billing_month: target.billing_month,
+      monthly_type: target.monthly_type,
+      amount: target.amount,
+      payee: target.payee,
+      due_date: target.due_date,
+      payment_method: target.payment_method,
+      breakdown_text: null,
+      sort_date: target.due_date ?? `${target.billing_month}-99`
+    }))
+  ];
+
+  targets.sort((a, b) => {
+    const aDueNull = a.due_date === null ? 1 : 0;
+    const bDueNull = b.due_date === null ? 1 : 0;
+    if (aDueNull !== bDueNull) return aDueNull - bDueNull;
+    if (a.sort_date !== b.sort_date) return a.sort_date.localeCompare(b.sort_date);
+    return a.id - b.id;
+  });
+
   if (targets.length === 0) {
     console.log({ stage: "payment_reminder_no_targets" });
     return;
@@ -1070,10 +1450,15 @@ async function handlePaymentReminderScheduled(
   console.log({ stage: "payment_reminder_push_success", status: pushStatus });
   const updatedCount = await markReminderSentOn(
     env.DB,
-    targets.map((target) => target.id),
+    targets.filter((target) => target.payment_kind === "event").map((target) => target.id),
     todayJst
   );
-  console.log({ stage: "payment_reminder_marked_sent", updatedCount });
+  const monthlyUpdatedCount = await markMonthlyReminderSentOn(
+    env.DB,
+    targets.filter((target) => target.payment_kind === "monthly").map((target) => target.id),
+    todayJst
+  );
+  console.log({ stage: "payment_reminder_marked_sent", updatedCount: updatedCount + monthlyUpdatedCount });
 }
 
 function isConcreteText(value: string | null): value is string {
@@ -1107,6 +1492,7 @@ function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResul
   return {
     message_kind: "dispatch_confirmed",
     practice_type: practice.practice_type ?? "不明",
+    monthly_charges: [],
     practice_date: practice.practice_date,
     attendance: practice.attendance,
     outbound_transport: {
@@ -1629,6 +2015,220 @@ async function upsertNonEventPaymentToD1(
     .run();
 }
 
+function normalizeMonthlyCharge(
+  result: StructuredLineResult,
+  charge: MonthlyCharge
+): MonthlyCharge | null {
+  if (result.message_kind !== "accounting_notice") {
+    return null;
+  }
+  if (!/^\d{4}-\d{2}$/.test(charge.billing_month)) {
+    return null;
+  }
+  if (!Number.isFinite(charge.amount) || charge.amount <= 0) {
+    return null;
+  }
+  if (charge.due_date !== null && !/^\d{4}-\d{2}-\d{2}$/.test(charge.due_date)) {
+    return null;
+  }
+  return charge;
+}
+
+async function upsertMonthlyPaymentToD1(
+  db: D1Database,
+  sourceLabel: string,
+  charge: MonthlyCharge
+): Promise<{
+  row: {
+    id: number;
+    billing_month: string;
+    monthly_type: MonthlyType;
+    amount: number;
+    payee: string | null;
+    due_date: string | null;
+    payment_method: PaymentMethod | null;
+    breakdown_text: string | null;
+    status: PaymentStatus;
+    needs_review: number;
+    review_reason: string | null;
+  };
+  reviewWarning: string | null;
+}> {
+  const now = new Date().toISOString();
+  const existing = await db
+    .prepare(
+      `SELECT id, billing_month, monthly_type, amount, payee, due_date, payment_method, breakdown_text,
+              status, needs_review, review_reason
+       FROM monthly_payments
+       WHERE billing_month = ?1
+         AND monthly_type = ?2
+       LIMIT 1`
+    )
+    .bind(charge.billing_month, charge.monthly_type)
+    .first<{
+      id: number;
+      billing_month: string;
+      monthly_type: MonthlyType;
+      amount: number;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: PaymentMethod | null;
+      breakdown_text: string | null;
+      status: PaymentStatus;
+      needs_review: number;
+      review_reason: string | null;
+    }>();
+
+  if (!existing) {
+    await db.prepare(
+      `INSERT INTO monthly_payments (
+         billing_month, monthly_type, amount, payee, due_date, payment_method, breakdown_text,
+         status, source, reminder_sent_on, needs_review, review_reason, created_at, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unpaid', ?8, NULL, 0, NULL, ?9, ?9)`
+    )
+      .bind(
+        charge.billing_month,
+        charge.monthly_type,
+        charge.amount,
+        charge.payee,
+        charge.due_date,
+        charge.payment_method,
+        charge.breakdown_text,
+        sourceLabel,
+        now
+      )
+      .run();
+  } else if (existing.status === "unpaid") {
+    const changed =
+      existing.amount !== charge.amount ||
+      existing.payee !== charge.payee ||
+      existing.due_date !== charge.due_date ||
+      existing.payment_method !== charge.payment_method ||
+      existing.breakdown_text !== charge.breakdown_text;
+
+    await db.prepare(
+      `UPDATE monthly_payments
+       SET amount = ?1,
+           payee = ?2,
+           due_date = ?3,
+           payment_method = ?4,
+           breakdown_text = ?5,
+           source = ?6,
+           reminder_sent_on = CASE WHEN ?7 THEN NULL ELSE reminder_sent_on END,
+           needs_review = 0,
+           review_reason = NULL,
+           updated_at = ?8
+       WHERE id = ?9`
+    )
+      .bind(
+        charge.amount,
+        charge.payee,
+        charge.due_date,
+        charge.payment_method,
+        charge.breakdown_text,
+        sourceLabel,
+        changed ? 1 : 0,
+        now,
+        existing.id
+      )
+      .run();
+  } else {
+    const changed =
+      existing.amount !== charge.amount ||
+      existing.payee !== charge.payee ||
+      existing.due_date !== charge.due_date ||
+      existing.payment_method !== charge.payment_method ||
+      existing.breakdown_text !== charge.breakdown_text;
+
+    if (changed) {
+      await db.prepare(
+        `UPDATE monthly_payments
+         SET needs_review = 1,
+             review_reason = '支払済み後に請求内容が変更されています',
+             source = ?1,
+             updated_at = ?2
+         WHERE id = ?3`
+      )
+        .bind(sourceLabel, now, existing.id)
+        .run();
+    }
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT id, billing_month, monthly_type, amount, payee, due_date, payment_method, breakdown_text,
+              status, needs_review, review_reason
+       FROM monthly_payments
+       WHERE billing_month = ?1
+         AND monthly_type = ?2
+       LIMIT 1`
+    )
+    .bind(charge.billing_month, charge.monthly_type)
+    .first<{
+      id: number;
+      billing_month: string;
+      monthly_type: MonthlyType;
+      amount: number;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: PaymentMethod | null;
+      breakdown_text: string | null;
+      status: PaymentStatus;
+      needs_review: number;
+      review_reason: string | null;
+    }>();
+
+  if (!row) {
+    throw new Error("monthly_upsert_failed");
+  }
+
+  let reviewWarning: string | null = null;
+  if (row.status === "paid" && row.needs_review === 1) {
+    reviewWarning =
+      "⚠️ 支払いの確認が必要です\n支払済み後に月次請求内容が変更されています。内容を確認してください。";
+  }
+
+  return { row, reviewWarning };
+}
+
+function formatMonthlyChargeSavedMessage(
+  rows: Array<{
+    billing_month: string;
+    monthly_type: MonthlyType;
+    amount: number;
+    payee: string | null;
+    due_date: string | null;
+    payment_method: PaymentMethod | null;
+    breakdown_text: string | null;
+  }>
+): string {
+  const lines: string[] = ["月次支払い："];
+  for (const row of rows) {
+    const parts = [
+      `・${formatBillingMonthForLine(row.billing_month)} ${monthlyTypeToLabel(row.monthly_type)}（${row.amount.toLocaleString(
+        "ja-JP"
+      )}円`
+    ];
+    if (row.payee) {
+      parts.push(`、支払先：${row.payee}`);
+    }
+    if (row.due_date) {
+      parts.push(`、期限：${formatDateForLine(row.due_date)}`);
+    }
+    if (row.payment_method && row.payment_method !== "不明") {
+      parts.push(`、${row.payment_method}`);
+    }
+    parts.push("）");
+    lines.push(parts.join(""));
+
+    if (row.breakdown_text) {
+      lines.push("内訳：");
+      lines.push(row.breakdown_text);
+    }
+  }
+  return lines.join("\n");
+}
+
 async function saveStructuredResultToD1(
   env: Env,
   sourceLabel: string,
@@ -1636,20 +2236,55 @@ async function saveStructuredResultToD1(
   practiceTypeBasis: PracticeTypeBasis,
   practiceTypePriority: number
 ): Promise<SaveStructuredResultOutcome> {
+  const savedMonthlyCharges: SaveStructuredResultOutcome["savedMonthlyCharges"] = [];
+  const reviewWarnings: string[] = [];
+  const normalizedMonthlyCharges = result.monthly_charges
+    .map((charge) => normalizeMonthlyCharge(result, charge))
+    .filter((charge): charge is MonthlyCharge => charge !== null);
+
+  for (const charge of normalizedMonthlyCharges) {
+    const monthlySave = await upsertMonthlyPaymentToD1(env.DB, sourceLabel, charge);
+    savedMonthlyCharges.push({
+      billing_month: monthlySave.row.billing_month,
+      monthly_type: monthlySave.row.monthly_type,
+      amount: monthlySave.row.amount,
+      payee: monthlySave.row.payee,
+      due_date: monthlySave.row.due_date,
+      payment_method: monthlySave.row.payment_method,
+      breakdown_text: monthlySave.row.breakdown_text
+    });
+    if (monthlySave.reviewWarning) {
+      reviewWarnings.push(monthlySave.reviewWarning);
+    }
+  }
+
   const practiceSave = await savePracticeToD1(env, sourceLabel, result, practiceTypeBasis, practiceTypePriority);
   if (!result.practice_date) {
-    return { practiceSaved: practiceSave.practiceSaved, paymentCount: 0, reviewWarnings: [] };
+    return {
+      practiceSaved: practiceSave.practiceSaved,
+      paymentCount: 0,
+      reviewWarnings,
+      savedMonthlyCharges
+    };
   }
 
   const latestPractice = await getPracticeByDate(env.DB, result.practice_date);
   if (!latestPractice) {
-    return { practiceSaved: practiceSave.practiceSaved, paymentCount: 0, reviewWarnings: [] };
+    return {
+      practiceSaved: practiceSave.practiceSaved,
+      paymentCount: 0,
+      reviewWarnings,
+      savedMonthlyCharges
+    };
   }
 
   const paymentsForStorage = mapPaymentsForStorage(result);
-  const paymentsToUpsert = isDispatchOrChangeKind(result.message_kind)
+  const shouldSkipLegacyPaymentUpsert =
+    result.message_kind === "accounting_notice" && normalizedMonthlyCharges.length > 0;
+  const basePaymentsToUpsert = isDispatchOrChangeKind(result.message_kind)
     ? paymentsForStorage.filter((payment) => payment.billing_scope !== "event")
     : paymentsForStorage;
+  const paymentsToUpsert = shouldSkipLegacyPaymentUpsert ? [] : basePaymentsToUpsert;
   for (const payment of paymentsToUpsert) {
     await upsertNonEventPaymentToD1(env, result.practice_date, sourceLabel, payment);
   }
@@ -1666,7 +2301,8 @@ async function saveStructuredResultToD1(
     return {
       practiceSaved: practiceSave.practiceSaved,
       paymentCount: Number(paymentCountRow?.count ?? 0),
-      reviewWarnings: []
+      reviewWarnings,
+      savedMonthlyCharges
     };
   }
 
@@ -1674,7 +2310,8 @@ async function saveStructuredResultToD1(
   return {
     practiceSaved: practiceSave.practiceSaved,
     paymentCount: reconciliation.paymentCount,
-    reviewWarnings: reconciliation.reviewWarnings
+    reviewWarnings: [...reviewWarnings, ...reconciliation.reviewWarnings],
+    savedMonthlyCharges
   };
 }
 
@@ -1763,6 +2400,7 @@ async function callOpenAIForStructuredResult(
   }
 
   const nowIso = new Date().toISOString();
+  const currentDateJst = getJstDateString(Date.now());
   const systemPrompt =
     "あなたはLINE本文の情報抽出器です。必ずJSON Schemaに従って厳密なJSONのみを返してください。" +
     "message_kindは必須で、schedule/dispatch_candidate/dispatch_confirmed/same_day_change/accounting_notice/general_rule/otherのどれかを返してください。" +
@@ -1787,11 +2425,17 @@ async function callOpenAIForStructuredResult(
     "そのような全体向け条件情報は必要ならnotesへ記載し、本人に適用されない条件付き支払い・引率に関する不明点をuncertain_pointsへ追加しないでください。" +
     "dispatch_candidateでは『車出し可能』『引率可能』を本人確定配車として扱わないでください。" +
     "『帰りバス引率は藤田さん』等の一般情報だけで本人のreturn_transportを確定しないでください。" +
-    "『100円』という金額だけで見守り代や他のpayment_typeを推測しないでください。見守り代は『見守り代』と明記がある場合のみ抽出してください。";
+    "『100円』という金額だけで見守り代や他のpayment_typeを推測しないでください。見守り代は『見守り代』と明記がある場合のみ抽出してください。" +
+    "monthly_chargesは必須配列です。実際に支払う具体的な月次請求（対象月と金額が確定）でない限り必ず空配列にしてください。" +
+    "一般料金ルール（単価説明・毎月の一般規則）だけではmonthly_chargesを作らないでください。" +
+    "regular_training_totalは『計○○円』等の実支払合計が明示される場合のみ作成してください。" +
+    "shimura_car_feeは対象月が特定された具体請求の場合のみ作成してください。" +
+    "monthly_chargesへ入れた請求をpaymentsへ重複して入れないでください。";
 
   const userPrompt = JSON.stringify(
     {
       source_name: sourceLabel,
+      current_date_japan: currentDateJst,
       current_datetime: nowIso,
       message_received_datetime: receivedAtIso,
       text: inputText
@@ -1901,7 +2545,7 @@ async function replyUnpaidList(
   env: Env
 ): Promise<{ totalCount: number; displayedCount: number; lineStatus?: number }> {
   console.log({ stage: "unpaid_list_start" });
-  const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+  const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
   console.log({
     stage: "unpaid_list_success",
     unpaidCount: unpaid.totalCount,
@@ -1924,7 +2568,12 @@ async function replyUnpaidList(
   };
 }
 
-async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, paymentIdRaw: string | null): Promise<void> {
+async function handleMarkPaidPostback(
+  event: LineWebhookEvent,
+  env: Env,
+  paymentIdRaw: string | null,
+  paymentKindRaw: string | null
+): Promise<void> {
   if (!event.replyToken) {
     return;
   }
@@ -1946,7 +2595,82 @@ async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, payment
     return;
   }
 
-  const markResult = await markPaymentPaid(env.DB, paymentId);
+  const paymentKind = paymentKindRaw === "monthly" ? "monthly" : "event";
+  if (paymentKind === "monthly") {
+    const markResult = await markMonthlyPaymentPaid(env.DB, paymentId);
+    console.log({ stage: "mark_paid_success", updated: markResult.outcome === "updated" });
+
+    if (markResult.outcome === "not_found") {
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [{ type: "text", text: "該当する支払いが見つかりませんでした。" }],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
+    }
+
+    if (markResult.outcome === "already_paid") {
+      console.log({ stage: "unpaid_list_start" });
+      const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+      console.log({
+        stage: "unpaid_list_success",
+        unpaidCount: unpaid.totalCount,
+        displayedCount: unpaid.payments.length
+      });
+      const messages: LineReplyMessage[] = [{ type: "text", text: "この支払いはすでに支払済みです。" }];
+      messages.push(buildUnpaidListMessage(unpaid.payments, unpaid.totalCount));
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(event.replyToken, messages, env.LINE_CHANNEL_ACCESS_TOKEN);
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
+    }
+
+    console.log({ stage: "unpaid_list_start" });
+    const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+    console.log({
+      stage: "unpaid_list_success",
+      unpaidCount: unpaid.totalCount,
+      displayedCount: unpaid.payments.length
+    });
+    const messages: LineReplyMessage[] = [];
+    if (markResult.payment) {
+      messages.push({
+        type: "text",
+        text: buildPaidConfirmationMessage({
+          payment_kind: "monthly",
+          id: markResult.payment.id,
+          billing_month: markResult.payment.billing_month,
+          monthly_type: markResult.payment.monthly_type,
+          amount: markResult.payment.amount,
+          payee: markResult.payment.payee,
+          due_date: markResult.payment.due_date,
+          payment_method: null,
+          breakdown_text: null,
+          sort_date: markResult.payment.due_date ?? `${markResult.payment.billing_month}-99`
+        })
+      });
+    } else {
+      messages.push({ type: "text", text: "支払済みにしました。" });
+    }
+    messages.push(buildUnpaidListMessage(unpaid.payments, unpaid.totalCount));
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(event.replyToken, messages, env.LINE_CHANNEL_ACCESS_TOKEN);
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
+  const markResult = await markEventPaymentPaid(env.DB, paymentId);
   console.log({ stage: "mark_paid_success", updated: markResult.outcome === "updated" });
 
   if (markResult.outcome === "not_found") {
@@ -1979,7 +2703,7 @@ async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, payment
 
   if (markResult.outcome === "already_paid") {
     console.log({ stage: "unpaid_list_start" });
-    const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+    const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
     console.log({
       stage: "unpaid_list_success",
       unpaidCount: unpaid.totalCount,
@@ -1999,7 +2723,7 @@ async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, payment
   }
 
   console.log({ stage: "unpaid_list_start" });
-  const unpaid = await getUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+  const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
   console.log({
     stage: "unpaid_list_success",
     unpaidCount: unpaid.totalCount,
@@ -2008,7 +2732,19 @@ async function handleMarkPaidPostback(event: LineWebhookEvent, env: Env, payment
 
   const messages: LineReplyMessage[] = [];
   if (markResult.payment) {
-    messages.push({ type: "text", text: buildPaidConfirmationMessage(markResult.payment) });
+    messages.push({
+      type: "text",
+      text: buildPaidConfirmationMessage({
+        payment_kind: "event",
+        id: markResult.payment.id,
+        practice_date: markResult.payment.practice_date,
+        payment_type: markResult.payment.payment_type,
+        amount: markResult.payment.amount,
+        payee: markResult.payment.payee,
+        due_date: markResult.payment.due_date,
+        sort_date: markResult.payment.due_date ?? markResult.payment.practice_date
+      })
+    });
   } else {
     messages.push({ type: "text", text: "支払済みにしました。" });
   }
@@ -2031,7 +2767,7 @@ async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<v
   const params = new URLSearchParams(postbackData);
   const action = params.get("action");
   if (action === "mark_paid") {
-    await handleMarkPaidPostback(event, env, params.get("payment_id"));
+    await handleMarkPaidPostback(event, env, params.get("payment_id"), params.get("payment_kind"));
     return;
   }
 
@@ -2186,7 +2922,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     let saveResult: SaveStructuredResultOutcome = {
       practiceSaved: false,
       paymentCount: 0,
-      reviewWarnings: []
+      reviewWarnings: [],
+      savedMonthlyCharges: []
     };
     try {
       saveResult = await saveStructuredResultToD1(
@@ -2223,6 +2960,12 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
     const formatted = formatStructuredResultForLine(sourceLabel, replyResult);
     const messages: LineReplyMessage[] = [{ type: "text", text: formatted }];
+    if (saveResult.savedMonthlyCharges.length > 0) {
+      messages.push({
+        type: "text",
+        text: formatMonthlyChargeSavedMessage(saveResult.savedMonthlyCharges)
+      });
+    }
     if (saveResult.reviewWarnings.length > 0) {
       messages.push({ type: "text", text: saveResult.reviewWarnings[0] });
     }
