@@ -22,6 +22,8 @@ const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
 const MAX_UNPAID_DISPLAY_COUNT = 10;
+const MAX_REMINDER_DISPLAY_COUNT = 20;
+const MAX_REMINDER_QUICK_REPLY_COUNT = 10;
 
 type LineReplyMessage = {
   type: "text";
@@ -95,6 +97,17 @@ type UnpaidPaymentRow = {
   payee: string | null;
   due_date: string | null;
   status: PaymentStatus;
+};
+
+type ReminderPaymentRow = {
+  id: number;
+  practice_date: string;
+  payment_type: string;
+  amount: number | null;
+  payee: string | null;
+  due_date: string | null;
+  status: PaymentStatus;
+  reminder_sent_on: string | null;
 };
 
 type StructuredLineResult = {
@@ -546,15 +559,7 @@ function buildUnpaidListMessage(payments: UnpaidPaymentRow[], totalCount: number
     type: "text",
     text: lines.join("\n"),
     quickReply: {
-      items: payments.map((payment, index) => ({
-        type: "action",
-        action: {
-          type: "postback",
-          label: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`,
-          data: `action=mark_paid&payment_id=${payment.id}`,
-          displayText: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`
-        }
-      }))
+      items: buildMarkPaidQuickReplyItems(payments, MAX_UNPAID_DISPLAY_COUNT)
     }
   };
 }
@@ -566,6 +571,75 @@ function buildPaidConfirmationMessage(payment: UnpaidPaymentRow): string {
     lines.push(`支払先：${payment.payee}`);
   }
   return lines.join("\n");
+}
+
+function buildMarkPaidQuickReplyItems(payments: Array<{ id: number }>, maxItems: number): NonNullable<
+  LineReplyMessage["quickReply"]
+>["items"] {
+  const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+  return payments.slice(0, maxItems).map((payment, index) => ({
+    type: "action",
+    action: {
+      type: "postback",
+      label: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`,
+      data: `action=mark_paid&payment_id=${payment.id}`,
+      displayText: `${circledNumbers[index] ?? `${index + 1}.`} 支払済みにする`
+    }
+  }));
+}
+
+function formatReminderMessage(payments: ReminderPaymentRow[]): LineReplyMessage {
+  const displayed = payments.slice(0, MAX_REMINDER_DISPLAY_COUNT);
+  const lines: string[] = ["お支払いリマインド", "", "今日お支払い予定のものがあります。", ""];
+  const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
+
+  if (payments.length > displayed.length) {
+    lines.push(`対象は${payments.length}件あります。先頭${displayed.length}件を表示しています。`, "");
+  }
+
+  displayed.forEach((payment, index) => {
+    const marker = circledNumbers[index] ?? `${index + 1}.`;
+    const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
+    lines.push(`${marker} ${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`);
+    if (payment.payee) {
+      lines.push(`　支払先：${payment.payee}`);
+    }
+    if (payment.due_date) {
+      lines.push(`　期限：${formatDateForLine(payment.due_date)}`);
+    }
+    lines.push("");
+  });
+
+  lines.push("「未払い」と送ると、支払済みにできます。");
+
+  const quickReplyItems = buildMarkPaidQuickReplyItems(displayed, MAX_REMINDER_QUICK_REPLY_COUNT);
+  const message: LineReplyMessage = {
+    type: "text",
+    text: lines.join("\n")
+  };
+  if (quickReplyItems.length > 0) {
+    message.quickReply = { items: quickReplyItems };
+  }
+  return message;
+}
+
+function getJstDateString(epochMs: number): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  return formatter.format(new Date(epochMs));
+}
+
+function shiftYmdByDays(ymd: string, deltaDays: number): string {
+  const [y, m, d] = ymd.split("-").map((v) => Number(v));
+  const shifted = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  const year = shifted.getUTCFullYear();
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function parsePositiveInt(value: string | null): number | null {
@@ -666,6 +740,140 @@ async function markPaymentPaid(
   }
 
   return { outcome: "not_found" };
+}
+
+async function getReminderTargets(
+  db: D1Database,
+  todayJst: string,
+  yesterdayJst: string
+): Promise<ReminderPaymentRow[]> {
+  const result = await db
+    .prepare(
+      `SELECT id, practice_date, payment_type, amount, payee, due_date, status, reminder_sent_on
+       FROM payments
+       WHERE status = 'unpaid'
+         AND (
+           (due_date IS NOT NULL AND due_date = ?1)
+           OR
+           (due_date IS NULL AND practice_date = ?2)
+         )
+         AND (
+           reminder_sent_on IS NULL
+           OR reminder_sent_on <> ?1
+         )
+       ORDER BY (due_date IS NULL) ASC, due_date ASC, practice_date ASC, id ASC`
+    )
+    .bind(todayJst, yesterdayJst)
+    .all<ReminderPaymentRow>();
+  return result.results ?? [];
+}
+
+async function markReminderSentOn(
+  db: D1Database,
+  paymentIds: number[],
+  todayJst: string
+): Promise<number> {
+  const now = new Date().toISOString();
+  let updatedCount = 0;
+
+  for (const paymentId of paymentIds) {
+    const updateResult = await db
+      .prepare(
+        `UPDATE payments
+         SET reminder_sent_on = ?1,
+             updated_at = ?2
+         WHERE id = ?3
+           AND status = 'unpaid'
+           AND (reminder_sent_on IS NULL OR reminder_sent_on <> ?1)`
+      )
+      .bind(todayJst, now, paymentId)
+      .run();
+    updatedCount += Number(updateResult.meta.changes ?? 0);
+  }
+
+  return updatedCount;
+}
+
+async function pushLineMessages(
+  to: string,
+  messages: LineReplyMessage[],
+  accessToken: string
+): Promise<number | undefined> {
+  const response = await fetch("https://api.line.me/v2/bot/message/push", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${accessToken}`
+    },
+    body: JSON.stringify({
+      to,
+      messages
+    })
+  });
+
+  if (!response.ok) {
+    console.error("LINE push API request failed", { status: response.status });
+    return undefined;
+  }
+
+  return response.status;
+}
+
+async function maybeSetOwnerLineUserId(event: LineWebhookEvent, env: Env): Promise<void> {
+  if (event.source?.type !== "user") {
+    return;
+  }
+  const userId = event.source.userId;
+  if (!userId) {
+    return;
+  }
+
+  const currentOwner = await env.STATE.get("owner_line_user_id");
+  if (currentOwner) {
+    return;
+  }
+
+  await env.STATE.put("owner_line_user_id", userId);
+}
+
+async function handlePaymentReminderScheduled(
+  controller: ScheduledController,
+  env: Env
+): Promise<void> {
+  console.log({ stage: "payment_reminder_start" });
+  const ownerLineUserId = await env.STATE.get("owner_line_user_id");
+  if (!ownerLineUserId) {
+    console.log({ stage: "payment_reminder_no_owner" });
+    return;
+  }
+
+  const todayJst = getJstDateString(controller.scheduledTime ?? Date.now());
+  const yesterdayJst = shiftYmdByDays(todayJst, -1);
+
+  const targets = await getReminderTargets(env.DB, todayJst, yesterdayJst);
+  if (targets.length === 0) {
+    console.log({ stage: "payment_reminder_no_targets" });
+    return;
+  }
+
+  console.log({ stage: "payment_reminder_targets_found", targetCount: targets.length });
+  console.log({ stage: "payment_reminder_push_start" });
+  const pushStatus = await pushLineMessages(
+    ownerLineUserId,
+    [formatReminderMessage(targets)],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof pushStatus !== "number") {
+    return;
+  }
+
+  console.log({ stage: "payment_reminder_push_success", status: pushStatus });
+  const updatedCount = await markReminderSentOn(
+    env.DB,
+    targets.map((target) => target.id),
+    todayJst
+  );
+  console.log({ stage: "payment_reminder_marked_sent", updatedCount });
 }
 
 function nonUnknownText(newValue: string | null, fallback: string | null): string | null {
@@ -1360,6 +1568,7 @@ async function handleImageMessageEvent(event: LineWebhookEvent, env: Env): Promi
 
 async function processEventInBackground(event: LineWebhookEvent, env: Env): Promise<void> {
   console.log({ stage: "background_processing_start" });
+  await maybeSetOwnerLineUserId(event, env);
   if (event.type === "postback") {
     await handlePostbackEvent(event, env);
     return;
@@ -1439,6 +1648,15 @@ export default {
       status: 404,
       headers: { "content-type": "text/plain; charset=UTF-8" }
     });
+  },
+
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      handlePaymentReminderScheduled(controller, env).catch((error) => {
+        const errorType = error instanceof Error ? error.name : "unknown";
+        console.error("Payment reminder scheduled failed", { errorType });
+      })
+    );
   }
 };
 
