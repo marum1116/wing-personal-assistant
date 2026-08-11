@@ -66,6 +66,15 @@ type LineWebhookBody = {
 type Attendance = "参加" | "不参加" | "不明";
 type TransportType = "車" | "バス" | "自力" | "個別" | "不明";
 type PaymentType = "参加費" | "車同乗代" | "バス引率代" | "見守り代" | "志村さん車代" | "その他";
+type MessageKind =
+  | "schedule"
+  | "dispatch_candidate"
+  | "dispatch_confirmed"
+  | "same_day_change"
+  | "accounting_notice"
+  | "general_rule"
+  | "other";
+type PracticeType = "通常練習" | "個人練習" | "不明";
 
 type ParsedTransport = {
   type: TransportType;
@@ -111,6 +120,8 @@ type ReminderPaymentRow = {
 };
 
 type StructuredLineResult = {
+  message_kind: MessageKind;
+  practice_type: PracticeType;
   practice_date: string | null;
   attendance: Attendance;
   outbound_transport: ParsedTransport;
@@ -131,6 +142,19 @@ const STRUCTURED_OUTPUT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    message_kind: {
+      type: "string",
+      enum: [
+        "schedule",
+        "dispatch_candidate",
+        "dispatch_confirmed",
+        "same_day_change",
+        "accounting_notice",
+        "general_rule",
+        "other"
+      ]
+    },
+    practice_type: { type: "string", enum: ["通常練習", "個人練習", "不明"] },
     practice_date: { type: ["string", "null"] },
     attendance: { type: "string", enum: ["参加", "不参加", "不明"] },
     outbound_transport: {
@@ -174,6 +198,8 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     }
   },
   required: [
+    "message_kind",
+    "practice_type",
     "practice_date",
     "attendance",
     "outbound_transport",
@@ -392,8 +418,73 @@ function paymentIdentityKey(payment: Pick<ParsedPayment, "type" | "amount" | "pa
   return `${payment.type}|${amount}|${payee}`;
 }
 
-function buildStandingRuleEventCandidates(result: StructuredLineResult): PaymentForStorage[] {
+function parseYmdAsUtcDate(ymd: string): Date | null {
+  const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  if (!matched) {
+    return null;
+  }
+  const year = Number(matched[1]);
+  const month = Number(matched[2]);
+  const day = Number(matched[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return date;
+}
+
+function inferPracticeTypeByWeekday(practiceDate: string | null): PracticeType {
+  if (!practiceDate) {
+    return "不明";
+  }
+  const parsed = parseYmdAsUtcDate(practiceDate);
+  if (!parsed) {
+    return "不明";
+  }
+  const weekday = parsed.getUTCDay();
+  if (weekday === 1 || weekday === 2 || weekday === 4) {
+    return "通常練習";
+  }
+  if (weekday === 5 || weekday === 6 || weekday === 0) {
+    return "個人練習";
+  }
+  return "不明";
+}
+
+function resolvePracticeType(result: StructuredLineResult): PracticeType {
+  if (result.practice_type !== "不明") {
+    return result.practice_type;
+  }
+  return inferPracticeTypeByWeekday(result.practice_date);
+}
+
+function shouldDropAiPayments(messageKind: MessageKind): boolean {
+  return (
+    messageKind === "schedule" ||
+    messageKind === "dispatch_candidate" ||
+    messageKind === "dispatch_confirmed" ||
+    messageKind === "same_day_change" ||
+    messageKind === "general_rule"
+  );
+}
+
+function buildStandingRuleEventCandidates(
+  result: StructuredLineResult,
+  resolvedPracticeType: PracticeType
+): PaymentForStorage[] {
   const candidates: PaymentForStorage[] = [];
+  const eligibleMessageKind =
+    result.message_kind === "dispatch_confirmed" || result.message_kind === "same_day_change";
+  const eligiblePracticeType = resolvedPracticeType === "通常練習";
+  const eligibleAttendance = result.attendance === "参加";
+  if (!eligibleMessageKind || !eligiblePracticeType || !eligibleAttendance) {
+    return candidates;
+  }
+
   if (result.outbound_transport.type === "車") {
     candidates.push({
       type: "車同乗代",
@@ -429,15 +520,17 @@ function buildStandingRuleEventCandidates(result: StructuredLineResult): Payment
 
 function applyStandingPaymentRules(
   result: StructuredLineResult
-): { result: StructuredLineResult; addedPaymentCount: number } {
-  const mergedPayments = [...result.payments];
+): { result: StructuredLineResult; addedPaymentCount: number; resolvedPracticeType: PracticeType } {
+  const resolvedPracticeType = resolvePracticeType(result);
+  const basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
+  const mergedPayments = [...basePayments];
   const existingCounts = new Map<string, number>();
   for (const payment of mergedPayments) {
     const key = paymentIdentityKey(payment);
     existingCounts.set(key, (existingCounts.get(key) ?? 0) + 1);
   }
 
-  const requiredCandidates = buildStandingRuleEventCandidates(result);
+  const requiredCandidates = buildStandingRuleEventCandidates(result, resolvedPracticeType);
   const requiredCounts = new Map<string, number>();
   for (const candidate of requiredCandidates) {
     const key = paymentIdentityKey(candidate);
@@ -467,9 +560,11 @@ function applyStandingPaymentRules(
   return {
     result: {
       ...result,
+      practice_type: resolvedPracticeType,
       payments: mergedPayments
     },
-    addedPaymentCount
+    addedPaymentCount,
+    resolvedPracticeType
   };
 }
 
@@ -485,7 +580,8 @@ function classifyBillingScope(paymentType: PaymentType): BillingScope {
 
 function mapPaymentsForStorage(result: StructuredLineResult): PaymentForStorage[] {
   const eventCandidateMap = new Map<string, PaymentDirection[]>();
-  for (const candidate of buildStandingRuleEventCandidates(result)) {
+  const resolvedPracticeType = resolvePracticeType(result);
+  for (const candidate of buildStandingRuleEventCandidates(result, resolvedPracticeType)) {
     const key = paymentIdentityKey(candidate);
     const current = eventCandidateMap.get(key) ?? [];
     current.push(candidate.direction);
@@ -1121,6 +1217,10 @@ async function callOpenAIForStructuredResult(
   const nowIso = new Date().toISOString();
   const systemPrompt =
     "あなたはLINE本文の情報抽出器です。必ずJSON Schemaに従って厳密なJSONのみを返してください。" +
+    "message_kindは必須で、schedule/dispatch_candidate/dispatch_confirmed/same_day_change/accounting_notice/general_rule/otherのどれかを返してください。" +
+    "scheduleは参加予定、dispatch_candidateは配車候補、dispatch_confirmedは確定配車、same_day_changeは当日含む変更連絡、" +
+    "accounting_noticeは会計・請求連絡、general_ruleは恒常ルール、otherはその他です。" +
+    "practice_typeは必須で、本文や画像に明示がある場合のみ通常練習または個人練習を返し、明示がなければ不明にしてください。" +
     "本文に書かれていない内容は推測しないでください。不明はnullまたは不明を使ってください。" +
     "一般ルールで金額を補完しないでください。相対日付は合理的に確定できる場合のみYYYY-MM-DDへ変換し、" +
     "不確定ならdue_dateをnullにしてuncertain_pointsへ理由を入れてください。" +
@@ -1136,7 +1236,10 @@ async function callOpenAIForStructuredResult(
     "return_transport.type='車'、return_transport.person='丹下さん'のようにpersonまで必ず設定してください。" +
     "同様に山田号→山田さん、佐藤号→佐藤さんのように扱ってください。" +
     "本人の帰りが車などでバスを使わないことが確定している場合、条件付きの一般案内を根拠にbus_guideを設定せず、bus_guideはnullにしてください。" +
-    "そのような全体向け条件情報は必要ならnotesへ記載し、本人に適用されない条件付き支払い・引率に関する不明点をuncertain_pointsへ追加しないでください。";
+    "そのような全体向け条件情報は必要ならnotesへ記載し、本人に適用されない条件付き支払い・引率に関する不明点をuncertain_pointsへ追加しないでください。" +
+    "dispatch_candidateでは『車出し可能』『引率可能』を本人確定配車として扱わないでください。" +
+    "『帰りバス引率は藤田さん』等の一般情報だけで本人のreturn_transportを確定しないでください。" +
+    "『100円』という金額だけで見守り代や他のpayment_typeを推測しないでください。見守り代は『見守り代』と明記がある場合のみ抽出してください。";
 
   const userPrompt = JSON.stringify(
     {
@@ -1505,7 +1608,15 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     );
     const standingApplied = applyStandingPaymentRules(parsed);
     console.log({
+      stage: "message_classification_resolved",
+      messageKind: standingApplied.result.message_kind,
+      openAiPracticeType: parsed.practice_type,
+      resolvedPracticeType: standingApplied.resolvedPracticeType
+    });
+    console.log({
       stage: "standing_payment_rules_applied",
+      messageKind: standingApplied.result.message_kind,
+      practiceType: standingApplied.resolvedPracticeType,
       addedPaymentCount: standingApplied.addedPaymentCount
     });
 
