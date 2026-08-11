@@ -1,14 +1,48 @@
 interface Env {
   LINE_CHANNEL_SECRET: string;
   LINE_CHANNEL_ACCESS_TOKEN: string;
+  STATE: KVNamespace;
 }
 
+type SourceId = "wing" | "parents_r8" | "first_grade" | "tange";
+
+const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
+  { id: "wing", label: "羽魂練習会", data: "source=wing" },
+  { id: "parents_r8", label: "R8年度保護者会", data: "source=parents_r8" },
+  { id: "first_grade", label: "1年生ウィング保護者会", data: "source=first_grade" },
+  { id: "tange", label: "丹下さん", data: "source=tange" }
+];
+
+const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
+
+type LineReplyMessage = {
+  type: "text";
+  text: string;
+  quickReply?: {
+    items: Array<{
+      type: "action";
+      action: {
+        type: "postback";
+        label: string;
+        data: string;
+        displayText: string;
+      };
+    }>;
+  };
+};
+
 type LineWebhookEvent = {
-  type: string;
+  type: "message" | "postback" | string;
   replyToken?: string;
+  source?: {
+    userId?: string;
+  };
   message?: {
     type: string;
     text?: string;
+  };
+  postback?: {
+    data?: string;
   };
 };
 
@@ -49,7 +83,47 @@ async function verifyLineSignature(rawBody: string, signature: string, secret: s
   return constantTimeEqual(computed, signature);
 }
 
-async function replyTextMessage(replyToken: string, text: string, accessToken: string): Promise<void> {
+function sourceIdToLabel(sourceId: SourceId): string {
+  const source = SOURCE_OPTIONS.find((option) => option.id === sourceId);
+  return source ? source.label : "";
+}
+
+function parseSourceIdFromPostback(data: string): SourceId | null {
+  const source = SOURCE_OPTIONS.find((option) => option.data === data);
+  return source ? source.id : null;
+}
+
+function isSourceId(value: string): value is SourceId {
+  return SOURCE_OPTIONS.some((option) => option.id === value);
+}
+
+function buildSourceQuickReply(text: string): LineReplyMessage {
+  return {
+    type: "text",
+    text,
+    quickReply: {
+      items: SOURCE_OPTIONS.map((option) => ({
+        type: "action",
+        action: {
+          type: "postback",
+          label: option.label,
+          data: option.data,
+          displayText: option.label
+        }
+      }))
+    }
+  };
+}
+
+function selectedSourceKey(userId: string): string {
+  return `selected_source:${userId}`;
+}
+
+async function replyMessages(
+  replyToken: string,
+  messages: LineReplyMessage[],
+  accessToken: string
+): Promise<void> {
   const response = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
     headers: {
@@ -58,13 +132,94 @@ async function replyTextMessage(replyToken: string, text: string, accessToken: s
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text }]
+      messages
     })
   });
 
   if (!response.ok) {
     console.error("LINE reply API request failed", { status: response.status });
   }
+}
+
+async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+
+  const postbackData = event.postback?.data ?? "";
+  const sourceId = parseSourceIdFromPostback(postbackData);
+  if (!sourceId) {
+    await replyMessages(
+      event.replyToken,
+      [buildSourceQuickReply("先に情報源を選んでください。")],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const userId = event.source?.userId;
+  if (!userId) {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "先に情報源を選んでください。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  await env.STATE.put(selectedSourceKey(userId), sourceId);
+  const sourceLabel = sourceIdToLabel(sourceId);
+  await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: `${sourceLabel}として受け付けます。\n記録したいメッセージを送ってください。` }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+}
+
+async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  if (!event.message || event.message.type !== "text" || typeof event.message.text !== "string") {
+    return;
+  }
+
+  const inputText = event.message.text;
+  if (MENU_TRIGGERS.has(inputText)) {
+    await replyMessages(
+      event.replyToken,
+      [buildSourceQuickReply("情報源を選んでください。")],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const userId = event.source?.userId;
+  if (!userId) {
+    await replyMessages(
+      event.replyToken,
+      [buildSourceQuickReply("先に情報源を選んでください。")],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
+  if (!selectedSourceId || !isSourceId(selectedSourceId)) {
+    await replyMessages(
+      event.replyToken,
+      [buildSourceQuickReply("先に情報源を選んでください。")],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const sourceLabel = sourceIdToLabel(selectedSourceId);
+  await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: `情報源：${sourceLabel}\n\n受け取りました：\n${inputText}` }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
 }
 
 async function handleWebhook(request: Request, env: Env): Promise<Response> {
@@ -93,23 +248,13 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
 
   const tasks: Promise<void>[] = [];
   for (const event of events) {
-    if (event.type !== "message") {
+    if (event.type === "postback") {
+      tasks.push(handlePostbackEvent(event, env));
       continue;
     }
-    if (!event.replyToken) {
-      continue;
+    if (event.type === "message") {
+      tasks.push(handleTextMessageEvent(event, env));
     }
-    if (!event.message || event.message.type !== "text" || typeof event.message.text !== "string") {
-      continue;
-    }
-
-    tasks.push(
-      replyTextMessage(
-        event.replyToken,
-        `受け取りました：${event.message.text}`,
-        env.LINE_CHANNEL_ACCESS_TOKEN
-      )
-    );
   }
 
   await Promise.all(tasks);

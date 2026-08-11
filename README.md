@@ -39,6 +39,10 @@ curl -X POST http://127.0.0.1:8787/webhook
 - `LINE_CHANNEL_SECRET`
 - `LINE_CHANNEL_ACCESS_TOKEN`
 
+## 必要なKV binding
+
+- `STATE` (`wing-personal-assistant-state` namespace を割り当てる)
+
 ローカルでの設定例（値そのものは記載しない）:
 
 `.dev.vars` に上記2つのキーを設定する。
@@ -49,7 +53,8 @@ curl -X POST http://127.0.0.1:8787/webhook
 2. `npm run dev` で Worker を起動する
 3. LINE Developers Console の Webhook URL を `<公開URL>/webhook` に設定する
 4. Webhook 検証を実行し、200 が返ることを確認する
-5. LINE公式アカウントへテキスト送信し、「受け取りました：<本文>」が返信されることを確認する
+5. 「情報源」「メニュー」「開始」のいずれかを送ると、4つの情報源クイックリプライが表示されることを確認する
+6. 情報源を選択後、テキストを送ると「情報源：<選択中情報源>」付きで受信メッセージが返信されることを確認する
 
 ## 秘密情報の扱い
 
