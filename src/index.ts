@@ -21,6 +21,7 @@ const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
+const RECENT_CONTEXT_TTL_SECONDS = 30 * 60;
 const MAX_UNPAID_DISPLAY_COUNT = 10;
 const MAX_REMINDER_DISPLAY_COUNT = 20;
 const MAX_REMINDER_QUICK_REPLY_COUNT = 10;
@@ -168,6 +169,20 @@ type ReminderPaymentRow = {
 };
 
 type PracticeTypeBasis = "explicit" | "weekday_default" | "unknown";
+
+type ResolvedContextBasis =
+  | "explicit_message"
+  | "message_pair"
+  | "d1_same_date"
+  | "kv_recent_context"
+  | "weekday_default"
+  | "unknown";
+
+type RecentPracticeContext = {
+  practice_date: string;
+  practice_type: PracticeType;
+  timestamp_ms: number;
+};
 
 type PracticeRow = {
   practice_date: string;
@@ -397,6 +412,10 @@ function selectedSourceKey(userId: string): string {
   return `selected_source:${userId}`;
 }
 
+function recentContextKey(userId: string, sourceId: SourceId): string {
+  return `recent_context:${userId}:${sourceId}`;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -461,6 +480,56 @@ async function fetchLineImageDataUrl(messageId: string, env: Env): Promise<strin
   const base64 = toBase64(imageBuffer);
   console.log({ stage: "line_image_fetch_success", status: response.status, contentType });
   return `data:${contentType};base64,${base64}`;
+}
+
+async function loadRecentPracticeContext(
+  env: Env,
+  userId: string,
+  sourceId: SourceId,
+  nowMs: number
+): Promise<RecentPracticeContext | null> {
+  const raw = await env.STATE.get(recentContextKey(userId, sourceId));
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as RecentPracticeContext;
+    if (
+      typeof parsed.practice_date !== "string" ||
+      (parsed.practice_type !== "通常練習" && parsed.practice_type !== "個人練習") ||
+      typeof parsed.timestamp_ms !== "number"
+    ) {
+      return null;
+    }
+    const ageMs = nowMs - parsed.timestamp_ms;
+    if (ageMs < 0 || ageMs > RECENT_CONTEXT_TTL_SECONDS * 1000) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function saveRecentPracticeContext(
+  env: Env,
+  userId: string,
+  sourceId: SourceId,
+  practiceDate: string,
+  practiceType: PracticeType,
+  nowMs: number
+): Promise<void> {
+  if (practiceType === "不明") {
+    return;
+  }
+  const payload: RecentPracticeContext = {
+    practice_date: practiceDate,
+    practice_type: practiceType,
+    timestamp_ms: nowMs
+  };
+  await env.STATE.put(recentContextKey(userId, sourceId), JSON.stringify(payload), {
+    expirationTtl: RECENT_CONTEXT_TTL_SECONDS
+  });
 }
 
 function extractResponseText(apiResponse: unknown): string | null {
@@ -601,6 +670,95 @@ function resolvePracticeType(result: StructuredLineResult): {
   };
 }
 
+async function resolvePracticeContext(
+  env: Env,
+  sourceId: SourceId,
+  userId: string,
+  result: StructuredLineResult,
+  nowMs: number
+): Promise<{
+  resolvedPracticeDate: string | null;
+  resolvedPracticeType: PracticeType;
+  dateBasis: ResolvedContextBasis;
+  typeBasis: ResolvedContextBasis;
+  needsConfirmation: boolean;
+  addedUncertainPoints: string[];
+}> {
+  let resolvedPracticeDate: string | null = result.practice_date;
+  let dateBasis: ResolvedContextBasis = result.practice_date ? "explicit_message" : "unknown";
+  let resolvedPracticeType: PracticeType = result.practice_type;
+  let typeBasis: ResolvedContextBasis =
+    result.practice_type !== "不明" ? "explicit_message" : "unknown";
+  const addedUncertainPoints: string[] = [];
+  let needsConfirmation = false;
+
+  if (!resolvedPracticeDate) {
+    const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
+    if (recent) {
+      resolvedPracticeDate = recent.practice_date;
+      dateBasis = "kv_recent_context";
+      if (resolvedPracticeType === "不明") {
+        resolvedPracticeType = recent.practice_type;
+        typeBasis = "kv_recent_context";
+      }
+    } else {
+      needsConfirmation = true;
+      addedUncertainPoints.push("対象日の特定に追加確認が必要です。");
+    }
+  }
+
+  if (resolvedPracticeDate) {
+    const existing = await getPracticeByDate(env.DB, resolvedPracticeDate);
+    if (existing && existing.practice_type && existing.practice_type !== "不明") {
+      if (result.practice_date && dateBasis === "explicit_message") {
+        // 日付は本文明示を維持（type補完のみ）
+      } else if (!result.practice_date) {
+        // KV継承よりも対象日がD1で確定していることを優先
+        dateBasis = "d1_same_date";
+      }
+
+      if (resolvedPracticeType === "不明") {
+        resolvedPracticeType = existing.practice_type;
+        typeBasis = "d1_same_date";
+      }
+    }
+  }
+
+  if (resolvedPracticeType === "不明") {
+    const inferred = inferPracticeTypeByWeekday(resolvedPracticeDate);
+    if (inferred !== "不明") {
+      resolvedPracticeType = inferred;
+      typeBasis = "weekday_default";
+    }
+  }
+
+  return {
+    resolvedPracticeDate,
+    resolvedPracticeType,
+    dateBasis,
+    typeBasis,
+    needsConfirmation,
+    addedUncertainPoints
+  };
+}
+
+function resolvedTypeBasisToPracticeTypeBasis(
+  basis: ResolvedContextBasis
+): { basis: PracticeTypeBasis; priority: number } {
+  switch (basis) {
+    case "explicit_message":
+    case "message_pair":
+      return { basis: "explicit", priority: 1000 };
+    case "d1_same_date":
+    case "kv_recent_context":
+      return { basis: "explicit", priority: 800 };
+    case "weekday_default":
+      return { basis: "weekday_default", priority: 100 };
+    default:
+      return { basis: "unknown", priority: 0 };
+  }
+}
+
 function messagePriority(messageKind: MessageKind): number {
   switch (messageKind) {
     case "same_day_change":
@@ -638,6 +796,70 @@ function normalizePersonalPracticePayments(payments: ParsedPayment[]): ParsedPay
     picked.push(personalAdjustment[personalAdjustment.length - 1]);
   }
   return picked;
+}
+
+function applyPersonalPracticeStandardTransport(
+  result: StructuredLineResult,
+  resolvedPracticeType: PracticeType,
+  existingPractice?: PracticeRow | null
+): {
+  result: StructuredLineResult;
+  appliedOutbound: boolean;
+  appliedReturn: boolean;
+} {
+  if (resolvedPracticeType !== "個人練習") {
+    return { result, appliedOutbound: false, appliedReturn: false };
+  }
+
+  let appliedOutbound = false;
+  let appliedReturn = false;
+  const shouldApplyOutbound =
+    result.outbound_transport.type === "不明" &&
+    !(existingPractice && existingPractice.outbound_type !== "不明");
+  const shouldApplyReturn =
+    result.return_transport.type === "不明" &&
+    !(existingPractice && existingPractice.return_type !== "不明");
+
+  const nextOutbound =
+    shouldApplyOutbound
+      ? ((appliedOutbound = true),
+        {
+          type: "車" as TransportType,
+          person: "志村さん"
+        })
+      : result.outbound_transport;
+
+  const nextReturn =
+    shouldApplyReturn
+      ? ((appliedReturn = true),
+        {
+          type: "車" as TransportType,
+          person: "志村さん"
+        })
+      : result.return_transport;
+
+  if (!appliedOutbound && !appliedReturn) {
+    return { result, appliedOutbound: false, appliedReturn: false };
+  }
+
+  const filteredUncertainPoints = result.uncertain_points.filter((point) => {
+    if (!appliedOutbound && !appliedReturn) {
+      return true;
+    }
+    return !/(交通|行き|帰り|送迎|バス引率)/.test(point);
+  });
+
+  return {
+    result: {
+      ...result,
+      outbound_transport: nextOutbound,
+      return_transport: nextReturn,
+      uncertain_points: filteredUncertainPoints,
+      needs_confirmation: filteredUncertainPoints.length > 0 ? result.needs_confirmation : false
+    },
+    appliedOutbound,
+    appliedReturn
+  };
 }
 
 function buildStandingRuleEventCandidates(
@@ -690,7 +912,12 @@ function buildStandingRuleEventCandidates(
 }
 
 function applyStandingPaymentRules(
-  result: StructuredLineResult
+  result: StructuredLineResult,
+  override?: {
+    resolvedPracticeType?: PracticeType;
+    practiceTypeBasis?: PracticeTypeBasis;
+    practiceTypePriority?: number;
+  }
 ): {
   result: StructuredLineResult;
   addedPaymentCount: number;
@@ -698,7 +925,13 @@ function applyStandingPaymentRules(
   practiceTypeBasis: PracticeTypeBasis;
   practiceTypePriority: number;
 } {
-  const resolvedPractice = resolvePracticeType(result);
+  const resolvedPractice = override?.resolvedPracticeType
+    ? {
+        practiceType: override.resolvedPracticeType,
+        basis: override.practiceTypeBasis ?? ("unknown" as PracticeTypeBasis),
+        priority: override.practiceTypePriority ?? 0
+      }
+    : resolvePracticeType(result);
   const resolvedPracticeType = resolvedPractice.practiceType;
   let basePayments: ParsedPayment[] = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
   if (resolvedPracticeType === "個人練習") {
@@ -3293,7 +3526,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
   const sourceLabel = sourceIdToLabel(selectedSourceId);
   try {
-    const receivedAtIso = new Date(event.timestamp ?? Date.now()).toISOString();
+    const receivedAtMs = event.timestamp ?? Date.now();
+    const receivedAtIso = new Date(receivedAtMs).toISOString();
     const parsed = await callOpenAIForStructuredResult(
       inputText,
       sourceLabel,
@@ -3301,12 +3535,39 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       imageDataUrl,
       env
     );
-    const standingApplied = applyStandingPaymentRules(parsed);
+    const resolved = await resolvePracticeContext(env, selectedSourceId, userId, parsed, receivedAtMs);
+    const resolvedTypeMeta = resolvedTypeBasisToPracticeTypeBasis(resolved.typeBasis);
+    const contextResolvedResult: StructuredLineResult = {
+      ...parsed,
+      practice_date: resolved.resolvedPracticeDate,
+      practice_type: resolved.resolvedPracticeType,
+      uncertain_points: [...parsed.uncertain_points, ...resolved.addedUncertainPoints],
+      needs_confirmation: parsed.needs_confirmation || resolved.needsConfirmation
+    };
+
+    const existingPracticeForResolvedDate = resolved.resolvedPracticeDate
+      ? await getPracticeByDate(env.DB, resolved.resolvedPracticeDate)
+      : null;
+    const transportApplied = applyPersonalPracticeStandardTransport(
+      contextResolvedResult,
+      resolved.resolvedPracticeType,
+      existingPracticeForResolvedDate
+    );
+    const standingApplied = applyStandingPaymentRules(transportApplied.result, {
+      resolvedPracticeType: resolved.resolvedPracticeType,
+      practiceTypeBasis: resolvedTypeMeta.basis,
+      practiceTypePriority: resolvedTypeMeta.priority
+    });
     console.log({
       stage: "message_classification_resolved",
       messageKind: standingApplied.result.message_kind,
       openAiPracticeType: parsed.practice_type,
-      resolvedPracticeType: standingApplied.resolvedPracticeType
+      resolvedPracticeType: standingApplied.resolvedPracticeType,
+      resolvedPracticeDate: resolved.resolvedPracticeDate,
+      dateBasis: resolved.dateBasis,
+      typeBasis: resolved.typeBasis,
+      defaultOutboundApplied: transportApplied.appliedOutbound,
+      defaultReturnApplied: transportApplied.appliedReturn
     });
     console.log({
       stage: "standing_payment_rules_applied",
@@ -3327,8 +3588,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
         env,
         sourceLabel,
         standingApplied.result,
-        standingApplied.practiceTypeBasis,
-        standingApplied.practiceTypePriority
+        resolvedTypeMeta.basis,
+        resolvedTypeMeta.priority
       );
       console.log({
         stage: "d1_save_success",
@@ -3374,6 +3635,21 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     }
     if (saveResult.reviewWarnings.length > 0) {
       messages.push({ type: "text", text: saveResult.reviewWarnings[0] });
+    }
+
+    if (standingApplied.result.practice_date && standingApplied.resolvedPracticeType !== "不明") {
+      try {
+        await saveRecentPracticeContext(
+          env,
+          userId,
+          selectedSourceId,
+          standingApplied.result.practice_date,
+          standingApplied.resolvedPracticeType,
+          receivedAtMs
+        );
+      } catch {
+        // Context cache failure should not block normal reply/save flow.
+      }
     }
     console.log({ stage: "line_reply_start" });
     const lineStatus = await replyMessages(
@@ -3567,6 +3843,10 @@ export class PairingSession implements DurableObject {
 
 export const TEST_HOOKS = {
   applyStandingPaymentRules,
+  applyPersonalPracticeStandardTransport,
+  resolvePracticeContext,
+  saveRecentPracticeContext,
+  loadRecentPracticeContext,
   saveStructuredResultToD1,
   getUnifiedUnpaidPayments,
   markEventPaymentPaid,

@@ -65,7 +65,7 @@ class MockKvNamespace {
     return this.map.get(key) ?? null;
   }
 
-  async put(key: string, value: string): Promise<void> {
+  async put(key: string, value: string, _options?: { expirationTtl?: number }): Promise<void> {
     this.map.set(key, value);
   }
 }
@@ -167,6 +167,171 @@ function baseResult(overrides: Record<string, unknown>) {
 async function main() {
   const { raw, env } = createTestEnv();
   const hooks = TEST_HOOKS;
+  const sourceId = "wing" as const;
+  const userId = "test-user";
+
+  // New Case 1: 個人練習の標準交通補完（交通記載なし）
+  const case1Resolved = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    userId,
+    baseResult({
+      practice_type: "個人練習",
+      practice_date: "2026-08-26",
+      outbound_transport: { type: "不明", person: null },
+      return_transport: { type: "不明", person: null },
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(case1Resolved.resolvedPracticeType, "個人練習");
+  const case1TransportApplied = hooks.applyPersonalPracticeStandardTransport(
+    {
+      ...(baseResult({
+        practice_type: "個人練習",
+        practice_date: "2026-08-26",
+        outbound_transport: { type: "不明", person: null },
+        return_transport: { type: "不明", person: null },
+        payments: []
+      }) as any),
+      practice_type: case1Resolved.resolvedPracticeType,
+      practice_date: case1Resolved.resolvedPracticeDate
+    },
+    case1Resolved.resolvedPracticeType
+  );
+  assert.equal(case1TransportApplied.result.outbound_transport.type, "車");
+  assert.equal(case1TransportApplied.result.outbound_transport.person, "志村さん");
+  assert.equal(case1TransportApplied.result.return_transport.type, "車");
+  assert.equal(case1TransportApplied.result.return_transport.person, "志村さん");
+  const case1Standing = hooks.applyStandingPaymentRules(case1TransportApplied.result as any, {
+    resolvedPracticeType: case1Resolved.resolvedPracticeType
+  });
+  assert.equal(case1Standing.addedPaymentCount, 0);
+
+  // New Case 2: D1既存情報でpractice_typeを補完
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_date: "2026-08-27",
+      payments: [{ type: "個人練習代", amount: 3000, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    "explicit",
+    40
+  );
+  const case2Parsed = baseResult({
+    practice_type: "不明",
+    practice_date: "2026-08-27",
+    payments: [
+      { type: "個人練習代", amount: 4040, payee: "丹下さん", due_date: null, payment_method: "PayPay" },
+      { type: "その他", amount: 1234, payee: null, due_date: null, payment_method: null }
+    ]
+  }) as any;
+  const case2Resolved = await hooks.resolvePracticeContext(env, sourceId, userId, case2Parsed, Date.now());
+  assert.equal(case2Resolved.resolvedPracticeType, "個人練習");
+  const case2Standing = hooks.applyStandingPaymentRules(
+    {
+      ...case2Parsed,
+      practice_type: case2Resolved.resolvedPracticeType,
+      practice_date: case2Resolved.resolvedPracticeDate
+    },
+    { resolvedPracticeType: case2Resolved.resolvedPracticeType }
+  );
+  assert.equal(case2Standing.result.payments.length, 1);
+  assert.equal(case2Standing.result.payments[0]?.type, "個人練習代");
+
+  // New Case 3: KV直前コンテキストで日付なし差額を解決
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_date: "2026-08-28",
+      payments: [{ type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    40
+  );
+  await hooks.saveRecentPracticeContext(
+    env,
+    userId,
+    sourceId,
+    "2026-08-28",
+    "個人練習",
+    Date.now() - 5 * 60 * 1000
+  );
+  const case3ParsedNoDate = baseResult({
+    practice_type: "不明",
+    practice_date: null,
+    payments: [{ type: "個人練習差額", amount: 420, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+  }) as any;
+  const case3ResolvedNoDate = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    userId,
+    case3ParsedNoDate,
+    Date.now()
+  );
+  assert.equal(case3ResolvedNoDate.resolvedPracticeDate, "2026-08-28");
+  assert.equal(case3ResolvedNoDate.resolvedPracticeType, "個人練習");
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    {
+      ...case3ParsedNoDate,
+      practice_date: case3ResolvedNoDate.resolvedPracticeDate,
+      practice_type: case3ResolvedNoDate.resolvedPracticeType
+    },
+    "explicit",
+    800
+  );
+  const case3Integrated = raw
+    .prepare(
+      "SELECT payment_type, amount, status, rule_key, payee, payment_method FROM payments WHERE practice_date='2026-08-28' ORDER BY id"
+    )
+    .all() as Array<{
+      payment_type: string;
+      amount: number;
+      status: string;
+      rule_key: string | null;
+      payee: string | null;
+      payment_method: string | null;
+    }>;
+  assert.equal(case3Integrated.length, 1);
+  assert.equal(case3Integrated[0]?.payment_type, "個人練習代");
+  assert.equal(case3Integrated[0]?.amount, 4040);
+  assert.equal(case3Integrated[0]?.status, "unpaid");
+
+  // New Case 4: コンテキストなしの日付なし料金は要確認
+  const case4ResolvedNoContext = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "no-context-user",
+    baseResult({
+      practice_type: "不明",
+      practice_date: null,
+      payments: [{ type: "個人練習差額", amount: 420, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(case4ResolvedNoContext.resolvedPracticeDate, null);
+  assert.equal(case4ResolvedNoContext.needsConfirmation, true);
+
+  // New Case 5: 個人練習でも明示交通を優先（標準交通で上書きしない）
+  const case5Transport = hooks.applyPersonalPracticeStandardTransport(
+    baseResult({
+      practice_type: "個人練習",
+      practice_date: "2026-08-29",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "車", person: "山田さん" },
+      payments: []
+    }) as any,
+    "個人練習"
+  );
+  assert.equal(case5Transport.result.outbound_transport.type, "バス");
+  assert.equal(case5Transport.result.return_transport.type, "車");
+  assert.equal(case5Transport.result.return_transport.person, "山田さん");
 
   // Case A: payee/payment_method 抽出結果の保存（志村さんをpayeeにしない）
   await hooks.saveStructuredResultToD1(
