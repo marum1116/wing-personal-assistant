@@ -65,7 +65,15 @@ type LineWebhookBody = {
 
 type Attendance = "参加" | "不参加" | "不明";
 type TransportType = "車" | "バス" | "自力" | "個別" | "不明";
-type PaymentType = "参加費" | "車同乗代" | "バス引率代" | "見守り代" | "志村さん車代" | "その他";
+type PaymentType =
+  | "参加費"
+  | "車同乗代"
+  | "バス引率代"
+  | "見守り代"
+  | "志村さん車代"
+  | "個人練習代"
+  | "個人練習差額"
+  | "その他";
 type MessageKind =
   | "schedule"
   | "dispatch_candidate"
@@ -88,6 +96,7 @@ type ParsedPayment = {
   amount: number | null;
   payee: string | null;
   due_date: string | null;
+  payment_method: string | null;
 };
 
 type MonthlyCharge = {
@@ -117,6 +126,7 @@ type UnpaidPaymentRow = {
   amount: number | null;
   payee: string | null;
   due_date: string | null;
+  payment_method: string | null;
   status: PaymentStatus;
 };
 
@@ -129,6 +139,7 @@ type UnifiedUnpaidItem =
       amount: number | null;
       payee: string | null;
       due_date: string | null;
+      payment_method: string | null;
       sort_date: string;
     }
   | {
@@ -151,6 +162,7 @@ type ReminderPaymentRow = {
   amount: number | null;
   payee: string | null;
   due_date: string | null;
+  payment_method: string | null;
   status: PaymentStatus;
   reminder_sent_on: string | null;
 };
@@ -281,12 +293,16 @@ const STRUCTURED_OUTPUT_SCHEMA = {
         type: "object",
         additionalProperties: false,
         properties: {
-          type: { type: "string", enum: ["参加費", "車同乗代", "バス引率代", "見守り代", "志村さん車代", "その他"] },
+          type: {
+            type: "string",
+            enum: ["参加費", "車同乗代", "バス引率代", "見守り代", "志村さん車代", "個人練習代", "個人練習差額", "その他"]
+          },
           amount: { type: ["number", "null"] },
           payee: { type: ["string", "null"] },
-          due_date: { type: ["string", "null"] }
+          due_date: { type: ["string", "null"] },
+          payment_method: { type: ["string", "null"] }
         },
-        required: ["type", "amount", "payee", "due_date"]
+        required: ["type", "amount", "payee", "due_date", "payment_method"]
       }
     },
     notes: { type: ["string", "null"] },
@@ -506,6 +522,9 @@ function formatPaymentLine(payment: ParsedPayment): string {
   if (payment.due_date) {
     details.push(`期限：${payment.due_date}`);
   }
+  if (payment.payment_method) {
+    details.push(`支払方法：${payment.payment_method}`);
+  }
   if (details.length === 0) {
     return `・${payment.type}`;
   }
@@ -607,6 +626,20 @@ function shouldDropAiPayments(messageKind: MessageKind): boolean {
   );
 }
 
+function normalizePersonalPracticePayments(payments: ParsedPayment[]): ParsedPayment[] {
+  const personalFee = payments.filter((payment) => payment.type === "個人練習代");
+  const personalAdjustment = payments.filter((payment) => payment.type === "個人練習差額");
+
+  const picked: ParsedPayment[] = [];
+  if (personalFee.length > 0) {
+    picked.push(personalFee[personalFee.length - 1]);
+  }
+  if (personalAdjustment.length > 0) {
+    picked.push(personalAdjustment[personalAdjustment.length - 1]);
+  }
+  return picked;
+}
+
 function buildStandingRuleEventCandidates(
   result: StructuredLineResult,
   resolvedPracticeType: PracticeType
@@ -626,6 +659,7 @@ function buildStandingRuleEventCandidates(
       amount: 100,
       payee: result.outbound_transport.person,
       due_date: null,
+      payment_method: null,
       billing_scope: "event",
       direction: "outbound"
     });
@@ -636,6 +670,7 @@ function buildStandingRuleEventCandidates(
       amount: 100,
       payee: result.return_transport.person,
       due_date: null,
+      payment_method: null,
       billing_scope: "event",
       direction: "return"
     });
@@ -646,6 +681,7 @@ function buildStandingRuleEventCandidates(
       amount: 100,
       payee: result.bus_guide,
       due_date: null,
+      payment_method: null,
       billing_scope: "event",
       direction: "return"
     });
@@ -664,7 +700,10 @@ function applyStandingPaymentRules(
 } {
   const resolvedPractice = resolvePracticeType(result);
   const resolvedPracticeType = resolvedPractice.practiceType;
-  const basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
+  let basePayments: ParsedPayment[] = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
+  if (resolvedPracticeType === "個人練習") {
+    basePayments = normalizePersonalPracticePayments(basePayments);
+  }
   const mergedPayments = [...basePayments];
   const existingCounts = new Map<string, number>();
   for (const payment of mergedPayments) {
@@ -693,7 +732,8 @@ function applyStandingPaymentRules(
       type: candidate.type,
       amount: candidate.amount,
       payee: candidate.payee,
-      due_date: candidate.due_date
+      due_date: candidate.due_date,
+      payment_method: candidate.payment_method ?? null
     });
     usedAdditionalCounts.set(key, currentAdded + 1);
     addedPaymentCount += 1;
@@ -790,6 +830,9 @@ function buildPaymentItemLine(payment: UnpaidPaymentRow, index: number): string[
   if (payment.due_date) {
     lines.push(`　期限：${formatDateForLine(payment.due_date)}`);
   }
+  if (payment.payment_method) {
+    lines.push(`　支払方法：${payment.payment_method}`);
+  }
   return lines;
 }
 
@@ -806,6 +849,9 @@ function buildUnifiedPaymentItemLine(item: UnifiedUnpaidItem, index: number): st
     if (item.due_date) {
       lines.push(`　期限：${formatDateForLine(item.due_date)}`);
     }
+    if (item.payment_method) {
+      lines.push(`　支払方法：${item.payment_method}`);
+    }
     return lines;
   }
 
@@ -819,6 +865,9 @@ function buildUnifiedPaymentItemLine(item: UnifiedUnpaidItem, index: number): st
   }
   if (item.due_date) {
     lines.push(`　期限：${formatDateForLine(item.due_date)}`);
+  }
+  if (item.payment_method) {
+    lines.push(`　支払方法：${item.payment_method}`);
   }
   return lines;
 }
@@ -860,6 +909,9 @@ function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
     if (payment.payee) {
       lines.push(`支払先：${payment.payee}`);
     }
+    if (payment.payment_method) {
+      lines.push(`支払方法：${payment.payment_method}`);
+    }
     return lines.join("\n");
   }
 
@@ -872,6 +924,9 @@ function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
   ];
   if (payment.payee) {
     lines.push(`支払先：${payment.payee}`);
+  }
+  if (payment.payment_method) {
+    lines.push(`支払方法：${payment.payment_method}`);
   }
   return lines.join("\n");
 }
@@ -971,6 +1026,7 @@ async function getUnpaidEventPayments(
   const paymentsResult = await db
     .prepare(
       `SELECT id, practice_date, payment_type, amount, payee, due_date, status
+              ,payment_method
        FROM payments
        WHERE status = 'unpaid'
          AND voided_at IS NULL
@@ -1050,6 +1106,7 @@ async function getUnifiedUnpaidPayments(
       amount: p.amount,
       payee: p.payee,
       due_date: p.due_date,
+      payment_method: p.payment_method,
       sort_date: p.due_date ?? p.practice_date
     })),
     ...monthly.payments.map((p) => ({
@@ -1087,6 +1144,7 @@ async function markEventPaymentPaid(
   const payment = await db
     .prepare(
       `SELECT id, practice_date, payment_type, amount, payee, due_date, status
+              ,payment_method
        FROM payments
        WHERE id = ?1
        LIMIT 1`
@@ -1135,7 +1193,7 @@ async function markEventPaymentPaid(
 
   const current = await db
     .prepare(
-      `SELECT id, practice_date, payment_type, amount, payee, due_date, status
+      `SELECT id, practice_date, payment_type, amount, payee, due_date, status, payment_method
        FROM payments
        WHERE id = ?1
        LIMIT 1`
@@ -1179,11 +1237,12 @@ async function markMonthlyPaymentPaid(
     amount: number;
     payee: string | null;
     due_date: string | null;
+    payment_method: PaymentMethod | null;
   };
 }> {
   const monthly = await db
     .prepare(
-      `SELECT id, billing_month, monthly_type, amount, payee, due_date, status
+      `SELECT id, billing_month, monthly_type, amount, payee, due_date, payment_method, status
        FROM monthly_payments
        WHERE id = ?1
        LIMIT 1`
@@ -1196,6 +1255,7 @@ async function markMonthlyPaymentPaid(
       amount: number;
       payee: string | null;
       due_date: string | null;
+      payment_method: PaymentMethod | null;
       status: PaymentStatus;
     }>();
 
@@ -1231,6 +1291,7 @@ async function getReminderTargets(
   const result = await db
     .prepare(
       `SELECT id, practice_date, payment_type, amount, payee, due_date, status, reminder_sent_on
+              ,payment_method
        FROM payments
        WHERE status = 'unpaid'
          AND voided_at IS NULL
@@ -1407,6 +1468,7 @@ async function handlePaymentReminderScheduled(
       amount: target.amount,
       payee: target.payee,
       due_date: target.due_date,
+      payment_method: target.payment_method,
       sort_date: target.due_date ?? target.practice_date
     })),
     ...monthlyTargets.map((target) => ({
@@ -1977,11 +2039,12 @@ async function upsertNonEventPaymentToD1(
     await env.DB.prepare(
       `UPDATE payments
        SET due_date = COALESCE(?1, due_date),
-           source = ?2,
-           updated_at = ?3
-       WHERE id = ?4`
+           payment_method = COALESCE(?2, payment_method),
+           source = ?3,
+           updated_at = ?4
+       WHERE id = ?5`
     )
-      .bind(payment.due_date, sourceLabel, now, existing.id)
+      .bind(payment.due_date, payment.payment_method, sourceLabel, now, existing.id)
       .run();
     return;
   }
@@ -1993,13 +2056,14 @@ async function upsertNonEventPaymentToD1(
       amount,
       payee,
       due_date,
+      payment_method,
       status,
       billing_scope,
       direction,
       source,
       created_at,
       updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, 'unpaid', ?6, ?7, ?8, ?9, ?9)`
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unpaid', ?7, ?8, ?9, ?10, ?10)`
   )
     .bind(
       practiceDate,
@@ -2007,12 +2071,283 @@ async function upsertNonEventPaymentToD1(
       payment.amount,
       payment.payee,
       payment.due_date,
+      payment.payment_method,
       payment.billing_scope,
       payment.direction,
       sourceLabel,
       now
     )
     .run();
+}
+
+async function upsertPersonalPracticePaymentToD1(
+  env: Env,
+  practiceDate: string,
+  sourceLabel: string,
+  payment: PaymentForStorage,
+  hasExplicitAdjustment: boolean,
+  hasExplicitFee: boolean
+): Promise<string | null> {
+  const now = new Date().toISOString();
+  const ruleKey =
+    payment.type === "個人練習代"
+      ? "personal_practice_fee"
+      : payment.type === "個人練習差額"
+        ? "personal_practice_fee_adjustment"
+        : null;
+  if (!ruleKey) {
+    return null;
+  }
+
+  if (payment.type === "個人練習差額") {
+    const base = await env.DB.prepare(
+      `SELECT id, amount, payee, due_date, payment_method, status
+       FROM payments
+       WHERE practice_date = ?1
+         AND rule_key = 'personal_practice_fee'
+       LIMIT 1`
+    )
+      .bind(practiceDate)
+      .first<{
+        id: number;
+        amount: number | null;
+        payee: string | null;
+        due_date: string | null;
+        payment_method: string | null;
+        status: PaymentStatus;
+      }>();
+    if (base && base.status === "unpaid" && typeof base.amount === "number" && typeof payment.amount === "number") {
+      // 同一メッセージ内に最終総額(個人練習代)がある場合は、差額を別加算しない。
+      // 基準請求(unpaid)は最終総額への更新を優先する。
+      if (hasExplicitFee) {
+        await env.DB.prepare(
+          `UPDATE payments
+           SET payee = COALESCE(?1, payee),
+               due_date = COALESCE(?2, due_date),
+               payment_method = COALESCE(?3, payment_method),
+               source = ?4,
+               updated_at = ?5
+           WHERE id = ?6`
+        )
+          .bind(payment.payee, payment.due_date, payment.payment_method, sourceLabel, now, base.id)
+          .run();
+        return null;
+      }
+      await env.DB.prepare(
+        `UPDATE payments
+         SET amount = ?1,
+             payee = COALESCE(?2, payee),
+             due_date = COALESCE(?3, due_date),
+             payment_method = COALESCE(?4, payment_method),
+             source = ?5,
+             updated_at = ?6
+         WHERE id = ?7`
+      )
+        .bind(base.amount + payment.amount, payment.payee, payment.due_date, payment.payment_method, sourceLabel, now, base.id)
+        .run();
+      return null;
+    }
+
+    if (base && base.status === "paid") {
+      const existingAdjustment = await env.DB.prepare(
+        `SELECT id, amount, payee, due_date, payment_method, status
+         FROM payments
+         WHERE practice_date = ?1
+           AND rule_key = 'personal_practice_fee_adjustment'
+         LIMIT 1`
+      )
+        .bind(practiceDate)
+        .first<{
+          id: number;
+          amount: number | null;
+          payee: string | null;
+          due_date: string | null;
+          payment_method: string | null;
+          status: PaymentStatus;
+        }>();
+
+      if (!existingAdjustment) {
+        await env.DB.prepare(
+          `INSERT INTO payments (
+            practice_date, payment_type, amount, payee, due_date, payment_method, status,
+            billing_scope, direction, rule_key, source, created_at, updated_at
+          ) VALUES (?1, '個人練習差額', ?2, ?3, ?4, ?5, 'unpaid', ?6, ?7, 'personal_practice_fee_adjustment', ?8, ?9, ?9)`
+        )
+          .bind(
+            practiceDate,
+            payment.amount,
+            payment.payee,
+            payment.due_date,
+            payment.payment_method,
+            payment.billing_scope,
+            payment.direction,
+            sourceLabel,
+            now
+          )
+          .run();
+        return null;
+      }
+
+      if (existingAdjustment.status === "unpaid") {
+        await env.DB.prepare(
+          `UPDATE payments
+           SET payment_type = '個人練習差額',
+               amount = COALESCE(?1, amount),
+               payee = COALESCE(?2, payee),
+               due_date = COALESCE(?3, due_date),
+               payment_method = COALESCE(?4, payment_method),
+               source = ?5,
+               updated_at = ?6
+           WHERE id = ?7`
+        )
+          .bind(
+            payment.amount,
+            payment.payee,
+            payment.due_date,
+            payment.payment_method,
+            sourceLabel,
+            now,
+            existingAdjustment.id
+          )
+          .run();
+        return null;
+      }
+    }
+  }
+
+  const existing = await env.DB.prepare(
+    `SELECT id, amount, payee, due_date, payment_method, status
+     FROM payments
+     WHERE practice_date = ?1
+       AND rule_key = ?2
+     LIMIT 1`
+  )
+    .bind(practiceDate, ruleKey)
+    .first<{
+      id: number;
+      amount: number | null;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: string | null;
+      status: PaymentStatus;
+    }>();
+
+  if (!existing) {
+    await env.DB.prepare(
+      `INSERT INTO payments (
+        practice_date, payment_type, amount, payee, due_date, status,
+        payment_method, billing_scope, direction, rule_key, source, created_at, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, 'unpaid', ?6, ?7, ?8, ?9, ?10, ?11, ?11)`
+    )
+      .bind(
+        practiceDate,
+        payment.type,
+        payment.amount,
+        payment.payee,
+        payment.due_date,
+        payment.payment_method,
+        payment.billing_scope,
+        payment.direction,
+        ruleKey,
+        sourceLabel,
+        now
+      )
+      .run();
+    return null;
+  }
+
+  if (existing.status === "unpaid") {
+    await env.DB.prepare(
+      `UPDATE payments
+       SET payment_type = ?1,
+           amount = COALESCE(?2, amount),
+           payee = COALESCE(?3, payee),
+           due_date = COALESCE(?4, due_date),
+           payment_method = COALESCE(?5, payment_method),
+           source = ?6,
+           updated_at = ?7,
+           needs_review = 0,
+           review_reason = NULL
+       WHERE id = ?8`
+    )
+      .bind(
+        payment.type,
+        payment.amount,
+        payment.payee,
+        payment.due_date,
+        payment.payment_method,
+        sourceLabel,
+        now,
+        existing.id
+      )
+      .run();
+    return null;
+  }
+
+  const nextAmount = payment.amount ?? existing.amount;
+  const nextPayee = payment.payee ?? existing.payee;
+  const nextDueDate = payment.due_date ?? existing.due_date;
+  const nextPaymentMethod = payment.payment_method ?? existing.payment_method;
+  const changed =
+    existing.amount !== nextAmount ||
+    existing.payee !== nextPayee ||
+    existing.due_date !== nextDueDate ||
+    existing.payment_method !== nextPaymentMethod;
+  if (!changed) {
+    return null;
+  }
+
+  if (payment.type === "個人練習差額") {
+    const hasExistingAdjustment = await env.DB.prepare(
+      `SELECT id FROM payments
+       WHERE practice_date = ?1
+         AND rule_key = 'personal_practice_fee_adjustment'
+         AND id <> ?2
+       LIMIT 1`
+    )
+      .bind(practiceDate, existing.id)
+      .first<{ id: number }>();
+    if (hasExistingAdjustment) {
+      await env.DB.prepare(
+        `UPDATE payments
+         SET amount = ?1,
+             payee = COALESCE(?2, payee),
+             due_date = COALESCE(?3, due_date),
+             payment_method = COALESCE(?4, payment_method),
+             source = ?5,
+             updated_at = ?6
+         WHERE id = ?7`
+      )
+        .bind(
+          payment.amount,
+          payment.payee,
+          payment.due_date,
+          payment.payment_method,
+          sourceLabel,
+          now,
+          hasExistingAdjustment.id
+        )
+        .run();
+      return null;
+    }
+  }
+
+  if (ruleKey === "personal_practice_fee" && hasExplicitAdjustment) {
+    return null;
+  }
+
+  await env.DB.prepare(
+    `UPDATE payments
+     SET needs_review = 1,
+         review_reason = '支払済み後に請求内容が変更されています',
+         source = ?1,
+         updated_at = ?2
+     WHERE id = ?3`
+  )
+    .bind(sourceLabel, now, existing.id)
+    .run();
+
+  return "⚠️ 支払いの確認が必要です\n支払済み後に個人練習代の請求内容が変更されています。";
 }
 
 function normalizeMonthlyCharge(
@@ -2285,7 +2620,23 @@ async function saveStructuredResultToD1(
     ? paymentsForStorage.filter((payment) => payment.billing_scope !== "event")
     : paymentsForStorage;
   const paymentsToUpsert = shouldSkipLegacyPaymentUpsert ? [] : basePaymentsToUpsert;
+  const hasExplicitPersonalAdjustment = paymentsToUpsert.some((payment) => payment.type === "個人練習差額");
+  const hasExplicitPersonalFee = paymentsToUpsert.some((payment) => payment.type === "個人練習代");
   for (const payment of paymentsToUpsert) {
+    if (payment.type === "個人練習代" || payment.type === "個人練習差額") {
+      const warning = await upsertPersonalPracticePaymentToD1(
+        env,
+        result.practice_date,
+        sourceLabel,
+        payment,
+        hasExplicitPersonalAdjustment,
+        hasExplicitPersonalFee
+      );
+      if (warning) {
+        reviewWarnings.push(warning);
+      }
+      continue;
+    }
     await upsertNonEventPaymentToD1(env, result.practice_date, sourceLabel, payment);
   }
 
@@ -2322,6 +2673,7 @@ async function getActiveUnpaidEventPaymentsForPractice(
   const rows = await db
     .prepare(
       `SELECT payment_type, amount, payee, due_date
+              ,payment_method
        FROM payments
        WHERE practice_date = ?1
          AND billing_scope = 'event'
@@ -2335,13 +2687,51 @@ async function getActiveUnpaidEventPaymentsForPractice(
       amount: number | null;
       payee: string | null;
       due_date: string | null;
+      payment_method: string | null;
     }>();
 
   return (rows.results ?? []).map((row) => ({
     type: row.payment_type,
     amount: row.amount,
     payee: row.payee,
-    due_date: row.due_date
+    due_date: row.due_date,
+    payment_method: row.payment_method
+  }));
+}
+
+async function getActiveUnpaidPersonalPracticePaymentsForPractice(
+  db: D1Database,
+  practiceDate: string
+): Promise<ParsedPayment[]> {
+  const rows = await db
+    .prepare(
+      `SELECT payment_type, amount, payee, due_date
+              ,payment_method
+       FROM payments
+       WHERE practice_date = ?1
+         AND status = 'unpaid'
+         AND voided_at IS NULL
+         AND rule_key IN ('personal_practice_fee', 'personal_practice_fee_adjustment')
+       ORDER BY CASE rule_key
+         WHEN 'personal_practice_fee' THEN 0
+         ELSE 1
+       END, id`
+    )
+    .bind(practiceDate)
+    .all<{
+      payment_type: PaymentType;
+      amount: number | null;
+      payee: string | null;
+      due_date: string | null;
+      payment_method: string | null;
+    }>();
+
+  return (rows.results ?? []).map((row) => ({
+    type: row.payment_type,
+    amount: row.amount,
+    payee: row.payee,
+    due_date: row.due_date,
+    payment_method: row.payment_method
   }));
 }
 
@@ -2430,7 +2820,13 @@ async function callOpenAIForStructuredResult(
     "一般料金ルール（単価説明・毎月の一般規則）だけではmonthly_chargesを作らないでください。" +
     "regular_training_totalは『計○○円』等の実支払合計が明示される場合のみ作成してください。" +
     "shimura_car_feeは対象月が特定された具体請求の場合のみ作成してください。" +
-    "monthly_chargesへ入れた請求をpaymentsへ重複して入れないでください。";
+    "monthly_chargesへ入れた請求をpaymentsへ重複して入れないでください。" +
+    "個人練習では参加費・施設費・高速代・引率代などの内訳をpaymentsの別明細に分割せず、最終的な1人分請求額のみを『個人練習代』として抽出してください。" +
+    "個人練習の請求額訂正で差額支払いが本文に明示される場合のみ『個人練習差額』を抽出し、本文に明示がない差額を自動計算して作成しないでください。" +
+    "個人練習では通常練習用の車同乗代100円やバス引率代100円をpaymentsとして作成しないでください。" +
+    "payments.payeeは『○○までお願いします』『○○さんへ支払ってください』『○○へPayPay』など、ユーザー本人が直接支払う相手を優先して抽出してください。" +
+    "『志村さんにお渡しする金額』のような計算説明だけではpayeeを志村さんにしないでください。" +
+    "payments.payment_methodには本文で明示された支払方法（PayPay/現金/振込/その他の具体記載）を入れ、明示がない場合はnullにしてください。";
 
   const userPrompt = JSON.stringify(
     {
@@ -2652,7 +3048,7 @@ async function handleMarkPaidPostback(
           amount: markResult.payment.amount,
           payee: markResult.payment.payee,
           due_date: markResult.payment.due_date,
-          payment_method: null,
+          payment_method: markResult.payment.payment_method,
           breakdown_text: null,
           sort_date: markResult.payment.due_date ?? `${markResult.payment.billing_month}-99`
         })
@@ -2742,6 +3138,7 @@ async function handleMarkPaidPostback(
         amount: markResult.payment.amount,
         payee: markResult.payment.payee,
         due_date: markResult.payment.due_date,
+        payment_method: markResult.payment.payment_method,
         sort_date: markResult.payment.due_date ?? markResult.payment.practice_date
       })
     });
@@ -2944,7 +3341,16 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     }
 
     let replyResult: StructuredLineResult = standingApplied.result;
-    if (
+    if (standingApplied.result.practice_date && standingApplied.resolvedPracticeType === "個人練習") {
+      const activePersonalPayments = await getActiveUnpaidPersonalPracticePaymentsForPractice(
+        env.DB,
+        standingApplied.result.practice_date
+      );
+      replyResult = {
+        ...standingApplied.result,
+        payments: activePersonalPayments
+      };
+    } else if (
       isDispatchOrChangeKind(standingApplied.result.message_kind) &&
       standingApplied.result.practice_date
     ) {
@@ -3158,3 +3564,15 @@ export class PairingSession implements DurableObject {
     return new Response("Not Found", { status: 404 });
   }
 }
+
+export const TEST_HOOKS = {
+  applyStandingPaymentRules,
+  saveStructuredResultToD1,
+  getUnifiedUnpaidPayments,
+  markEventPaymentPaid,
+  markMonthlyPaymentPaid,
+  getReminderTargets,
+  getMonthlyReminderTargets,
+  handleMarkPaidPostback,
+  handlePaymentReminderScheduled
+};

@@ -4,10 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:personal-practice": "tsx tests/personal-practice.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",
+    "tsx": "latest",
     "typescript": "latest",
     "wrangler": "latest"
   }
