@@ -786,15 +786,6 @@ async function resolvePracticeContext(
   const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
   const sourceLabel = sourceIdToLabel(sourceId);
   const personalPracticeFallbackEligible = isDateLessPersonalPracticePaymentMessage(result);
-  const paymentTypes = result.payments.map((payment) => payment.type);
-  console.log({
-    stage: "personal_practice_date_fallback_check",
-    currentResolvedDate: resolvedPracticeDate,
-    hasRecentKvContext: recent !== null,
-    eligible: personalPracticeFallbackEligible,
-    sourceLabel,
-    paymentTypes
-  });
 
   if (!resolvedPracticeDate) {
     if (recent) {
@@ -848,13 +839,6 @@ async function resolvePracticeContext(
       typeBasis = "ai_inferred";
     }
   }
-
-  console.log({
-    stage: "personal_practice_date_resolution_result",
-    resolvedDate: resolvedPracticeDate,
-    dateBasis,
-    needsConfirmation
-  });
 
   return {
     resolvedPracticeDate,
@@ -2074,11 +2058,6 @@ async function findUniqueUnpaidPersonalPracticeFeeDate(
   const candidateDates = candidates
     .map((row) => row.practice_date)
     .filter((date): date is string => typeof date === "string");
-  console.log({
-    stage: "personal_practice_date_candidates",
-    candidateCount: candidateDates.length,
-    candidateDates
-  });
   if (candidates.length !== 1) {
     return { practiceDate: null, candidateCount: candidates.length, candidateDates };
   }
