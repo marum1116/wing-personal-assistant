@@ -672,6 +672,200 @@ async function main() {
     .get() as { practice_type: string };
   assert.equal(flipDAfter.practice_type, "個人練習");
 
+  // Date Resolve Case A: KVなし + D1のactive unpaid personal_practice_feeが1件ならその日付へ解決
+  const { raw: resolveRawA, env: resolveEnvA } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    resolveEnvA,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-08-14",
+      payments: [{ type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    40
+  );
+  const resolveCaseAInput = baseResult({
+    practice_date: null,
+    practice_type: "不明",
+    practice_type_basis: "unknown",
+    payments: [{ type: "個人練習代", amount: 4040, payee: null, due_date: null, payment_method: null }]
+  }) as any;
+  const resolveCaseA = await hooks.resolvePracticeContext(
+    resolveEnvA,
+    sourceId,
+    "resolve-a-user",
+    resolveCaseAInput,
+    Date.now()
+  );
+  assert.equal(resolveCaseA.resolvedPracticeDate, "2026-08-14");
+  assert.equal(resolveCaseA.needsConfirmation, false);
+  await hooks.saveStructuredResultToD1(
+    resolveEnvA,
+    "羽魂練習会",
+    {
+      ...resolveCaseAInput,
+      practice_date: resolveCaseA.resolvedPracticeDate,
+      practice_type: resolveCaseA.resolvedPracticeType
+    },
+    "explicit",
+    40
+  );
+  const resolveCaseARows = resolveRawA
+    .prepare(
+      "SELECT amount, status, payee, payment_method, rule_key FROM payments WHERE practice_date='2026-08-14' AND rule_key='personal_practice_fee' AND voided_at IS NULL"
+    )
+    .all() as Array<{
+      amount: number;
+      status: string;
+      payee: string | null;
+      payment_method: string | null;
+      rule_key: string | null;
+    }>;
+  assert.equal(resolveCaseARows.length, 1);
+  assert.equal(resolveCaseARows[0]?.amount, 4040);
+  assert.equal(resolveCaseARows[0]?.status, "unpaid");
+  assert.equal(resolveCaseARows[0]?.rule_key, "personal_practice_fee");
+
+  // Date Resolve Case B: KV recent contextがある場合はKV優先（D1逆引きはfallback）
+  const { env: resolveEnvB } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    resolveEnvB,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-08-14",
+      payments: [{ type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    40
+  );
+  await hooks.saveRecentPracticeContext(
+    resolveEnvB,
+    "resolve-b-user",
+    sourceId,
+    "2026-08-18",
+    "個人練習",
+    Date.now() - 60 * 1000
+  );
+  const resolveCaseB = await hooks.resolvePracticeContext(
+    resolveEnvB,
+    sourceId,
+    "resolve-b-user",
+    baseResult({
+      practice_date: null,
+      payments: [{ type: "個人練習代", amount: 4040, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(resolveCaseB.resolvedPracticeDate, "2026-08-18");
+  assert.equal(resolveCaseB.dateBasis, "kv_recent_context");
+
+  // Date Resolve Case C: D1候補が複数なら自動紐付けしない
+  const { env: resolveEnvC } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    resolveEnvC,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-08-14",
+      payments: [{ type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    40
+  );
+  await hooks.saveStructuredResultToD1(
+    resolveEnvC,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-08-16",
+      payments: [{ type: "個人練習代", amount: 3900, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    40
+  );
+  const resolveCaseC = await hooks.resolvePracticeContext(
+    resolveEnvC,
+    sourceId,
+    "resolve-c-user",
+    baseResult({
+      practice_date: null,
+      payments: [{ type: "個人練習代", amount: 4040, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(resolveCaseC.resolvedPracticeDate, null);
+  assert.equal(resolveCaseC.needsConfirmation, true);
+
+  // Date Resolve Case D: D1候補が0件なら自動紐付けしない
+  const { env: resolveEnvD } = createTestEnv();
+  const resolveCaseD = await hooks.resolvePracticeContext(
+    resolveEnvD,
+    sourceId,
+    "resolve-d-user",
+    baseResult({
+      practice_date: null,
+      payments: [{ type: "個人練習代", amount: 4040, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(resolveCaseD.resolvedPracticeDate, null);
+  assert.equal(resolveCaseD.needsConfirmation, true);
+
+  // Date Resolve Case E: 訂正文でpayee/payment_methodがnullでも既存値を保持
+  const { raw: resolveRawE, env: resolveEnvE } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    resolveEnvE,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-08-14",
+      payments: [{ type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    40
+  );
+  await hooks.saveStructuredResultToD1(
+    resolveEnvE,
+    "羽魂練習会",
+    baseResult({
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-08-14",
+      payments: [{ type: "個人練習代", amount: 4040, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    "explicit",
+    40
+  );
+  const resolveCaseERow = resolveRawE
+    .prepare(
+      "SELECT amount, payee, payment_method, status, rule_key FROM payments WHERE practice_date='2026-08-14' AND rule_key='personal_practice_fee' LIMIT 1"
+    )
+    .get() as {
+      amount: number;
+      payee: string | null;
+      payment_method: string | null;
+      status: string;
+      rule_key: string | null;
+    };
+  assert.equal(resolveCaseERow.amount, 4040);
+  assert.equal(resolveCaseERow.payee, "丹下さん");
+  assert.equal(resolveCaseERow.payment_method, "PayPay");
+  assert.equal(resolveCaseERow.status, "unpaid");
+  assert.equal(resolveCaseERow.rule_key, "personal_practice_fee");
+
   // Requested Case F: 実メッセージ相当（金曜・内訳・1人3620・丹下までPayPay）
   // OpenAI期待仕様（プロンプト固定化メモ）:
   // 入力相当:

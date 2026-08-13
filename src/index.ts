@@ -181,6 +181,7 @@ type ResolvedContextBasis =
   | "explicit_message"
   | "message_pair"
   | "d1_same_date"
+  | "d1_personal_fee_unique"
   | "kv_recent_context"
   | "weekday_default"
   | "ai_inferred"
@@ -783,11 +784,21 @@ async function resolvePracticeContext(
   const addedUncertainPoints: string[] = [];
   let needsConfirmation = false;
   const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
+  const sourceLabel = sourceIdToLabel(sourceId);
 
   if (!resolvedPracticeDate) {
     if (recent) {
       resolvedPracticeDate = recent.practice_date;
       dateBasis = "kv_recent_context";
+    } else if (isDateLessPersonalPracticePaymentMessage(result)) {
+      const reverseLookup = await findUniqueUnpaidPersonalPracticeFeeDate(env.DB, sourceLabel);
+      if (reverseLookup.practiceDate) {
+        resolvedPracticeDate = reverseLookup.practiceDate;
+        dateBasis = "d1_personal_fee_unique";
+      } else {
+        needsConfirmation = true;
+        addedUncertainPoints.push("対象日の特定に追加確認が必要です。");
+      }
     } else {
       needsConfirmation = true;
       addedUncertainPoints.push("対象日の特定に追加確認が必要です。");
@@ -802,7 +813,7 @@ async function resolvePracticeContext(
     const existing = await getPracticeByDate(env.DB, resolvedPracticeDate);
     if (existing && existing.practice_type && existing.practice_type !== "不明") {
       existingType = existing.practice_type;
-      if (!result.practice_date) {
+      if (!result.practice_date && dateBasis === "unknown") {
         dateBasis = "d1_same_date";
       }
     }
@@ -1960,6 +1971,44 @@ async function getPracticeByDate(db: D1Database, practiceDate: string): Promise<
     .bind(practiceDate)
     .first<PracticeRow>();
   return row ?? null;
+}
+
+function isPersonalPracticePaymentType(paymentType: PaymentType): boolean {
+  return paymentType === "個人練習代" || paymentType === "個人練習差額";
+}
+
+function isDateLessPersonalPracticePaymentMessage(result: StructuredLineResult): boolean {
+  if (result.practice_date) {
+    return false;
+  }
+  return result.payments.some((payment) => isPersonalPracticePaymentType(payment.type));
+}
+
+async function findUniqueUnpaidPersonalPracticeFeeDate(
+  db: D1Database,
+  sourceLabel: string
+): Promise<{ practiceDate: string | null; candidateCount: number }> {
+  const rows = await db
+    .prepare(
+      `SELECT DISTINCT p.practice_date
+       FROM payments p
+       INNER JOIN practices pr
+         ON pr.practice_date = p.practice_date
+       WHERE p.rule_key = 'personal_practice_fee'
+         AND p.payment_type = '個人練習代'
+         AND p.status = 'unpaid'
+         AND p.voided_at IS NULL
+         AND p.source = ?1
+         AND pr.practice_type = '個人練習'
+       ORDER BY p.practice_date ASC`
+    )
+    .bind(sourceLabel)
+    .all<{ practice_date: string }>();
+  const candidates = rows.results ?? [];
+  if (candidates.length !== 1) {
+    return { practiceDate: null, candidateCount: candidates.length };
+  }
+  return { practiceDate: candidates[0]?.practice_date ?? null, candidateCount: 1 };
 }
 
 async function savePracticeToD1(
