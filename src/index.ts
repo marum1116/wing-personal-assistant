@@ -785,12 +785,22 @@ async function resolvePracticeContext(
   let needsConfirmation = false;
   const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
   const sourceLabel = sourceIdToLabel(sourceId);
+  const personalPracticeFallbackEligible = isDateLessPersonalPracticePaymentMessage(result);
+  const paymentTypes = result.payments.map((payment) => payment.type);
+  console.log({
+    stage: "personal_practice_date_fallback_check",
+    currentResolvedDate: resolvedPracticeDate,
+    hasRecentKvContext: recent !== null,
+    eligible: personalPracticeFallbackEligible,
+    sourceLabel,
+    paymentTypes
+  });
 
   if (!resolvedPracticeDate) {
     if (recent) {
       resolvedPracticeDate = recent.practice_date;
       dateBasis = "kv_recent_context";
-    } else if (isDateLessPersonalPracticePaymentMessage(result)) {
+    } else if (personalPracticeFallbackEligible) {
       const reverseLookup = await findUniqueUnpaidPersonalPracticeFeeDate(env.DB, sourceLabel);
       if (reverseLookup.practiceDate) {
         resolvedPracticeDate = reverseLookup.practiceDate;
@@ -838,6 +848,13 @@ async function resolvePracticeContext(
       typeBasis = "ai_inferred";
     }
   }
+
+  console.log({
+    stage: "personal_practice_date_resolution_result",
+    resolvedDate: resolvedPracticeDate,
+    dateBasis,
+    needsConfirmation
+  });
 
   return {
     resolvedPracticeDate,
@@ -1987,7 +2004,7 @@ function isDateLessPersonalPracticePaymentMessage(result: StructuredLineResult):
 async function findUniqueUnpaidPersonalPracticeFeeDate(
   db: D1Database,
   sourceLabel: string
-): Promise<{ practiceDate: string | null; candidateCount: number }> {
+): Promise<{ practiceDate: string | null; candidateCount: number; candidateDates: string[] }> {
   const rows = await db
     .prepare(
       `SELECT DISTINCT p.practice_date
@@ -2005,10 +2022,18 @@ async function findUniqueUnpaidPersonalPracticeFeeDate(
     .bind(sourceLabel)
     .all<{ practice_date: string }>();
   const candidates = rows.results ?? [];
+  const candidateDates = candidates
+    .map((row) => row.practice_date)
+    .filter((date): date is string => typeof date === "string");
+  console.log({
+    stage: "personal_practice_date_candidates",
+    candidateCount: candidateDates.length,
+    candidateDates
+  });
   if (candidates.length !== 1) {
-    return { practiceDate: null, candidateCount: candidates.length };
+    return { practiceDate: null, candidateCount: candidates.length, candidateDates };
   }
-  return { practiceDate: candidates[0]?.practice_date ?? null, candidateCount: 1 };
+  return { practiceDate: candidates[0]?.practice_date ?? null, candidateCount: 1, candidateDates };
 }
 
 async function savePracticeToD1(
