@@ -386,6 +386,56 @@ async function main() {
   assert.equal(case5Transport.result.return_transport.type, "車");
   assert.equal(case5Transport.result.return_transport.person, "山田さん");
 
+  // Transport display: 既存D1交通を返信用resultへ反映
+  const existingPracticeTransport = {
+    practice_date: "2026-08-14",
+    attendance: "参加",
+    outbound_type: "車",
+    outbound_person: "志村さん",
+    return_type: "車",
+    return_person: "志村さん",
+    bus_guide: null,
+    source: "羽魂練習会",
+    notes: null,
+    practice_type: "個人練習",
+    practice_type_basis: "weekday_default",
+    practice_type_priority: 700,
+    attendance_priority: 0,
+    outbound_priority: 0,
+    return_priority: 0,
+    bus_guide_priority: 0,
+    last_message_kind: "schedule"
+  } as const;
+  const mergedFromExisting = hooks.applyPersonalPracticeStandardTransport(
+    baseResult({
+      practice_type: "個人練習",
+      practice_date: "2026-08-14",
+      outbound_transport: { type: "不明", person: null },
+      return_transport: { type: "不明", person: null }
+    }) as any,
+    "個人練習",
+    existingPracticeTransport as any
+  );
+  assert.equal(mergedFromExisting.result.outbound_transport.type, "車");
+  assert.equal(mergedFromExisting.result.outbound_transport.person, "志村さん");
+  assert.equal(mergedFromExisting.result.return_transport.type, "車");
+  assert.equal(mergedFromExisting.result.return_transport.person, "志村さん");
+
+  // Transport display: 今回明示交通は既存D1値で上書きしない
+  const keepExplicitOverD1 = hooks.applyPersonalPracticeStandardTransport(
+    baseResult({
+      practice_type: "個人練習",
+      practice_date: "2026-08-14",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "車", person: "山田さん" }
+    }) as any,
+    "個人練習",
+    existingPracticeTransport as any
+  );
+  assert.equal(keepExplicitOverD1.result.outbound_transport.type, "バス");
+  assert.equal(keepExplicitOverD1.result.return_transport.type, "車");
+  assert.equal(keepExplicitOverD1.result.return_transport.person, "山田さん");
+
   // Flip Case A: 料金系メッセージで既存個人練習を通常練習へ反転しない
   await hooks.saveStructuredResultToD1(
     env,

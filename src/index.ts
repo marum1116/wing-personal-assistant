@@ -842,36 +842,43 @@ function applyPersonalPracticeStandardTransport(
   appliedOutbound: boolean;
   appliedReturn: boolean;
 } {
-  if (resolvedPracticeType !== "個人練習") {
-    return { result, appliedOutbound: false, appliedReturn: false };
-  }
-
   let appliedOutbound = false;
   let appliedReturn = false;
-  const shouldApplyOutbound =
-    result.outbound_transport.type === "不明" &&
-    !(existingPractice && existingPractice.outbound_type !== "不明");
-  const shouldApplyReturn =
-    result.return_transport.type === "不明" &&
-    !(existingPractice && existingPractice.return_type !== "不明");
+  const hasExplicitOutbound = result.outbound_transport.type !== "不明";
+  const hasExplicitReturn = result.return_transport.type !== "不明";
+  const hasExistingOutbound = !!existingPractice && existingPractice.outbound_type !== "不明";
+  const hasExistingReturn = !!existingPractice && existingPractice.return_type !== "不明";
 
-  const nextOutbound =
-    shouldApplyOutbound
-      ? ((appliedOutbound = true),
-        {
-          type: "車" as TransportType,
-          person: "志村さん"
-        })
-      : result.outbound_transport;
+  let nextOutbound = result.outbound_transport;
+  let nextReturn = result.return_transport;
 
-  const nextReturn =
-    shouldApplyReturn
-      ? ((appliedReturn = true),
-        {
-          type: "車" as TransportType,
-          person: "志村さん"
-        })
-      : result.return_transport;
+  if (!hasExplicitOutbound && hasExistingOutbound && existingPractice) {
+    nextOutbound = {
+      type: existingPractice.outbound_type,
+      person: existingPractice.outbound_person
+    };
+    appliedOutbound = true;
+  } else if (!hasExplicitOutbound && resolvedPracticeType === "個人練習") {
+    nextOutbound = {
+      type: "車",
+      person: "志村さん"
+    };
+    appliedOutbound = true;
+  }
+
+  if (!hasExplicitReturn && hasExistingReturn && existingPractice) {
+    nextReturn = {
+      type: existingPractice.return_type,
+      person: existingPractice.return_person
+    };
+    appliedReturn = true;
+  } else if (!hasExplicitReturn && resolvedPracticeType === "個人練習") {
+    nextReturn = {
+      type: "車",
+      person: "志村さん"
+    };
+    appliedReturn = true;
+  }
 
   if (!appliedOutbound && !appliedReturn) {
     return { result, appliedOutbound: false, appliedReturn: false };
@@ -970,8 +977,25 @@ function applyStandingPaymentRules(
   const resolvedPracticeType = resolvedPractice.practiceType;
   let basePayments: ParsedPayment[] = [];
   if (resolvedPracticeType === "個人練習") {
+    const beforePayments = result.payments.map((payment) => ({
+      type: payment.type,
+      amount: payment.amount,
+      payee: payment.payee,
+      payment_method: payment.payment_method
+    }));
     // 個人練習では message_kind に関わらず、AI抽出から個人練習系支払いのみ正規化して保持する。
     basePayments = normalizePersonalPracticePayments([...result.payments]);
+    const afterPayments = basePayments.map((payment) => ({
+      type: payment.type,
+      amount: payment.amount,
+      payee: payment.payee,
+      payment_method: payment.payment_method
+    }));
+    console.log({
+      stage: "personal_payment_normalized",
+      before: beforePayments,
+      after: afterPayments
+    });
   } else {
     // 通常練習は既存どおり schedule/dispatch系のAI支払いを破棄する。
     basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
@@ -3592,7 +3616,29 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       imageDataUrl,
       env
     );
+    console.log({
+      stage: "openai_structured_result",
+      message_kind: parsed.message_kind,
+      practice_date: parsed.practice_date,
+      practice_type: parsed.practice_type,
+      practice_type_basis: parsed.practice_type_basis,
+      payments: parsed.payments.map((payment) => ({
+        type: payment.type,
+        amount: payment.amount,
+        payee: payment.payee,
+        payment_method: payment.payment_method
+      }))
+    });
     const resolved = await resolvePracticeContext(env, selectedSourceId, userId, parsed, receivedAtMs);
+    console.log({
+      stage: "context_resolved",
+      resolved_practice_date: resolved.resolvedPracticeDate,
+      resolved_practice_type: resolved.resolvedPracticeType,
+      resolved_basis: {
+        date: resolved.dateBasis,
+        type: resolved.typeBasis
+      }
+    });
     const resolvedTypeMeta = resolvedTypeBasisToPracticeTypeBasis(resolved.typeBasis);
     const resolvedExtractionBasis: PracticeTypeExtractionBasis =
       resolved.typeBasis === "explicit_message" || resolved.typeBasis === "message_pair"
