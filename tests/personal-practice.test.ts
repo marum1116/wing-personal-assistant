@@ -645,6 +645,22 @@ async function main() {
   assert.equal(flipDAfter.practice_type, "個人練習");
 
   // Requested Case F: 実メッセージ相当（金曜・内訳・1人3620・丹下までPayPay）
+  // OpenAI期待仕様（プロンプト固定化メモ）:
+  // 入力相当:
+  // - 8/14金曜日 9-13時
+  // - 寺尾地区センター
+  // - 参加費 1500円×2人 / 施設費 / 高速往復 / 引率代
+  // - 全体合計7240円
+  // - 2人で割ると1人あたり3620円
+  // - 丹下までPayPayお願いします
+  // 期待payments:
+  // [
+  //   { type: "個人練習代", amount: 3620, payee: "丹下さん", payment_method: "PayPay" }
+  // ]
+  // 抽出禁止:
+  // - 参加費7240
+  // - 車同乗代
+  // - 施設費 / 高速代 / 引率代など内訳単体
   const reqCaseFParsed = baseResult({
     message_kind: "schedule",
     practice_date: "2026-08-14",
