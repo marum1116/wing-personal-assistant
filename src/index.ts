@@ -184,6 +184,16 @@ type RecentPracticeContext = {
   timestamp_ms: number;
 };
 
+function isPaymentFocusedMessage(result: StructuredLineResult): boolean {
+  if (result.message_kind === "accounting_notice") {
+    return true;
+  }
+  if (result.message_kind === "other" && result.payments.length > 0) {
+    return true;
+  }
+  return false;
+}
+
 type PracticeRow = {
   practice_date: string;
   attendance: Attendance;
@@ -684,43 +694,60 @@ async function resolvePracticeContext(
   needsConfirmation: boolean;
   addedUncertainPoints: string[];
 }> {
+  const isPaymentFocused = isPaymentFocusedMessage(result);
   let resolvedPracticeDate: string | null = result.practice_date;
   let dateBasis: ResolvedContextBasis = result.practice_date ? "explicit_message" : "unknown";
-  let resolvedPracticeType: PracticeType = result.practice_type;
-  let typeBasis: ResolvedContextBasis =
-    result.practice_type !== "不明" ? "explicit_message" : "unknown";
+  let resolvedPracticeType: PracticeType = "不明";
+  let typeBasis: ResolvedContextBasis = "unknown";
   const addedUncertainPoints: string[] = [];
   let needsConfirmation = false;
+  const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
 
   if (!resolvedPracticeDate) {
-    const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
     if (recent) {
       resolvedPracticeDate = recent.practice_date;
       dateBasis = "kv_recent_context";
-      if (resolvedPracticeType === "不明") {
-        resolvedPracticeType = recent.practice_type;
-        typeBasis = "kv_recent_context";
-      }
     } else {
       needsConfirmation = true;
       addedUncertainPoints.push("対象日の特定に追加確認が必要です。");
     }
   }
 
+  const recentApplicable =
+    !!recent && (!resolvedPracticeDate || recent.practice_date === resolvedPracticeDate);
+
+  let existingType: PracticeType = "不明";
   if (resolvedPracticeDate) {
     const existing = await getPracticeByDate(env.DB, resolvedPracticeDate);
     if (existing && existing.practice_type && existing.practice_type !== "不明") {
-      if (result.practice_date && dateBasis === "explicit_message") {
-        // 日付は本文明示を維持（type補完のみ）
-      } else if (!result.practice_date) {
-        // KV継承よりも対象日がD1で確定していることを優先
+      existingType = existing.practice_type;
+      if (!result.practice_date) {
         dateBasis = "d1_same_date";
       }
+    }
+  }
 
-      if (resolvedPracticeType === "不明") {
-        resolvedPracticeType = existing.practice_type;
-        typeBasis = "d1_same_date";
-      }
+  if (isPaymentFocused) {
+    if (existingType !== "不明") {
+      resolvedPracticeType = existingType;
+      typeBasis = "d1_same_date";
+    } else if (recentApplicable && recent && recent.practice_type !== "不明") {
+      resolvedPracticeType = recent.practice_type;
+      typeBasis = "kv_recent_context";
+    } else if (result.practice_type !== "不明") {
+      resolvedPracticeType = result.practice_type;
+      typeBasis = "explicit_message";
+    }
+  } else {
+    if (result.practice_type !== "不明") {
+      resolvedPracticeType = result.practice_type;
+      typeBasis = "explicit_message";
+    } else if (existingType !== "不明") {
+      resolvedPracticeType = existingType;
+      typeBasis = "d1_same_date";
+    } else if (recentApplicable && recent && recent.practice_type !== "不明") {
+      resolvedPracticeType = recent.practice_type;
+      typeBasis = "kv_recent_context";
     }
   }
 
@@ -743,12 +770,13 @@ async function resolvePracticeContext(
 }
 
 function resolvedTypeBasisToPracticeTypeBasis(
-  basis: ResolvedContextBasis
+  basis: ResolvedContextBasis,
+  isPaymentFocused: boolean
 ): { basis: PracticeTypeBasis; priority: number } {
   switch (basis) {
     case "explicit_message":
     case "message_pair":
-      return { basis: "explicit", priority: 1000 };
+      return { basis: "explicit", priority: isPaymentFocused ? 300 : 1000 };
     case "d1_same_date":
     case "kv_recent_context":
       return { basis: "explicit", priority: 800 };
@@ -1873,6 +1901,8 @@ async function savePracticeToD1(
   let practiceType = fallback.practice_type ?? "不明";
   let storedPracticeTypeBasis = fallback.practice_type_basis ?? "unknown";
   let storedPracticeTypePriority = fallback.practice_type_priority ?? 0;
+  const lockPracticeTypeForPaymentMessage =
+    isPaymentFocusedMessage(result) && (fallback.practice_type ?? "不明") !== "不明";
 
   let shouldReconcileEventPayments = false;
 
@@ -1919,7 +1949,7 @@ async function savePracticeToD1(
     notes = result.notes;
   }
 
-  if (practiceTypePriority >= storedPracticeTypePriority) {
+  if (!lockPracticeTypeForPaymentMessage && practiceTypePriority >= storedPracticeTypePriority) {
     practiceType = result.practice_type;
     storedPracticeTypeBasis = practiceTypeBasis;
     storedPracticeTypePriority = practiceTypePriority;
@@ -3536,7 +3566,10 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       env
     );
     const resolved = await resolvePracticeContext(env, selectedSourceId, userId, parsed, receivedAtMs);
-    const resolvedTypeMeta = resolvedTypeBasisToPracticeTypeBasis(resolved.typeBasis);
+    const resolvedTypeMeta = resolvedTypeBasisToPracticeTypeBasis(
+      resolved.typeBasis,
+      isPaymentFocusedMessage(parsed)
+    );
     const contextResolvedResult: StructuredLineResult = {
       ...parsed,
       practice_date: resolved.resolvedPracticeDate,

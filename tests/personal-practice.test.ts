@@ -333,6 +333,159 @@ async function main() {
   assert.equal(case5Transport.result.return_transport.type, "車");
   assert.equal(case5Transport.result.return_transport.person, "山田さん");
 
+  // Flip Case A: 料金系メッセージで既存個人練習を通常練習へ反転しない
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "個人練習",
+      practice_date: "2026-10-01",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" },
+      payments: [{ type: "個人練習代", amount: 3000, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    "explicit",
+    1000
+  );
+  const flipAParsed = baseResult({
+    message_kind: "accounting_notice",
+    practice_type: "通常練習",
+    practice_date: "2026-10-01",
+    payments: [
+      { type: "参加費", amount: 3620, payee: null, due_date: null, payment_method: "PayPay" },
+      { type: "その他", amount: 3620, payee: null, due_date: null, payment_method: "PayPay" },
+      { type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }
+    ]
+  }) as any;
+  const flipAResolved = await hooks.resolvePracticeContext(env, sourceId, userId, flipAParsed, Date.now());
+  assert.equal(flipAResolved.resolvedPracticeType, "個人練習");
+  const flipAStanding = hooks.applyStandingPaymentRules(
+    {
+      ...flipAParsed,
+      practice_type: flipAResolved.resolvedPracticeType,
+      practice_date: flipAResolved.resolvedPracticeDate
+    },
+    { resolvedPracticeType: flipAResolved.resolvedPracticeType }
+  );
+  assert.equal(flipAStanding.result.payments.length, 1);
+  assert.equal(flipAStanding.result.payments[0]?.type, "個人練習代");
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    flipAStanding.result,
+    "explicit",
+    300
+  );
+  const flipAPractice = raw
+    .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-01' LIMIT 1")
+    .get() as { practice_type: string };
+  assert.equal(flipAPractice.practice_type, "個人練習");
+  const flipAPayments = raw
+    .prepare("SELECT payment_type, amount, rule_key FROM payments WHERE practice_date='2026-10-01' AND status='unpaid'")
+    .all() as Array<{ payment_type: string; amount: number; rule_key: string | null }>;
+  assert.ok(flipAPayments.some((row) => row.rule_key === "personal_practice_fee" && row.amount === 3620));
+  assert.equal(flipAPayments.some((row) => row.payment_type === "参加費" || row.payment_type === "その他"), false);
+
+  // Flip Case B: 料金系メッセージで既存通常練習を個人練習へ反転しない
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_date: "2026-10-02",
+      outbound_transport: { type: "車", person: "山田さん" },
+      return_transport: { type: "自力", person: null },
+      payments: []
+    }) as any,
+    "explicit",
+    1000
+  );
+  const flipBParsed = baseResult({
+    message_kind: "accounting_notice",
+    practice_type: "個人練習",
+    practice_date: "2026-10-02",
+    payments: [{ type: "個人練習代", amount: 3500, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+  }) as any;
+  const flipBResolved = await hooks.resolvePracticeContext(env, sourceId, userId, flipBParsed, Date.now());
+  assert.equal(flipBResolved.resolvedPracticeType, "通常練習");
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    {
+      ...flipBParsed,
+      practice_type: flipBResolved.resolvedPracticeType,
+      practice_date: flipBResolved.resolvedPracticeDate
+    },
+    "explicit",
+    300
+  );
+  const flipBPractice = raw
+    .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-02' LIMIT 1")
+    .get() as { practice_type: string };
+  assert.equal(flipBPractice.practice_type, "通常練習");
+
+  // Flip Case C: D1なし + KVありなら料金系AI種別よりKVを優先
+  await hooks.saveRecentPracticeContext(
+    env,
+    "flip-c-user",
+    sourceId,
+    "2026-10-03",
+    "個人練習",
+    Date.now() - 2 * 60 * 1000
+  );
+  const flipCResolved = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "flip-c-user",
+    baseResult({
+      message_kind: "accounting_notice",
+      practice_type: "通常練習",
+      practice_date: null,
+      payments: [{ type: "個人練習代", amount: 4040, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(flipCResolved.resolvedPracticeDate, "2026-10-03");
+  assert.equal(flipCResolved.resolvedPracticeType, "個人練習");
+
+  // Flip Case D: D1/KVなしの料金系は他日practice_typeを変更しない
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "個人練習",
+      practice_date: "2026-10-04",
+      payments: []
+    }) as any,
+    "explicit",
+    1000
+  );
+  const flipDBefore = raw
+    .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-04' LIMIT 1")
+    .get() as { practice_type: string };
+  assert.equal(flipDBefore.practice_type, "個人練習");
+  const flipDResolved = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "flip-d-user",
+    baseResult({
+      message_kind: "accounting_notice",
+      practice_type: "通常練習",
+      practice_date: null,
+      payments: [{ type: "参加費", amount: 1200, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(flipDResolved.resolvedPracticeDate, null);
+  assert.equal(flipDResolved.needsConfirmation, true);
+  const flipDAfter = raw
+    .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-04' LIMIT 1")
+    .get() as { practice_type: string };
+  assert.equal(flipDAfter.practice_type, "個人練習");
+
   // Case A: payee/payment_method 抽出結果の保存（志村さんをpayeeにしない）
   await hooks.saveStructuredResultToD1(
     env,
