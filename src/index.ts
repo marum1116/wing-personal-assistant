@@ -925,6 +925,55 @@ function normalizePersonalPracticePayments(payments: ParsedPayment[]): ParsedPay
   return picked;
 }
 
+function isPracticeDateUncertainPoint(point: string): boolean {
+  return /(対象日|日付).*(不明|特定|確認|必要)|対象日の特定/.test(point);
+}
+
+function reconcileDateResolutionUncertainty(input: {
+  resolvedPracticeDate: string | null;
+  uncertainPoints: string[];
+  parsedNeedsConfirmation: boolean;
+  resolvedNeedsConfirmation: boolean;
+}): { uncertainPoints: string[]; needsConfirmation: boolean } {
+  const hadDateUncertainty = input.uncertainPoints.some((point) => isPracticeDateUncertainPoint(point));
+  const filteredUncertainPoints = input.resolvedPracticeDate
+    ? input.uncertainPoints.filter((point) => !isPracticeDateUncertainPoint(point))
+    : input.uncertainPoints;
+
+  if (filteredUncertainPoints.length > 0) {
+    return {
+      uncertainPoints: filteredUncertainPoints,
+      needsConfirmation: true
+    };
+  }
+
+  if (input.resolvedNeedsConfirmation) {
+    return {
+      uncertainPoints: filteredUncertainPoints,
+      needsConfirmation: true
+    };
+  }
+
+  if (!input.resolvedPracticeDate && input.parsedNeedsConfirmation) {
+    return {
+      uncertainPoints: filteredUncertainPoints,
+      needsConfirmation: true
+    };
+  }
+
+  if (input.resolvedPracticeDate && input.parsedNeedsConfirmation && !hadDateUncertainty) {
+    return {
+      uncertainPoints: filteredUncertainPoints,
+      needsConfirmation: true
+    };
+  }
+
+  return {
+    uncertainPoints: filteredUncertainPoints,
+    needsConfirmation: false
+  };
+}
+
 function applyPersonalPracticeStandardTransport(
   result: StructuredLineResult,
   resolvedPracticeType: PracticeType,
@@ -3780,14 +3829,21 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
         : resolved.typeBasis === "unknown"
           ? "unknown"
           : "inferred";
+    const combinedUncertainPoints = [...parsed.uncertain_points, ...resolved.addedUncertainPoints];
+    const reconciledDateUncertainty = reconcileDateResolutionUncertainty({
+      resolvedPracticeDate: resolved.resolvedPracticeDate,
+      uncertainPoints: combinedUncertainPoints,
+      parsedNeedsConfirmation: parsed.needs_confirmation,
+      resolvedNeedsConfirmation: resolved.needsConfirmation
+    });
     const contextResolvedResult: StructuredLineResult = {
       ...parsed,
       practice_date: resolved.resolvedPracticeDate,
       practice_type: resolved.resolvedPracticeType,
       practice_type_basis: resolvedExtractionBasis,
       practice_type_evidence: resolvedExtractionBasis === "explicit" ? parsed.practice_type_evidence : null,
-      uncertain_points: [...parsed.uncertain_points, ...resolved.addedUncertainPoints],
-      needs_confirmation: parsed.needs_confirmation || resolved.needsConfirmation
+      uncertain_points: reconciledDateUncertainty.uncertainPoints,
+      needs_confirmation: reconciledDateUncertainty.needsConfirmation
     };
 
     const existingPracticeForResolvedDate = resolved.resolvedPracticeDate
@@ -4096,6 +4152,7 @@ export class PairingSession implements DurableObject {
 export const TEST_HOOKS = {
   applyStandingPaymentRules,
   applyPersonalPracticeStandardTransport,
+  reconcileDateResolutionUncertainty,
   resolvePairedImageDataUrlForTextEvent,
   resolvePracticeContext,
   saveRecentPracticeContext,

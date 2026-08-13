@@ -866,6 +866,59 @@ async function main() {
   assert.equal(resolveCaseERow.status, "unpaid");
   assert.equal(resolveCaseERow.rule_key, "personal_practice_fee");
 
+  // Date Uncertainty Case A: 日付不明だけなら解決後に確認不要へ
+  const dateUncertaintyA = hooks.reconcileDateResolutionUncertainty({
+    resolvedPracticeDate: "2026-08-14",
+    uncertainPoints: ["対象日の特定が必要"],
+    parsedNeedsConfirmation: true,
+    resolvedNeedsConfirmation: false
+  });
+  assert.equal(dateUncertaintyA.needsConfirmation, false);
+  assert.deepEqual(dateUncertaintyA.uncertainPoints, []);
+
+  // Date Uncertainty Case B: 日付以外の不確定要素は保持
+  const dateUncertaintyB = hooks.reconcileDateResolutionUncertainty({
+    resolvedPracticeDate: "2026-08-14",
+    uncertainPoints: ["対象日の特定が必要", "支払期限が不明"],
+    parsedNeedsConfirmation: true,
+    resolvedNeedsConfirmation: false
+  });
+  assert.equal(dateUncertaintyB.needsConfirmation, true);
+  assert.deepEqual(dateUncertaintyB.uncertainPoints, ["支払期限が不明"]);
+
+  // Date Uncertainty Case C: 日付未解決なら対象日不明は保持
+  const dateUncertaintyC = hooks.reconcileDateResolutionUncertainty({
+    resolvedPracticeDate: null,
+    uncertainPoints: ["対象日の特定が必要"],
+    parsedNeedsConfirmation: true,
+    resolvedNeedsConfirmation: true
+  });
+  assert.equal(dateUncertaintyC.needsConfirmation, true);
+  assert.deepEqual(dateUncertaintyC.uncertainPoints, ["対象日の特定が必要"]);
+
+  // Date Uncertainty Case D: 交通不明の解消ロジックを壊さない
+  const dateUncertaintyDBase = hooks.reconcileDateResolutionUncertainty({
+    resolvedPracticeDate: "2026-08-14",
+    uncertainPoints: ["対象日の特定が必要", "行きの交通手段が不明です。"],
+    parsedNeedsConfirmation: true,
+    resolvedNeedsConfirmation: false
+  });
+  const dateUncertaintyDTransportApplied = hooks.applyPersonalPracticeStandardTransport(
+    {
+      ...(baseResult({
+        practice_type: "個人練習",
+        practice_date: "2026-08-14",
+        outbound_transport: { type: "不明", person: null },
+        return_transport: { type: "不明", person: null }
+      }) as any),
+      uncertain_points: dateUncertaintyDBase.uncertainPoints,
+      needs_confirmation: dateUncertaintyDBase.needsConfirmation
+    },
+    "個人練習"
+  );
+  assert.deepEqual(dateUncertaintyDTransportApplied.result.uncertain_points, []);
+  assert.equal(dateUncertaintyDTransportApplied.result.needs_confirmation, false);
+
   // Requested Case F: 実メッセージ相当（金曜・内訳・1人3620・丹下までPayPay）
   // OpenAI期待仕様（プロンプト固定化メモ）:
   // 入力相当:
