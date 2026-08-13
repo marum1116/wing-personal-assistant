@@ -84,6 +84,7 @@ type MessageKind =
   | "general_rule"
   | "other";
 type PracticeType = "通常練習" | "個人練習" | "不明";
+type PracticeTypeExtractionBasis = "explicit" | "inferred" | "unknown";
 type MonthlyType = "regular_training_total" | "shimura_car_fee";
 type PaymentMethod = "PayPay" | "現金" | "楽天Pay" | "その他" | "不明";
 
@@ -168,7 +169,13 @@ type ReminderPaymentRow = {
   reminder_sent_on: string | null;
 };
 
-type PracticeTypeBasis = "explicit" | "weekday_default" | "unknown";
+type StoredPracticeTypeBasis =
+  | "explicit"
+  | "d1_same_date"
+  | "kv_recent_context"
+  | "weekday_default"
+  | "ai_inferred"
+  | "unknown";
 
 type ResolvedContextBasis =
   | "explicit_message"
@@ -176,6 +183,7 @@ type ResolvedContextBasis =
   | "d1_same_date"
   | "kv_recent_context"
   | "weekday_default"
+  | "ai_inferred"
   | "unknown";
 
 type RecentPracticeContext = {
@@ -183,16 +191,6 @@ type RecentPracticeContext = {
   practice_type: PracticeType;
   timestamp_ms: number;
 };
-
-function isPaymentFocusedMessage(result: StructuredLineResult): boolean {
-  if (result.message_kind === "accounting_notice") {
-    return true;
-  }
-  if (result.message_kind === "other" && result.payments.length > 0) {
-    return true;
-  }
-  return false;
-}
 
 type PracticeRow = {
   practice_date: string;
@@ -205,7 +203,7 @@ type PracticeRow = {
   source: string;
   notes: string | null;
   practice_type: PracticeType | null;
-  practice_type_basis: PracticeTypeBasis | null;
+  practice_type_basis: StoredPracticeTypeBasis | null;
   practice_type_priority: number | null;
   attendance_priority: number | null;
   outbound_priority: number | null;
@@ -232,6 +230,8 @@ type SaveStructuredResultOutcome = {
 type StructuredLineResult = {
   message_kind: MessageKind;
   practice_type: PracticeType;
+  practice_type_basis: PracticeTypeExtractionBasis;
+  practice_type_evidence: string | null;
   monthly_charges: MonthlyCharge[];
   practice_date: string | null;
   attendance: Attendance;
@@ -266,6 +266,8 @@ const STRUCTURED_OUTPUT_SCHEMA = {
       ]
     },
     practice_type: { type: "string", enum: ["通常練習", "個人練習", "不明"] },
+    practice_type_basis: { type: "string", enum: ["explicit", "inferred", "unknown"] },
+    practice_type_evidence: { type: ["string", "null"] },
     monthly_charges: {
       type: "array",
       items: {
@@ -340,6 +342,8 @@ const STRUCTURED_OUTPUT_SCHEMA = {
   required: [
     "message_kind",
     "practice_type",
+    "practice_type_basis",
+    "practice_type_evidence",
     "monthly_charges",
     "practice_date",
     "attendance",
@@ -655,14 +659,21 @@ function inferPracticeTypeByWeekday(practiceDate: string | null): PracticeType {
 
 function resolvePracticeType(result: StructuredLineResult): {
   practiceType: PracticeType;
-  basis: PracticeTypeBasis;
+  basis: StoredPracticeTypeBasis;
   priority: number;
 } {
-  if (result.practice_type !== "不明") {
+  if (result.practice_type !== "不明" && result.practice_type_basis === "explicit") {
     return {
       practiceType: result.practice_type,
       basis: "explicit",
       priority: 1000
+    };
+  }
+  if (result.practice_type !== "不明" && result.practice_type_basis === "inferred") {
+    return {
+      practiceType: result.practice_type,
+      basis: "ai_inferred",
+      priority: 600
     };
   }
   const inferred = inferPracticeTypeByWeekday(result.practice_date);
@@ -670,7 +681,14 @@ function resolvePracticeType(result: StructuredLineResult): {
     return {
       practiceType: inferred,
       basis: "weekday_default",
-      priority: 100
+      priority: 700
+    };
+  }
+  if (result.practice_type !== "不明") {
+    return {
+      practiceType: result.practice_type,
+      basis: "ai_inferred",
+      priority: 600
     };
   }
   return {
@@ -694,7 +712,6 @@ async function resolvePracticeContext(
   needsConfirmation: boolean;
   addedUncertainPoints: string[];
 }> {
-  const isPaymentFocused = isPaymentFocusedMessage(result);
   let resolvedPracticeDate: string | null = result.practice_date;
   let dateBasis: ResolvedContextBasis = result.practice_date ? "explicit_message" : "unknown";
   let resolvedPracticeType: PracticeType = "不明";
@@ -727,35 +744,23 @@ async function resolvePracticeContext(
     }
   }
 
-  if (isPaymentFocused) {
-    if (existingType !== "不明") {
-      resolvedPracticeType = existingType;
-      typeBasis = "d1_same_date";
-    } else if (recentApplicable && recent && recent.practice_type !== "不明") {
-      resolvedPracticeType = recent.practice_type;
-      typeBasis = "kv_recent_context";
+  if (result.practice_type !== "不明" && result.practice_type_basis === "explicit") {
+    resolvedPracticeType = result.practice_type;
+    typeBasis = "explicit_message";
+  } else if (existingType !== "不明") {
+    resolvedPracticeType = existingType;
+    typeBasis = "d1_same_date";
+  } else if (recentApplicable && recent && recent.practice_type !== "不明") {
+    resolvedPracticeType = recent.practice_type;
+    typeBasis = "kv_recent_context";
+  } else {
+    const inferredByRule = inferPracticeTypeByWeekday(resolvedPracticeDate);
+    if (inferredByRule !== "不明") {
+      resolvedPracticeType = inferredByRule;
+      typeBasis = "weekday_default";
     } else if (result.practice_type !== "不明") {
       resolvedPracticeType = result.practice_type;
-      typeBasis = "explicit_message";
-    }
-  } else {
-    if (result.practice_type !== "不明") {
-      resolvedPracticeType = result.practice_type;
-      typeBasis = "explicit_message";
-    } else if (existingType !== "不明") {
-      resolvedPracticeType = existingType;
-      typeBasis = "d1_same_date";
-    } else if (recentApplicable && recent && recent.practice_type !== "不明") {
-      resolvedPracticeType = recent.practice_type;
-      typeBasis = "kv_recent_context";
-    }
-  }
-
-  if (resolvedPracticeType === "不明") {
-    const inferred = inferPracticeTypeByWeekday(resolvedPracticeDate);
-    if (inferred !== "不明") {
-      resolvedPracticeType = inferred;
-      typeBasis = "weekday_default";
+      typeBasis = "ai_inferred";
     }
   }
 
@@ -770,18 +775,20 @@ async function resolvePracticeContext(
 }
 
 function resolvedTypeBasisToPracticeTypeBasis(
-  basis: ResolvedContextBasis,
-  isPaymentFocused: boolean
-): { basis: PracticeTypeBasis; priority: number } {
+  basis: ResolvedContextBasis
+): { basis: StoredPracticeTypeBasis; priority: number } {
   switch (basis) {
     case "explicit_message":
     case "message_pair":
-      return { basis: "explicit", priority: isPaymentFocused ? 300 : 1000 };
+      return { basis: "explicit", priority: 1000 };
     case "d1_same_date":
+      return { basis: "d1_same_date", priority: 900 };
     case "kv_recent_context":
-      return { basis: "explicit", priority: 800 };
+      return { basis: "kv_recent_context", priority: 850 };
     case "weekday_default":
-      return { basis: "weekday_default", priority: 100 };
+      return { basis: "weekday_default", priority: 700 };
+    case "ai_inferred":
+      return { basis: "ai_inferred", priority: 600 };
     default:
       return { basis: "unknown", priority: 0 };
   }
@@ -943,27 +950,31 @@ function applyStandingPaymentRules(
   result: StructuredLineResult,
   override?: {
     resolvedPracticeType?: PracticeType;
-    practiceTypeBasis?: PracticeTypeBasis;
+    practiceTypeBasis?: StoredPracticeTypeBasis;
     practiceTypePriority?: number;
   }
 ): {
   result: StructuredLineResult;
   addedPaymentCount: number;
   resolvedPracticeType: PracticeType;
-  practiceTypeBasis: PracticeTypeBasis;
+  practiceTypeBasis: StoredPracticeTypeBasis;
   practiceTypePriority: number;
 } {
   const resolvedPractice = override?.resolvedPracticeType
     ? {
         practiceType: override.resolvedPracticeType,
-        basis: override.practiceTypeBasis ?? ("unknown" as PracticeTypeBasis),
+        basis: override.practiceTypeBasis ?? ("unknown" as StoredPracticeTypeBasis),
         priority: override.practiceTypePriority ?? 0
       }
     : resolvePracticeType(result);
   const resolvedPracticeType = resolvedPractice.practiceType;
-  let basePayments: ParsedPayment[] = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
+  let basePayments: ParsedPayment[] = [];
   if (resolvedPracticeType === "個人練習") {
-    basePayments = normalizePersonalPracticePayments(basePayments);
+    // 個人練習では message_kind に関わらず、AI抽出から個人練習系支払いのみ正規化して保持する。
+    basePayments = normalizePersonalPracticePayments([...result.payments]);
+  } else {
+    // 通常練習は既存どおり schedule/dispatch系のAI支払いを破棄する。
+    basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
   }
   const mergedPayments = [...basePayments];
   const existingCounts = new Map<string, number>();
@@ -1000,10 +1011,20 @@ function applyStandingPaymentRules(
     addedPaymentCount += 1;
   }
 
+  const outputPracticeTypeBasis: PracticeTypeExtractionBasis =
+    resolvedPractice.basis === "explicit"
+      ? "explicit"
+      : resolvedPractice.basis === "unknown"
+        ? "unknown"
+        : "inferred";
+
   return {
     result: {
       ...result,
       practice_type: resolvedPracticeType,
+      practice_type_basis: outputPracticeTypeBasis,
+      practice_type_evidence:
+        outputPracticeTypeBasis === "explicit" ? result.practice_type_evidence : null,
       payments: mergedPayments
     },
     addedPaymentCount,
@@ -1812,9 +1833,13 @@ function formatPaymentSummaryLine(payment: {
 }
 
 function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResult {
+  const extractionBasis: PracticeTypeExtractionBasis =
+    practice.practice_type_basis === "explicit" ? "explicit" : "unknown";
   return {
     message_kind: "dispatch_confirmed",
     practice_type: practice.practice_type ?? "不明",
+    practice_type_basis: extractionBasis,
+    practice_type_evidence: null,
     monthly_charges: [],
     practice_date: practice.practice_date,
     attendance: practice.attendance,
@@ -1853,7 +1878,7 @@ async function savePracticeToD1(
   env: Env,
   sourceLabel: string,
   result: StructuredLineResult,
-  practiceTypeBasis: PracticeTypeBasis,
+  practiceTypeBasis: StoredPracticeTypeBasis,
   practiceTypePriority: number
 ): Promise<{
   practiceSaved: boolean;
@@ -1901,8 +1926,6 @@ async function savePracticeToD1(
   let practiceType = fallback.practice_type ?? "不明";
   let storedPracticeTypeBasis = fallback.practice_type_basis ?? "unknown";
   let storedPracticeTypePriority = fallback.practice_type_priority ?? 0;
-  const lockPracticeTypeForPaymentMessage =
-    isPaymentFocusedMessage(result) && (fallback.practice_type ?? "不明") !== "不明";
 
   let shouldReconcileEventPayments = false;
 
@@ -1949,7 +1972,7 @@ async function savePracticeToD1(
     notes = result.notes;
   }
 
-  if (!lockPracticeTypeForPaymentMessage && practiceTypePriority >= storedPracticeTypePriority) {
+  if (practiceTypePriority >= storedPracticeTypePriority) {
     practiceType = result.practice_type;
     storedPracticeTypeBasis = practiceTypeBasis;
     storedPracticeTypePriority = practiceTypePriority;
@@ -2831,7 +2854,7 @@ async function saveStructuredResultToD1(
   env: Env,
   sourceLabel: string,
   result: StructuredLineResult,
-  practiceTypeBasis: PracticeTypeBasis,
+  practiceTypeBasis: StoredPracticeTypeBasis,
   practiceTypePriority: number
 ): Promise<SaveStructuredResultOutcome> {
   const savedMonthlyCharges: SaveStructuredResultOutcome["savedMonthlyCharges"] = [];
@@ -3059,7 +3082,11 @@ async function callOpenAIForStructuredResult(
     "message_kindは必須で、schedule/dispatch_candidate/dispatch_confirmed/same_day_change/accounting_notice/general_rule/otherのどれかを返してください。" +
     "scheduleは参加予定、dispatch_candidateは配車候補、dispatch_confirmedは確定配車、same_day_changeは当日含む変更連絡、" +
     "accounting_noticeは会計・請求連絡、general_ruleは恒常ルール、otherはその他です。" +
-    "practice_typeは必須で、本文や画像に明示がある場合のみ通常練習または個人練習を返し、明示がなければ不明にしてください。" +
+    "practice_typeは必須で、本文や画像に明示があれば通常練習または個人練習を返してください。" +
+    "明示がないが推測できる場合はpractice_typeを返してpractice_type_basis=inferred、推測不能ならpractice_type=不明かつpractice_type_basis=unknownにしてください。" +
+    "practice_type_basisは必須で、practice_typeが本文や画像中の直接表現（個人練習/個別練習/通常練習等）に基づく場合だけexplicit、" +
+    "曜日・会場・料金文脈などからの推測はinferred、判定不能はunknownにしてください。" +
+    "practice_type_evidenceにはexplicitの根拠となる短い原文を入れ、explicitでない場合はnullにしてください。" +
     "本文に書かれていない内容は推測しないでください。不明はnullまたは不明を使ってください。" +
     "一般ルールで金額を補完しないでください。相対日付は合理的に確定できる場合のみYYYY-MM-DDへ変換し、" +
     "不確定ならdue_dateをnullにしてuncertain_pointsへ理由を入れてください。" +
@@ -3566,14 +3593,19 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       env
     );
     const resolved = await resolvePracticeContext(env, selectedSourceId, userId, parsed, receivedAtMs);
-    const resolvedTypeMeta = resolvedTypeBasisToPracticeTypeBasis(
-      resolved.typeBasis,
-      isPaymentFocusedMessage(parsed)
-    );
+    const resolvedTypeMeta = resolvedTypeBasisToPracticeTypeBasis(resolved.typeBasis);
+    const resolvedExtractionBasis: PracticeTypeExtractionBasis =
+      resolved.typeBasis === "explicit_message" || resolved.typeBasis === "message_pair"
+        ? "explicit"
+        : resolved.typeBasis === "unknown"
+          ? "unknown"
+          : "inferred";
     const contextResolvedResult: StructuredLineResult = {
       ...parsed,
       practice_date: resolved.resolvedPracticeDate,
       practice_type: resolved.resolvedPracticeType,
+      practice_type_basis: resolvedExtractionBasis,
+      practice_type_evidence: resolvedExtractionBasis === "explicit" ? parsed.practice_type_evidence : null,
       uncertain_points: [...parsed.uncertain_points, ...resolved.addedUncertainPoints],
       needs_confirmation: parsed.needs_confirmation || resolved.needsConfirmation
     };

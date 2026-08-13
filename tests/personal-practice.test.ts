@@ -149,7 +149,9 @@ function createTestEnv() {
 function baseResult(overrides: Record<string, unknown>) {
   return {
     message_kind: "accounting_notice",
-    practice_type: "通常練習",
+    practice_type: "不明",
+    practice_type_basis: "unknown",
+    practice_type_evidence: null,
     monthly_charges: [],
     practice_date: "2026-08-01",
     attendance: "参加",
@@ -169,6 +171,57 @@ async function main() {
   const hooks = TEST_HOOKS;
   const sourceId = "wing" as const;
   const userId = "test-user";
+
+  // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
+  const reqCaseA = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "req-a-user",
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-08-14",
+      practice_type: "通常練習",
+      practice_type_basis: "inferred",
+      practice_type_evidence: null,
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(reqCaseA.resolvedPracticeType, "個人練習");
+
+  // Requested Case B: 月曜日・種別明示なし・AI推測個人練習でも曜日ルール優先で通常練習
+  const reqCaseB = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "req-b-user",
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-08-10",
+      practice_type: "個人練習",
+      practice_type_basis: "inferred",
+      practice_type_evidence: null,
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(reqCaseB.resolvedPracticeType, "通常練習");
+
+  // Requested Case C: 月曜日でも本文明示個人練習なら個人練習を優先
+  const reqCaseC = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "req-c-user",
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-08-10",
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(reqCaseC.resolvedPracticeType, "個人練習");
 
   // New Case 1: 個人練習の標準交通補完（交通記載なし）
   const case1Resolved = await hooks.resolvePracticeContext(
@@ -387,6 +440,23 @@ async function main() {
   assert.ok(flipAPayments.some((row) => row.rule_key === "personal_practice_fee" && row.amount === 3620));
   assert.equal(flipAPayments.some((row) => row.payment_type === "参加費" || row.payment_type === "その他"), false);
 
+  // Requested Case D: D1既存個人練習 + 後続AI inferred通常練習でも個人練習維持
+  const reqCaseD = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "req-d-user",
+    baseResult({
+      message_kind: "other",
+      practice_type: "通常練習",
+      practice_type_basis: "inferred",
+      practice_type_evidence: null,
+      practice_date: "2026-10-01",
+      payments: [{ type: "その他", amount: 1000, payee: null, due_date: null, payment_method: null }]
+    }) as any,
+    Date.now()
+  );
+  assert.equal(reqCaseD.resolvedPracticeType, "個人練習");
+
   // Flip Case B: 料金系メッセージで既存通常練習を個人練習へ反転しない
   await hooks.saveStructuredResultToD1(
     env,
@@ -425,6 +495,44 @@ async function main() {
     .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-02' LIMIT 1")
     .get() as { practice_type: string };
   assert.equal(flipBPractice.practice_type, "通常練習");
+
+  // Requested Case E: D1既存通常練習 + 後続explicit個人練習なら訂正可能
+  const reqCaseEResolved = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "req-e-user",
+    baseResult({
+      message_kind: "schedule",
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習です",
+      practice_date: "2026-10-02",
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(reqCaseEResolved.resolvedPracticeType, "個人練習");
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    {
+      ...(baseResult({
+        message_kind: "schedule",
+        practice_date: "2026-10-02",
+        practice_type: "個人練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "個人練習です",
+        payments: []
+      }) as any),
+      practice_type: reqCaseEResolved.resolvedPracticeType
+    },
+    "explicit",
+    1000
+  );
+  const reqCaseEPractice = raw
+    .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-02' LIMIT 1")
+    .get() as { practice_type: string };
+  assert.equal(reqCaseEPractice.practice_type, "個人練習");
 
   // Flip Case C: D1なし + KVありなら料金系AI種別よりKVを優先
   await hooks.saveRecentPracticeContext(
@@ -485,6 +593,76 @@ async function main() {
     .prepare("SELECT practice_type FROM practices WHERE practice_date='2026-10-04' LIMIT 1")
     .get() as { practice_type: string };
   assert.equal(flipDAfter.practice_type, "個人練習");
+
+  // Requested Case F: 実メッセージ相当（金曜・内訳・1人3620・丹下までPayPay）
+  const reqCaseFParsed = baseResult({
+    message_kind: "schedule",
+    practice_date: "2026-08-14",
+    practice_type: "通常練習",
+    practice_type_basis: "inferred",
+    practice_type_evidence: null,
+    outbound_transport: { type: "不明", person: null },
+    return_transport: { type: "不明", person: null },
+    notes: "寺尾地区センター。集合時間は後から連絡",
+    payments: [
+      { type: "参加費", amount: 2000, payee: null, due_date: null, payment_method: "PayPay" },
+      { type: "その他", amount: 1620, payee: null, due_date: null, payment_method: "PayPay" },
+      { type: "個人練習代", amount: 3620, payee: "丹下さん", due_date: null, payment_method: "PayPay" }
+    ]
+  }) as any;
+  const reqCaseFResolved = await hooks.resolvePracticeContext(env, sourceId, "req-f-user", reqCaseFParsed, Date.now());
+  assert.equal(reqCaseFResolved.resolvedPracticeType, "個人練習");
+  const reqCaseFTransport = hooks.applyPersonalPracticeStandardTransport(
+    { ...reqCaseFParsed, practice_type: reqCaseFResolved.resolvedPracticeType },
+    reqCaseFResolved.resolvedPracticeType
+  );
+  assert.equal(reqCaseFTransport.result.outbound_transport.type, "車");
+  assert.equal(reqCaseFTransport.result.outbound_transport.person, "志村さん");
+  assert.equal(reqCaseFTransport.result.return_transport.type, "車");
+  assert.equal(reqCaseFTransport.result.return_transport.person, "志村さん");
+  const reqCaseFStanding = hooks.applyStandingPaymentRules(reqCaseFTransport.result as any, {
+    resolvedPracticeType: reqCaseFResolved.resolvedPracticeType
+  });
+  assert.equal(reqCaseFStanding.result.payments.length, 1);
+  assert.equal(reqCaseFStanding.result.payments[0]?.type, "個人練習代");
+  assert.equal(reqCaseFStanding.result.payments[0]?.amount, 3620);
+  assert.equal(reqCaseFStanding.result.payments[0]?.payee, "丹下さん");
+  assert.equal(reqCaseFStanding.result.payments[0]?.payment_method, "PayPay");
+
+  // Requested Regression: 通常練習 schedule は従来どおりAI支払いを落とす
+  const regularScheduleDrop = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-08-11",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      payments: [
+        { type: "参加費", amount: 3620, payee: null, due_date: null, payment_method: null },
+        { type: "その他", amount: 1000, payee: null, due_date: null, payment_method: null }
+      ]
+    }) as any
+  );
+  assert.equal(regularScheduleDrop.result.payments.length, 0);
+
+  // Requested Regression: 個人練習差額は message_kind だけで削除しない
+  const personalAdjustmentOnSchedule = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-08-16",
+      practice_type: "通常練習",
+      practice_type_basis: "inferred",
+      practice_type_evidence: null,
+      payments: [
+        { type: "個人練習差額", amount: 420, payee: "丹下さん", due_date: null, payment_method: "PayPay" },
+        { type: "その他", amount: 2000, payee: null, due_date: null, payment_method: null }
+      ]
+    }) as any,
+    { resolvedPracticeType: "個人練習" }
+  );
+  assert.equal(personalAdjustmentOnSchedule.result.payments.length, 1);
+  assert.equal(personalAdjustmentOnSchedule.result.payments[0]?.type, "個人練習差額");
+  assert.equal(personalAdjustmentOnSchedule.result.payments[0]?.amount, 420);
 
   // Case A: payee/payment_method 抽出結果の保存（志村さんをpayeeにしない）
   await hooks.saveStructuredResultToD1(
@@ -790,6 +968,8 @@ async function main() {
       baseResult({
         message_kind: "dispatch_confirmed",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: regularRows[0][0],
         outbound_transport: { type: "車", person: "志村さん" },
         return_transport: { type: "自力", person: null }
@@ -805,6 +985,8 @@ async function main() {
       baseResult({
         message_kind: "dispatch_confirmed",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: regularRows[1][0],
         outbound_transport: { type: "自力", person: null },
         return_transport: { type: "車", person: "志村さん" }
@@ -820,6 +1002,8 @@ async function main() {
       baseResult({
         message_kind: "dispatch_confirmed",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: regularRows[2][0],
         outbound_transport: { type: "自力", person: null },
         return_transport: { type: "バス", person: null },
@@ -849,6 +1033,8 @@ async function main() {
       baseResult({
         message_kind: "dispatch_confirmed",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: "2026-09-02",
         outbound_transport: { type: "車", person: "志村さん" },
         return_transport: { type: "自力", person: null }
@@ -868,6 +1054,8 @@ async function main() {
       baseResult({
         message_kind: "same_day_change",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: "2026-09-02",
         outbound_transport: { type: "自力", person: null },
         return_transport: { type: "自力", person: null }
@@ -889,6 +1077,8 @@ async function main() {
       baseResult({
         message_kind: "dispatch_confirmed",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: "2026-09-03",
         outbound_transport: { type: "車", person: "志村さん" },
         return_transport: { type: "バス", person: null },
@@ -905,6 +1095,8 @@ async function main() {
       baseResult({
         message_kind: "same_day_change",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: "2026-09-03",
         outbound_transport: { type: "自力", person: null },
         return_transport: { type: "自力", person: null },
@@ -925,6 +1117,8 @@ async function main() {
       baseResult({
         message_kind: "same_day_change",
         practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
         practice_date: "2026-09-03",
         outbound_transport: { type: "車", person: "志村さん" },
         return_transport: { type: "バス", person: null },
