@@ -453,22 +453,86 @@ async function takeNearestImageCandidateFromPairing(
   textTimestamp: number
 ): Promise<PairingCandidate | null> {
   const stub = env.PAIRING.getByName(userId);
-  const response = await stub.fetch("https://pairing/take-nearest", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      timestamp: textTimestamp,
-      maxDiffMs: PAIR_WINDOW_MS
-    })
-  });
+  let response: Response;
+  try {
+    response = await stub.fetch("https://pairing/take-nearest", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        timestamp: textTimestamp,
+        maxDiffMs: PAIR_WINDOW_MS
+      })
+    });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    const errorMessage = error instanceof Error ? error.message : "unknown";
+    console.error("Pairing stub fetch failed", {
+      stage: "pair_stub_fetch_error",
+      errorType,
+      errorMessage
+    });
+    throw error;
+  }
   if (!response.ok) {
     return null;
   }
-  const result = (await response.json()) as { found: boolean; messageId?: string; timestamp?: number };
+  let result: { found: boolean; messageId?: string; timestamp?: number };
+  try {
+    result = (await response.json()) as { found: boolean; messageId?: string; timestamp?: number };
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    const errorMessage = error instanceof Error ? error.message : "unknown";
+    console.error("Pairing response parse failed", {
+      stage: "pair_response_parse_error",
+      errorType,
+      errorMessage
+    });
+    throw error;
+  }
   if (!result.found || typeof result.messageId !== "string" || typeof result.timestamp !== "number") {
     return null;
   }
   return { messageId: result.messageId, timestamp: result.timestamp };
+}
+
+async function resolvePairedImageDataUrlForTextEvent(
+  env: Env,
+  userId: string,
+  textTimestamp: number,
+  deps?: {
+    takeNearest?: (
+      env: Env,
+      userId: string,
+      textTimestamp: number
+    ) => Promise<PairingCandidate | null>;
+    fetchImageDataUrl?: (messageId: string, env: Env) => Promise<string | null>;
+  }
+): Promise<string | null> {
+  const takeNearest = deps?.takeNearest ?? takeNearestImageCandidateFromPairing;
+  const fetchImageDataUrl = deps?.fetchImageDataUrl ?? fetchLineImageDataUrl;
+
+  let pairedImage: PairingCandidate | null = null;
+  try {
+    pairedImage = await takeNearest(env, userId, textTimestamp);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    const errorMessage = error instanceof Error ? error.message : "unknown";
+    console.error("Pair lookup failed", { stage: "pair_lookup_error", errorType, errorMessage });
+    console.log({ stage: "paired_image_not_found" });
+    return null;
+  }
+
+  if (!pairedImage) {
+    console.log({ stage: "paired_image_not_found" });
+    return null;
+  }
+
+  console.log({ stage: "paired_image_found" });
+  try {
+    return await fetchImageDataUrl(pairedImage.messageId, env);
+  } catch {
+    return null;
+  }
 }
 
 async function fetchLineImageDataUrl(messageId: string, env: Env): Promise<string | null> {
@@ -3578,19 +3642,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
   await sleep(PAIR_WAIT_MS);
   console.log({ stage: "pair_lookup_start" });
-  let imageDataUrl: string | null = null;
   const textTimestamp = event.timestamp ?? Date.now();
-  const pairedImage = await takeNearestImageCandidateFromPairing(env, userId, textTimestamp);
-  if (pairedImage) {
-    console.log({ stage: "paired_image_found" });
-    try {
-      imageDataUrl = await fetchLineImageDataUrl(pairedImage.messageId, env);
-    } catch {
-      imageDataUrl = null;
-    }
-  } else {
-    console.log({ stage: "paired_image_not_found" });
-  }
+  const imageDataUrl = await resolvePairedImageDataUrlForTextEvent(env, userId, textTimestamp);
 
   const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
   console.log({
@@ -3865,7 +3918,14 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
       ctx.waitUntil(
         processEventInBackground(event, env).catch((error) => {
           const errorType = error instanceof Error ? error.name : "unknown";
-          console.error("Background event processing failed", { eventType: event.type, errorType });
+          const errorMessage = error instanceof Error ? error.message : "unknown";
+          const errorStack = error instanceof Error ? error.stack : undefined;
+          console.error("Background event processing failed", {
+            eventType: event.type,
+            errorType,
+            errorMessage,
+            errorStack
+          });
         })
       );
       console.log({ stage: "webhook_ack_scheduled" });
@@ -3962,6 +4022,7 @@ export class PairingSession implements DurableObject {
 export const TEST_HOOKS = {
   applyStandingPaymentRules,
   applyPersonalPracticeStandardTransport,
+  resolvePairedImageDataUrlForTextEvent,
   resolvePracticeContext,
   saveRecentPracticeContext,
   loadRecentPracticeContext,

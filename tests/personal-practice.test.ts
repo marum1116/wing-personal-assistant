@@ -172,6 +172,34 @@ async function main() {
   const sourceId = "wing" as const;
   const userId = "test-user";
 
+  // Pairing Case A: take-nearestが正常nullでも本文処理継続相当（null返却）
+  let pairingFetchCalled = false;
+  const pairingAResult = await hooks.resolvePairedImageDataUrlForTextEvent(env, userId, Date.now(), {
+    takeNearest: async () => null,
+    fetchImageDataUrl: async () => {
+      pairingFetchCalled = true;
+      return "data:image/png;base64,unused";
+    }
+  });
+  assert.equal(pairingAResult, null);
+  assert.equal(pairingFetchCalled, false);
+
+  // Pairing Case B: Pairing取得で例外でもfail-openでnull返却
+  const pairingBResult = await hooks.resolvePairedImageDataUrlForTextEvent(env, userId, Date.now(), {
+    takeNearest: async () => {
+      throw new Error("pairing fetch failed");
+    },
+    fetchImageDataUrl: async () => "data:image/png;base64,unused"
+  });
+  assert.equal(pairingBResult, null);
+
+  // Pairing Case C: 画像ペアリング成功時は画像URLを利用
+  const pairingCResult = await hooks.resolvePairedImageDataUrlForTextEvent(env, userId, Date.now(), {
+    takeNearest: async () => ({ messageId: "mid-1", timestamp: Date.now() }),
+    fetchImageDataUrl: async (messageId: string) => `data:image/png;base64,${messageId}`
+  });
+  assert.equal(pairingCResult, "data:image/png;base64,mid-1");
+
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(
     env,
