@@ -18,6 +18,7 @@ const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
 
 const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
 const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
+const CONTACT_RUI_COMMAND = "塁に連絡";
 const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
@@ -201,6 +202,11 @@ type PracticeRow = {
   return_type: TransportType;
   return_person: string | null;
   bus_guide: string | null;
+  meeting_time: string | null;
+  meeting_place: string | null;
+  outbound_companions: string | null;
+  return_dropoff_place: string | null;
+  return_release_place: string | null;
   source: string;
   notes: string | null;
   practice_type: PracticeType | null;
@@ -210,7 +216,17 @@ type PracticeRow = {
   outbound_priority: number | null;
   return_priority: number | null;
   bus_guide_priority: number | null;
+  meeting_time_priority: number | null;
+  meeting_place_priority: number | null;
+  outbound_companions_priority: number | null;
+  return_dropoff_place_priority: number | null;
+  return_release_place_priority: number | null;
   last_message_kind: MessageKind | null;
+};
+
+type RuiContactCommandParseResult = {
+  dates: string[];
+  labels: string[];
 };
 
 type SaveStructuredResultOutcome = {
@@ -239,6 +255,11 @@ type StructuredLineResult = {
   outbound_transport: ParsedTransport;
   return_transport: ParsedTransport;
   bus_guide: string | null;
+  meeting_time: string | null;
+  meeting_place: string | null;
+  outbound_companions: string | null;
+  return_dropoff_place: string | null;
+  return_release_place: string | null;
   payments: ParsedPayment[];
   notes: string | null;
   needs_confirmation: boolean;
@@ -315,6 +336,11 @@ const STRUCTURED_OUTPUT_SCHEMA = {
       required: ["type", "person"]
     },
     bus_guide: { type: ["string", "null"] },
+    meeting_time: { type: ["string", "null"] },
+    meeting_place: { type: ["string", "null"] },
+    outbound_companions: { type: ["string", "null"] },
+    return_dropoff_place: { type: ["string", "null"] },
+    return_release_place: { type: ["string", "null"] },
     payments: {
       type: "array",
       items: {
@@ -351,6 +377,11 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     "outbound_transport",
     "return_transport",
     "bus_guide",
+    "meeting_time",
+    "meeting_place",
+    "outbound_companions",
+    "return_dropoff_place",
+    "return_release_place",
     "payments",
     "notes",
     "needs_confirmation",
@@ -1429,6 +1460,134 @@ function shiftYmdByDays(ymd: string, deltaDays: number): string {
   return `${year}-${month}-${day}`;
 }
 
+function formatYmdWithJapaneseWeekday(ymd: string): string {
+  const parsed = parseYmdAsUtcDate(ymd);
+  if (!parsed) {
+    return ymd;
+  }
+  const weekdayJp = ["日", "月", "火", "水", "木", "金", "土"][parsed.getUTCDay()] ?? "";
+  const month = parsed.getUTCMonth() + 1;
+  const day = parsed.getUTCDate();
+  return `${month}/${day}（${weekdayJp}）`;
+}
+
+function parseRuiContactCommand(inputText: string, nowMs: number): RuiContactCommandParseResult | null {
+  const trimmed = inputText.trim();
+  const today = getJstDateString(nowMs);
+  const tomorrow = shiftYmdByDays(today, 1);
+  if (trimmed === CONTACT_RUI_COMMAND) {
+    return {
+      dates: [today, tomorrow],
+      labels: [`今日 ${formatYmdWithJapaneseWeekday(today)}`, `明日 ${formatYmdWithJapaneseWeekday(tomorrow)}`]
+    };
+  }
+
+  const matched = /^(\d{1,2})\/(\d{1,2})\s+塁に連絡$/.exec(trimmed);
+  if (!matched) {
+    return null;
+  }
+
+  const now = new Date(nowMs);
+  const year = Number(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric"
+    }).format(now)
+  );
+  const month = Number(matched[1]);
+  const day = Number(matched[2]);
+  const ymd = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (!parseYmdAsUtcDate(ymd)) {
+    return null;
+  }
+  return {
+    dates: [ymd],
+    labels: [formatYmdWithJapaneseWeekday(ymd)]
+  };
+}
+
+async function getPracticeByDateAndSource(
+  db: D1Database,
+  practiceDate: string,
+  sourceLabel: string
+): Promise<PracticeRow | null> {
+  const row = await db
+    .prepare(
+      `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide,
+              meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, source, notes,
+              practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
+              bus_guide_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
+              return_dropoff_place_priority, return_release_place_priority, last_message_kind
+       FROM practices
+       WHERE practice_date = ?1
+         AND source = ?2
+       LIMIT 1`
+    )
+    .bind(practiceDate, sourceLabel)
+    .first<PracticeRow>();
+  return row ?? null;
+}
+
+function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow | null): string[] {
+  const lines: string[] = [`【${headerLabel}】`];
+  if (!practice) {
+    lines.push("練習情報なし");
+    return lines;
+  }
+
+  const meetingParts = [practice.meeting_time, practice.meeting_place].filter((value): value is string =>
+    isConcreteText(value)
+  );
+  let meetingLabel = meetingParts.length > 0 ? meetingParts.join(" ") : "不明";
+  const practiceDate = parseYmdAsUtcDate(practice.practice_date);
+  const weekday = practiceDate ? practiceDate.getUTCDay() : -1;
+  const isWeekdayRegularPractice = (weekday === 1 || weekday === 2 || weekday === 4) && practice.practice_type === "通常練習";
+  if (meetingLabel === "不明" && isWeekdayRegularPractice) {
+    meetingLabel = "17:55ごろ KSP（または18:20 溝の口南口）";
+  }
+  lines.push(`集合：${meetingLabel}`);
+
+  const outboundLabel = isConcreteTransportType(practice.outbound_type)
+    ? transportToLineLabel({ type: practice.outbound_type, person: practice.outbound_person ?? null })
+    : "不明";
+  lines.push(`行き：${outboundLabel}`);
+  lines.push(`一緒：${isConcreteText(practice.outbound_companions) ? practice.outbound_companions : "不明"}`);
+
+  const returnLabel = isConcreteTransportType(practice.return_type)
+    ? transportToLineLabel({ type: practice.return_type, person: practice.return_person ?? null })
+    : "不明";
+  lines.push(`帰り：${returnLabel}`);
+
+  if (practice.return_type === "車") {
+    lines.push(`降りる場所：${isConcreteText(practice.return_dropoff_place) ? practice.return_dropoff_place : "不明"}`);
+  } else if (practice.return_type === "バス") {
+    lines.push(`引率：${isConcreteText(practice.bus_guide) ? practice.bus_guide : "不明"}`);
+    const returnReleasePlace = isConcreteText(practice.return_release_place)
+      ? practice.return_release_place
+      : isWeekdayRegularPractice
+        ? "溝の口南口"
+        : "不明";
+    lines.push(`解散：${returnReleasePlace}`);
+  }
+  return lines;
+}
+
+async function buildRuiContactMessage(
+  db: D1Database,
+  sourceLabel: string,
+  dates: string[],
+  labels: string[]
+): Promise<string> {
+  const sections: string[] = [];
+  for (let i = 0; i < dates.length; i += 1) {
+    const practiceDate = dates[i];
+    const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
+    const practice = await getPracticeByDateAndSource(db, practiceDate, sourceLabel);
+    sections.push(buildRuiContactPracticeBlock(headerLabel, practice).join("\n"));
+  }
+  return sections.join("\n\n");
+}
+
 function parsePositiveInt(value: string | null): number | null {
   if (!value) {
     return null;
@@ -2001,6 +2160,11 @@ function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResul
       person: practice.return_person
     },
     bus_guide: practice.bus_guide,
+    meeting_time: practice.meeting_time,
+    meeting_place: practice.meeting_place,
+    outbound_companions: practice.outbound_companions,
+    return_dropoff_place: practice.return_dropoff_place,
+    return_release_place: practice.return_release_place,
     payments: [],
     notes: practice.notes,
     needs_confirmation: false,
@@ -2011,9 +2175,11 @@ function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResul
 async function getPracticeByDate(db: D1Database, practiceDate: string): Promise<PracticeRow | null> {
   const row = await db
     .prepare(
-      `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide, source, notes,
+      `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide,
+              meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, source, notes,
               practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
-              bus_guide_priority, last_message_kind
+              bus_guide_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
+              return_dropoff_place_priority, return_release_place_priority, last_message_kind
        FROM practices
        WHERE practice_date = ?1
        LIMIT 1`
@@ -2090,6 +2256,11 @@ async function savePracticeToD1(
     return_type: "不明",
     return_person: null,
     bus_guide: null,
+    meeting_time: null,
+    meeting_place: null,
+    outbound_companions: null,
+    return_dropoff_place: null,
+    return_release_place: null,
     source: sourceLabel,
     notes: null,
     practice_type: "不明",
@@ -2099,6 +2270,11 @@ async function savePracticeToD1(
     outbound_priority: 0,
     return_priority: 0,
     bus_guide_priority: 0,
+    meeting_time_priority: 0,
+    meeting_place_priority: 0,
+    outbound_companions_priority: 0,
+    return_dropoff_place_priority: 0,
+    return_release_place_priority: 0,
     last_message_kind: null
   };
 
@@ -2112,6 +2288,16 @@ async function savePracticeToD1(
   let returnPriority = fallback.return_priority ?? 0;
   let busGuide = fallback.bus_guide;
   let busGuidePriority = fallback.bus_guide_priority ?? 0;
+  let meetingTime = fallback.meeting_time;
+  let meetingTimePriority = fallback.meeting_time_priority ?? 0;
+  let meetingPlace = fallback.meeting_place;
+  let meetingPlacePriority = fallback.meeting_place_priority ?? 0;
+  let outboundCompanions = fallback.outbound_companions;
+  let outboundCompanionsPriority = fallback.outbound_companions_priority ?? 0;
+  let returnDropoffPlace = fallback.return_dropoff_place;
+  let returnDropoffPlacePriority = fallback.return_dropoff_place_priority ?? 0;
+  let returnReleasePlace = fallback.return_release_place;
+  let returnReleasePlacePriority = fallback.return_release_place_priority ?? 0;
   let notes = fallback.notes;
   let practiceType = fallback.practice_type ?? "不明";
   let storedPracticeTypeBasis = fallback.practice_type_basis ?? "unknown";
@@ -2162,6 +2348,27 @@ async function savePracticeToD1(
     notes = result.notes;
   }
 
+  if (isConcreteText(result.meeting_time) && messagePriorityValue >= meetingTimePriority) {
+    meetingTime = result.meeting_time;
+    meetingTimePriority = messagePriorityValue;
+  }
+  if (isConcreteText(result.meeting_place) && messagePriorityValue >= meetingPlacePriority) {
+    meetingPlace = result.meeting_place;
+    meetingPlacePriority = messagePriorityValue;
+  }
+  if (isConcreteText(result.outbound_companions) && messagePriorityValue >= outboundCompanionsPriority) {
+    outboundCompanions = result.outbound_companions;
+    outboundCompanionsPriority = messagePriorityValue;
+  }
+  if (isConcreteText(result.return_dropoff_place) && messagePriorityValue >= returnDropoffPlacePriority) {
+    returnDropoffPlace = result.return_dropoff_place;
+    returnDropoffPlacePriority = messagePriorityValue;
+  }
+  if (isConcreteText(result.return_release_place) && messagePriorityValue >= returnReleasePlacePriority) {
+    returnReleasePlace = result.return_release_place;
+    returnReleasePlacePriority = messagePriorityValue;
+  }
+
   if (practiceTypePriority >= storedPracticeTypePriority) {
     practiceType = result.practice_type;
     storedPracticeTypeBasis = practiceTypeBasis;
@@ -2178,6 +2385,11 @@ async function savePracticeToD1(
       return_type,
       return_person,
       bus_guide,
+      meeting_time,
+      meeting_place,
+      outbound_companions,
+      return_dropoff_place,
+      return_release_place,
       source,
       notes,
       practice_type,
@@ -2187,10 +2399,15 @@ async function savePracticeToD1(
       outbound_priority,
       return_priority,
       bus_guide_priority,
+      meeting_time_priority,
+      meeting_place_priority,
+      outbound_companions_priority,
+      return_dropoff_place_priority,
+      return_release_place_priority,
       last_message_kind,
       created_at,
       updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?28)
     ON CONFLICT(practice_date) DO UPDATE SET
       attendance = excluded.attendance,
       outbound_type = excluded.outbound_type,
@@ -2198,6 +2415,11 @@ async function savePracticeToD1(
       return_type = excluded.return_type,
       return_person = excluded.return_person,
       bus_guide = excluded.bus_guide,
+      meeting_time = excluded.meeting_time,
+      meeting_place = excluded.meeting_place,
+      outbound_companions = excluded.outbound_companions,
+      return_dropoff_place = excluded.return_dropoff_place,
+      return_release_place = excluded.return_release_place,
       source = excluded.source,
       notes = excluded.notes,
       practice_type = excluded.practice_type,
@@ -2207,6 +2429,11 @@ async function savePracticeToD1(
       outbound_priority = excluded.outbound_priority,
       return_priority = excluded.return_priority,
       bus_guide_priority = excluded.bus_guide_priority,
+      meeting_time_priority = excluded.meeting_time_priority,
+      meeting_place_priority = excluded.meeting_place_priority,
+      outbound_companions_priority = excluded.outbound_companions_priority,
+      return_dropoff_place_priority = excluded.return_dropoff_place_priority,
+      return_release_place_priority = excluded.return_release_place_priority,
       last_message_kind = excluded.last_message_kind,
       updated_at = excluded.updated_at`
   )
@@ -2218,6 +2445,11 @@ async function savePracticeToD1(
       returnType,
       returnPerson,
       busGuide,
+      meetingTime,
+      meetingPlace,
+      outboundCompanions,
+      returnDropoffPlace,
+      returnReleasePlace,
       sourceLabel,
       notes,
       practiceType,
@@ -2227,6 +2459,11 @@ async function savePracticeToD1(
       outboundPriority,
       returnPriority,
       busGuidePriority,
+      meetingTimePriority,
+      meetingPlacePriority,
+      outboundCompanionsPriority,
+      returnDropoffPlacePriority,
+      returnReleasePlacePriority,
       result.message_kind,
       now
     )
@@ -3287,6 +3524,8 @@ async function callOpenAIForStructuredResult(
     "渡辺塁本人の確定情報として扱わないでください。" +
     "attendance/outbound_transport/return_transportは、渡辺塁本人について明示または文脈上の確定情報がある場合のみ設定し、" +
     "判断できなければ必ず不明にしてください。" +
+    "meeting_time/meeting_place/outbound_companions/return_dropoff_place/return_release_placeも同様に、本文に明示があるときのみ設定し、" +
+    "根拠がなければ必ずnullにしてください。" +
     "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。" +
     "配車表などで『○○号』は『○○さんの車』として扱い、渡辺塁本人の割当が『渡辺→丹下号』のように明示される場合は" +
     "return_transport.type='車'、return_transport.person='丹下さん'のようにpersonまで必ず設定してください。" +
@@ -3732,6 +3971,56 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     return;
   }
 
+  const contactCommand = parseRuiContactCommand(inputText, event.timestamp ?? Date.now());
+  if (contactCommand) {
+    const userId = event.source?.userId;
+    if (!userId) {
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [buildSourceQuickReply("先に情報源を選んでください。")],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
+    }
+    const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
+    if (!selectedSourceId || !isSourceId(selectedSourceId)) {
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [buildSourceQuickReply("先に情報源を選んでください。")],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
+    }
+    const sourceLabel = sourceIdToLabel(selectedSourceId);
+    const contactText = await buildRuiContactMessage(
+      env.DB,
+      sourceLabel,
+      contactCommand.dates,
+      contactCommand.labels
+    );
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: contactText }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
   const userId = event.source?.userId;
   if (!userId) {
     await replyMessages(
@@ -4132,6 +4421,8 @@ export const TEST_HOOKS = {
   applyStandingPaymentRules,
   applyPersonalPracticeStandardTransport,
   reconcileDateResolutionUncertainty,
+  parseRuiContactCommand,
+  buildRuiContactMessage,
   resolvePairedImageDataUrlForTextEvent,
   resolvePracticeContext,
   saveRecentPracticeContext,

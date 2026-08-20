@@ -82,6 +82,11 @@ function createTestEnv() {
       return_type TEXT NOT NULL,
       return_person TEXT,
       bus_guide TEXT,
+      meeting_time TEXT,
+      meeting_place TEXT,
+      outbound_companions TEXT,
+      return_dropoff_place TEXT,
+      return_release_place TEXT,
       source TEXT NOT NULL,
       notes TEXT,
       created_at TEXT NOT NULL,
@@ -93,6 +98,11 @@ function createTestEnv() {
       outbound_priority INTEGER NOT NULL DEFAULT 0,
       return_priority INTEGER NOT NULL DEFAULT 0,
       bus_guide_priority INTEGER NOT NULL DEFAULT 0,
+      meeting_time_priority INTEGER NOT NULL DEFAULT 0,
+      meeting_place_priority INTEGER NOT NULL DEFAULT 0,
+      outbound_companions_priority INTEGER NOT NULL DEFAULT 0,
+      return_dropoff_place_priority INTEGER NOT NULL DEFAULT 0,
+      return_release_place_priority INTEGER NOT NULL DEFAULT 0,
       last_message_kind TEXT
     );
 
@@ -158,6 +168,11 @@ function baseResult(overrides: Record<string, unknown>) {
     outbound_transport: { type: "不明", person: null },
     return_transport: { type: "不明", person: null },
     bus_guide: null,
+    meeting_time: null,
+    meeting_place: null,
+    outbound_companions: null,
+    return_dropoff_place: null,
+    return_release_place: null,
     payments: [],
     notes: null,
     needs_confirmation: false,
@@ -199,6 +214,276 @@ async function main() {
     fetchImageDataUrl: async (messageId: string) => `data:image/png;base64,${messageId}`
   });
   assert.equal(pairingCResult, "data:image/png;base64,mid-1");
+
+  // 塁に連絡: コマンド解釈（今日/明日）
+  const fixedNow = Date.UTC(2026, 7, 20, 3, 0, 0);
+  const contactDefault = hooks.parseRuiContactCommand("塁に連絡", fixedNow);
+  assert.ok(contactDefault);
+  assert.deepEqual(contactDefault.dates, ["2026-08-20", "2026-08-21"]);
+  assert.deepEqual(contactDefault.labels, ["今日 8/20（木）", "明日 8/21（金）"]);
+
+  // 塁に連絡: 日付指定
+  const contactSingle = hooks.parseRuiContactCommand("8/24 塁に連絡", fixedNow);
+  assert.ok(contactSingle);
+  assert.deepEqual(contactSingle.dates, ["2026-08-24"]);
+
+  // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
+  const { env: contactEnvToday } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvToday,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-20",
+      meeting_time: "17:55ごろ",
+      meeting_place: "KSP",
+      outbound_companions: "太郎、次郎",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "山田さん・遠山さん",
+      return_release_place: "溝の口南口"
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactTodayText = await hooks.buildRuiContactMessage(
+    contactEnvToday.DB as any,
+    "羽魂練習会",
+    ["2026-08-20", "2026-08-21"],
+    ["今日 8/20（木）", "明日 8/21（金）"]
+  );
+  assert.match(contactTodayText, /【今日 8\/20（木）】/);
+  assert.match(contactTodayText, /集合：17:55ごろ KSP/);
+  assert.match(contactTodayText, /行き：バス/);
+  assert.match(contactTodayText, /一緒：太郎、次郎/);
+  assert.match(contactTodayText, /帰り：バス/);
+  assert.match(contactTodayText, /引率：山田さん・遠山さん/);
+  assert.match(contactTodayText, /解散：溝の口南口/);
+  assert.match(contactTodayText, /【明日 8\/21（金）】\n練習情報なし/);
+
+  // 塁に連絡 Case: 明日だけ練習あり（帰り車 + 降車場所）
+  const { env: contactEnvTomorrow } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvTomorrow,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-21",
+      meeting_time: "18:20",
+      meeting_place: "志村さん宅",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" },
+      return_dropoff_place: "溝の口駅前"
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactTomorrowText = await hooks.buildRuiContactMessage(
+    contactEnvTomorrow.DB as any,
+    "羽魂練習会",
+    ["2026-08-20", "2026-08-21"],
+    ["今日 8/20（木）", "明日 8/21（金）"]
+  );
+  assert.match(contactTomorrowText, /【今日 8\/20（木）】\n練習情報なし/);
+  assert.match(contactTomorrowText, /【明日 8\/21（金）】/);
+  assert.match(contactTomorrowText, /集合：18:20 志村さん宅/);
+  assert.match(contactTomorrowText, /行き：志村さんの車/);
+  assert.match(contactTomorrowText, /帰り：志村さんの車/);
+  assert.match(contactTomorrowText, /降りる場所：溝の口駅前/);
+  assert.match(contactTomorrowText, /一緒：不明/);
+
+  // 塁に連絡 Case: 今日・明日両方あり
+  const { env: contactEnvBoth } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvBoth,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-20",
+      meeting_place: "KSP",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "Aさん"
+    }) as any,
+    "explicit",
+    300
+  );
+  await hooks.saveStructuredResultToD1(
+    contactEnvBoth,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-21",
+      meeting_place: "志村さん宅",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" }
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactBothText = await hooks.buildRuiContactMessage(
+    contactEnvBoth.DB as any,
+    "羽魂練習会",
+    ["2026-08-20", "2026-08-21"],
+    ["今日 8/20（木）", "明日 8/21（金）"]
+  );
+  assert.match(contactBothText, /【今日 8\/20（木）】/);
+  assert.match(contactBothText, /【明日 8\/21（金）】/);
+
+  // 塁に連絡 Case: 今日・明日両方なし
+  const { env: contactEnvNone } = createTestEnv();
+  const contactNoneText = await hooks.buildRuiContactMessage(
+    contactEnvNone.DB as any,
+    "羽魂練習会",
+    ["2026-08-20", "2026-08-21"],
+    ["今日 8/20（木）", "明日 8/21（金）"]
+  );
+  assert.match(contactNoneText, /【今日 8\/20（木）】\n練習情報なし/);
+  assert.match(contactNoneText, /【明日 8\/21（金）】\n練習情報なし/);
+
+  // 塁に連絡 Case: 当日変更が確定配車より優先される
+  const { env: contactEnvPriority } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvPriority,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-20",
+      return_transport: { type: "バス", person: null },
+      bus_guide: "旧引率"
+    }) as any,
+    "explicit",
+    300
+  );
+  await hooks.saveStructuredResultToD1(
+    contactEnvPriority,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "same_day_change",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-20",
+      return_transport: { type: "車", person: "志村さん" },
+      return_dropoff_place: "自宅前"
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactPriorityText = await hooks.buildRuiContactMessage(
+    contactEnvPriority.DB as any,
+    "羽魂練習会",
+    ["2026-08-20"],
+    ["今日 8/20（木）"]
+  );
+  assert.match(contactPriorityText, /帰り：志村さんの車/);
+  assert.match(contactPriorityText, /降りる場所：自宅前/);
+
+  // 塁に連絡 Case: 一部項目不明でも壊れない
+  const { env: contactEnvPartial } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvPartial,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-20",
+      meeting_place: "KSP",
+      outbound_transport: { type: "不明", person: null },
+      return_transport: { type: "バス", person: null }
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactPartialText = await hooks.buildRuiContactMessage(
+    contactEnvPartial.DB as any,
+    "羽魂練習会",
+    ["2026-08-20"],
+    ["今日 8/20（木）"]
+  );
+  assert.match(contactPartialText, /【今日 8\/20（木）】/);
+  assert.match(contactPartialText, /集合：KSP/);
+  assert.match(contactPartialText, /一緒：不明/);
+  assert.match(contactPartialText, /行き：不明/);
+  assert.match(contactPartialText, /帰り：バス/);
+  assert.match(contactPartialText, /引率：不明/);
+  assert.match(contactPartialText, /解散：不明/);
+  assert.ok(!contactPartialText.includes("undefined"));
+
+  // 塁に連絡 Case: 木曜通常練習は集合/解散を業務ルールで補完
+  const { env: contactEnvRuleFallback } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvRuleFallback,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-20",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      meeting_time: null,
+      meeting_place: null,
+      return_release_place: null
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactRuleFallbackText = await hooks.buildRuiContactMessage(
+    contactEnvRuleFallback.DB as any,
+    "羽魂練習会",
+    ["2026-08-20"],
+    ["8/20（木）"]
+  );
+  assert.match(contactRuleFallbackText, /集合：17:55ごろ KSP（または18:20 溝の口南口）/);
+  assert.match(contactRuleFallbackText, /解散：溝の口南口/);
+
+  // 塁に連絡 Case: 月曜通常練習も同じ補完を適用
+  const { env: contactEnvRuleFallbackMon } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvRuleFallbackMon,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-24",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      meeting_time: null,
+      meeting_place: null,
+      return_release_place: null
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactRuleFallbackMonText = await hooks.buildRuiContactMessage(
+    contactEnvRuleFallbackMon.DB as any,
+    "羽魂練習会",
+    ["2026-08-24"],
+    ["8/24（月）"]
+  );
+  assert.match(contactRuleFallbackMonText, /集合：17:55ごろ KSP（または18:20 溝の口南口）/);
+  assert.match(contactRuleFallbackMonText, /解散：溝の口南口/);
 
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(
