@@ -424,7 +424,7 @@ async function main() {
   assert.match(contactPartialText, /行き：不明/);
   assert.match(contactPartialText, /帰り：バス/);
   assert.match(contactPartialText, /引率：不明/);
-  assert.match(contactPartialText, /解散：不明/);
+  assert.match(contactPartialText, /解散：溝の口南口/);
   assert.ok(!contactPartialText.includes("undefined"));
 
   // 塁に連絡 Case: 木曜通常練習は集合/解散を業務ルールで補完

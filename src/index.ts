@@ -3527,8 +3527,12 @@ async function callOpenAIForStructuredResult(
     "meeting_time/meeting_place/outbound_companions/return_dropoff_place/return_release_placeも同様に、本文に明示があるときのみ設定し、" +
     "根拠がなければ必ずnullにしてください。" +
     "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。" +
+    "配車表画像を読むときは、渡辺塁（塁/塁くん/ルイくん）本人が記載された行を最優先し、他人の行の交通手段を本人へ適用しないでください。" +
+    "同一表内に『バス』行と『○○号』行が混在する場合でも、本人名がある行の値だけを本人情報として採用してください。" +
     "配車表などで『○○号』は『○○さんの車』として扱い、渡辺塁本人の割当が『渡辺→丹下号』のように明示される場合は" +
     "return_transport.type='車'、return_transport.person='丹下さん'のようにpersonまで必ず設定してください。" +
+    "『志村号』等で車を確定してよいのは、渡辺塁本人名と同じ行（または明確に本人へ紐づくセル）にその号がある場合のみです。" +
+    "本人名のない別行に『志村号』があるだけなら、渡辺塁本人のreturn_transport/outbound_transportを車にしないでください。" +
     "同様に山田号→山田さん、佐藤号→佐藤さんのように扱ってください。" +
     "本人の帰りが車などでバスを使わないことが確定している場合、条件付きの一般案内を根拠にbus_guideを設定せず、bus_guideはnullにしてください。" +
     "そのような全体向け条件情報は必要ならnotesへ記載し、本人に適用されない条件付き支払い・引率に関する不明点をuncertain_pointsへ追加しないでください。" +
