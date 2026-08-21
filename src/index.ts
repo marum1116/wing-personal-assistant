@@ -2717,6 +2717,23 @@ function paymentMatchesExpected(
   );
 }
 
+function paymentMatchesExpectedWithoutRuleKey(
+  payment: {
+    payment_type: PaymentType;
+    amount: number | null;
+    payee: string | null;
+    direction: PaymentDirection;
+  },
+  expected: PaymentForStorage
+): boolean {
+  return (
+    payment.payment_type === expected.type &&
+    payment.amount === expected.amount &&
+    payment.payee === expected.payee &&
+    payment.direction === expected.direction
+  );
+}
+
 function eventRuleKey(direction: PaymentDirection, paymentType: PaymentType): string | null {
   if (paymentType === "車同乗代" && direction === "outbound") {
     return "transport:outbound:car";
@@ -2841,6 +2858,56 @@ async function reconcileEventPayments(
         activeRuleKeyMatch.needs_review !== expectedNeedsReview ||
         (activeRuleKeyMatch.review_reason ?? null) !== (expectedReviewReason ?? null)
       ) {
+        const duplicateIdentityForRuleKey = existing.find(
+          (row) =>
+            row.id !== activeRuleKeyMatch.id &&
+            paymentMatchesExpectedWithoutRuleKey(row, expectedWithRuleKey)
+        );
+        if (duplicateIdentityForRuleKey) {
+          matchedIds.add(duplicateIdentityForRuleKey.id);
+          await env.DB
+            .prepare(
+              `UPDATE payments
+               SET voided_at = NULL,
+                   amount = ?1,
+                   payee = ?2,
+                   rule_key = ?3,
+                   direction = ?4,
+                   billing_scope = 'event',
+                   status = 'unpaid',
+                   needs_review = ?5,
+                   review_reason = ?6,
+                   source = ?7,
+                   updated_at = ?8
+               WHERE id = ?9`
+            )
+            .bind(
+              expectedWithRuleKey.amount,
+              expectedWithRuleKey.payee,
+              expectedWithRuleKey.rule_key,
+              expectedWithRuleKey.direction,
+              expectedNeedsReview,
+              expectedReviewReason,
+              sourceLabel,
+              now,
+              duplicateIdentityForRuleKey.id
+            )
+            .run();
+
+          await env.DB
+            .prepare(
+              `UPDATE payments
+               SET voided_at = ?1,
+                   updated_at = ?1
+               WHERE id = ?2
+                 AND status = 'unpaid'
+                 AND voided_at IS NULL`
+            )
+            .bind(now, activeRuleKeyMatch.id)
+            .run();
+          continue;
+        }
+
         await env.DB
           .prepare(
             `UPDATE payments
@@ -2860,6 +2927,98 @@ async function reconcileEventPayments(
             sourceLabel,
             now,
             activeRuleKeyMatch.id
+          )
+          .run();
+      }
+      continue;
+    }
+
+    const activeLegacyMatch = existing.find(
+      (row) =>
+        row.voided_at === null &&
+        row.status === "unpaid" &&
+        paymentMatchesExpectedWithoutRuleKey(row, expectedWithRuleKey)
+    );
+    if (activeLegacyMatch) {
+      matchedIds.add(activeLegacyMatch.id);
+      const duplicateLegacyIdentity = existing.find(
+        (row) =>
+          row.id !== activeLegacyMatch.id &&
+          paymentMatchesExpectedWithoutRuleKey(row, expectedWithRuleKey)
+      );
+      if (duplicateLegacyIdentity) {
+        matchedIds.add(duplicateLegacyIdentity.id);
+        await env.DB
+          .prepare(
+            `UPDATE payments
+             SET voided_at = NULL,
+                 amount = ?1,
+                 payee = ?2,
+                 rule_key = ?3,
+                 direction = ?4,
+                 billing_scope = 'event',
+                 status = 'unpaid',
+                 needs_review = ?5,
+                 review_reason = ?6,
+                 source = ?7,
+                 updated_at = ?8
+             WHERE id = ?9`
+          )
+          .bind(
+            expectedWithRuleKey.amount,
+            expectedWithRuleKey.payee,
+            expectedWithRuleKey.rule_key,
+            expectedWithRuleKey.direction,
+            expectedNeedsReview,
+            expectedReviewReason,
+            sourceLabel,
+            now,
+            duplicateLegacyIdentity.id
+          )
+          .run();
+
+        await env.DB
+          .prepare(
+            `UPDATE payments
+             SET voided_at = ?1,
+                 updated_at = ?1
+             WHERE id = ?2
+               AND status = 'unpaid'
+               AND voided_at IS NULL`
+          )
+          .bind(now, activeLegacyMatch.id)
+          .run();
+        continue;
+      }
+
+      const requiresLegacyUpgrade =
+        activeLegacyMatch.rule_key !== expectedWithRuleKey.rule_key ||
+        activeLegacyMatch.amount !== expectedWithRuleKey.amount ||
+        activeLegacyMatch.payee !== expectedWithRuleKey.payee ||
+        activeLegacyMatch.needs_review !== expectedNeedsReview ||
+        (activeLegacyMatch.review_reason ?? null) !== (expectedReviewReason ?? null);
+      if (requiresLegacyUpgrade) {
+        await env.DB
+          .prepare(
+            `UPDATE payments
+             SET amount = ?1,
+                 payee = ?2,
+                 rule_key = ?3,
+                 needs_review = ?4,
+                 review_reason = ?5,
+                 source = ?6,
+                 updated_at = ?7
+             WHERE id = ?8`
+          )
+          .bind(
+            expectedWithRuleKey.amount,
+            expectedWithRuleKey.payee,
+            expectedWithRuleKey.rule_key,
+            expectedNeedsReview,
+            expectedReviewReason,
+            sourceLabel,
+            now,
+            activeLegacyMatch.id
           )
           .run();
       }
@@ -2892,20 +3051,36 @@ async function reconcileEventPayments(
       (row) =>
         row.status === "unpaid" &&
         row.voided_at !== null &&
-        paymentMatchesExpected(row, expectedWithRuleKey)
+        paymentMatchesExpectedWithoutRuleKey(row, expectedWithRuleKey)
     );
     if (voidedReusable) {
       matchedIds.add(voidedReusable.id);
       await env.DB.prepare(
         `UPDATE payments
          SET voided_at = NULL,
-            needs_review = ?1,
-            review_reason = ?2,
-            source = ?3,
-            updated_at = ?4
-         WHERE id = ?5`
+            amount = ?1,
+            payee = ?2,
+            rule_key = ?3,
+            direction = ?4,
+            billing_scope = 'event',
+            status = 'unpaid',
+            needs_review = ?5,
+            review_reason = ?6,
+            source = ?7,
+            updated_at = ?8
+         WHERE id = ?9`
       )
-        .bind(expectedNeedsReview, expectedReviewReason, sourceLabel, now, voidedReusable.id)
+        .bind(
+          expectedWithRuleKey.amount,
+          expectedWithRuleKey.payee,
+          expectedWithRuleKey.rule_key,
+          expectedWithRuleKey.direction,
+          expectedNeedsReview,
+          expectedReviewReason,
+          sourceLabel,
+          now,
+          voidedReusable.id
+        )
         .run();
       continue;
     }

@@ -127,6 +127,16 @@ function createTestEnv() {
       review_reason TEXT
     );
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_event_unique
+    ON payments (
+      practice_date,
+      payment_type,
+      IFNULL(amount, -1),
+      IFNULL(payee, ''),
+      direction
+    )
+    WHERE billing_scope = 'event';
+
     CREATE TABLE IF NOT EXISTS monthly_payments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       billing_month TEXT NOT NULL,
