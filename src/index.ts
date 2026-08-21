@@ -2826,6 +2826,48 @@ async function reconcileEventPayments(
       rule_key: expectedPayment.rule_key
     };
 
+    const activeRuleKeyMatch = existing.find(
+      (row) =>
+        row.voided_at === null &&
+        row.status === "unpaid" &&
+        row.rule_key === expectedWithRuleKey.rule_key &&
+        row.payment_type === expectedWithRuleKey.type &&
+        row.direction === expectedWithRuleKey.direction
+    );
+    if (activeRuleKeyMatch) {
+      matchedIds.add(activeRuleKeyMatch.id);
+      const requiresCoreUpdate =
+        activeRuleKeyMatch.amount !== expectedWithRuleKey.amount || activeRuleKeyMatch.payee !== expectedWithRuleKey.payee;
+      if (
+        requiresCoreUpdate ||
+        activeRuleKeyMatch.needs_review !== expectedNeedsReview ||
+        (activeRuleKeyMatch.review_reason ?? null) !== (expectedReviewReason ?? null)
+      ) {
+        await env.DB
+          .prepare(
+            `UPDATE payments
+             SET amount = ?1,
+                 payee = ?2,
+                 needs_review = ?3,
+                 review_reason = ?4,
+                 source = ?5,
+                 updated_at = ?6
+             WHERE id = ?7`
+          )
+          .bind(
+            expectedWithRuleKey.amount,
+            expectedWithRuleKey.payee,
+            expectedNeedsReview,
+            expectedReviewReason,
+            sourceLabel,
+            now,
+            activeRuleKeyMatch.id
+          )
+          .run();
+      }
+      continue;
+    }
+
     const activeMatch = existing.find(
       (row) => row.voided_at === null && paymentMatchesExpected(row, expectedWithRuleKey)
     );
