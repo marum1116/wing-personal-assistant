@@ -1,0 +1,110 @@
+---
+description: Cloudflare D1 code 7403 incident handling
+alwaysApply: true
+---
+
+# Cloudflare D1 7403 handling
+
+羽魂メモでは、Cloudflare D1 remote操作時に次の既知エラーが一時的に発生した実績がある。
+
+```text
+The given account is not valid or is not authorized to access this service
+[code: 7403]
+```
+
+このエラーが出ても、直ちにコード・wrangler設定・Cloudflare設定を変更しない。
+
+## 7403発生時の標準手順
+
+### 1. 失敗した元コマンドを1回だけ再実行する
+
+一時的なCloudflare APIエラーの可能性があるため、まず同じコマンドをそのまま1回だけ再実行する。
+
+成功した場合:
+
+- 一時エラーとして扱う
+- コードや設定を変更しない
+- そのまま作業を継続する
+
+### 2. 再度7403になった場合
+
+PowerShellでは以下を実行する。
+
+```powershell
+npx.cmd wrangler whoami
+```
+
+```powershell
+npx.cmd wrangler d1 list
+```
+
+確認項目:
+
+- Wranglerが認証済みか
+- 想定アカウントか
+- `wing-personal-assistant` がD1一覧に存在するか
+- wrangler設定のdatabase name / database IDと一致するか
+
+### 3. 認証・D1一覧が正常ならD1疎通確認
+
+```powershell
+npx.cmd wrangler d1 execute wing-personal-assistant --remote --command="SELECT 1;"
+```
+
+成功した場合は、元々実行しようとしていたD1コマンドを再実行する。
+
+### 4. migration実行中だった場合
+
+7403発生を理由にmigrationを闇雲に再適用しない。
+
+必ず、
+
+- migrationファイル
+- remote側の適用状態
+- 未適用migration
+
+を確認してから処理する。
+
+すでに適用済みなら再適用しない。
+
+### 5. 認証異常の場合
+
+`wrangler whoami` が未認証・異常の場合、
+
+- Secretsを変更しない
+- API Tokenを変更しない
+- account_idを書き換えない
+
+必要なら `npx.cmd wrangler login` が必要であることをユーザーへ報告し、人間の操作が必要なところで停止する。
+
+### 6. D1が一覧にない場合
+
+設定を推測で変更しない。
+
+以下を報告して停止する。
+
+- whoami結果の概要
+- d1 list結果の概要
+- 現在設定されているdatabase name / database ID
+- 不一致箇所
+
+SecretsやTokenの実値は表示しない。
+
+### 7. Wranglerについて
+
+7403対応だけを理由にWranglerを勝手にアップデートしない。
+
+### 8. deployとの関係
+
+Worker deployが成功していても、D1 migrationやD1 remote操作が成功したとは限らない。
+
+それぞれ個別に成功状態を確認する。
+
+## PowerShell共通ルール
+
+このプロジェクトでは、
+
+- `npm` ではなく `npm.cmd`
+- `npx` ではなく `npx.cmd`
+
+を使用する。
