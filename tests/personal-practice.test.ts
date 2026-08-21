@@ -1702,6 +1702,66 @@ async function main() {
   assert.equal(busCaseCRows[0]?.rule_key, "transport:return:bus");
   assert.equal(busCaseCRows[0]?.voided_at, null);
 
+  // Bus Allowance Case C2: active不明 + void済み既存payeeが1名なら再解決して復元
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    hooks.applyStandingPaymentRules(
+      baseResult({
+        message_kind: "dispatch_confirmed",
+        practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
+        practice_date: "2026-09-16",
+        outbound_transport: { type: "自力", person: null },
+        return_transport: { type: "バス", person: null },
+        bus_guide: "山田さん・遠山さん",
+        notes: "帰りはバスとの案内。"
+      }) as any
+    ).result as any,
+    "explicit",
+    30
+  );
+  raw.prepare(
+    "INSERT INTO payments (practice_date,payment_type,amount,payee,due_date,payment_method,status,billing_scope,direction,source,created_at,updated_at,rule_key,voided_at,needs_review,review_reason) VALUES ('2026-09-16','バス引率代',100,'遠山さん',NULL,NULL,'unpaid','event','return','羽魂練習会',datetime('now'),datetime('now'),NULL,datetime('now'),0,NULL)"
+  ).run();
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    hooks.applyStandingPaymentRules(
+      baseResult({
+        message_kind: "schedule",
+        practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
+        practice_date: "2026-09-16",
+        outbound_transport: { type: "自力", person: null },
+        return_transport: { type: "バス", person: null },
+        bus_guide: "山田さん・遠山さん",
+        notes: "帰りはバスとの案内。"
+      }) as any
+    ).result as any,
+    "explicit",
+    300
+  );
+  const busCaseC2ActiveRows = raw
+    .prepare(
+      "SELECT payment_type, amount, payee, rule_key, needs_review, voided_at FROM payments WHERE practice_date='2026-09-16' AND payment_type='バス引率代' AND voided_at IS NULL ORDER BY id"
+    )
+    .all() as Array<{
+      payment_type: string;
+      amount: number;
+      payee: string | null;
+      rule_key: string | null;
+      needs_review: number;
+      voided_at: string | null;
+    }>;
+  assert.equal(busCaseC2ActiveRows.length, 1);
+  assert.equal(busCaseC2ActiveRows[0]?.amount, 100);
+  assert.equal(busCaseC2ActiveRows[0]?.payee, "遠山さん");
+  assert.equal(busCaseC2ActiveRows[0]?.rule_key, "transport:return:bus");
+  assert.equal(busCaseC2ActiveRows[0]?.needs_review, 0);
+
   // Bus Allowance Case D: 帰り車はバス引率代を生成しない（車代のみ）
   const busCaseD = hooks.applyStandingPaymentRules(
     baseResult({

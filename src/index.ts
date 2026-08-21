@@ -2799,7 +2799,6 @@ async function reconcileEventPayments(
                WHERE practice_date = ?1
                  AND payment_type = 'バス引率代'
                  AND status = 'unpaid'
-                 AND voided_at IS NULL
                  AND payee IS NOT NULL`
             )
             .bind(practice.practice_date)
