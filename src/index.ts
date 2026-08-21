@@ -1060,13 +1060,213 @@ function applyPersonalPracticeStandardTransport(
   };
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function splitGuideNames(raw: string | null): string[] {
+  if (!isConcreteText(raw)) {
+    return [];
+  }
+  return raw
+    .split(/[、,・/／\s]+/)
+    .map((name) => name.trim().replace(/[。．,，、]+$/g, ""))
+    .filter((name) => name.length > 0 && name !== "不明");
+}
+
+function extractReturnBusGuideFromText(inputText: string): string[] {
+  const sentenceMatch = inputText.match(/(?:帰り|復路)[^。\n]*引率(?:は|:|：)?\s*([^。\n]+)/);
+  if (sentenceMatch && sentenceMatch[1]) {
+    return sentenceMatch[1]
+      .split(/[、,・/／\s]+/)
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0 && name !== "不明" && /さん$/.test(name));
+  }
+
+  const roleHintNames: string[] = [];
+  const roleRegex = /([^\s、,，。]{1,12}さん)\s*は\s*(初回|経験者|同行経験者)/g;
+  let matched: RegExpExecArray | null = roleRegex.exec(inputText);
+  while (matched) {
+    const name = matched[1]?.trim();
+    if (name && !roleHintNames.includes(name)) {
+      roleHintNames.push(name);
+    }
+    matched = roleRegex.exec(inputText);
+  }
+  return roleHintNames.filter((name) => name.length > 0 && name !== "不明" && /さん$/.test(name));
+}
+
+function extractGuideRoleHintsFromText(inputText: string): string[] {
+  const hints: string[] = [];
+  const regex = /([^\s、,，。]{1,12}さん)\s*は\s*(初回|経験者|同行経験者)/g;
+  let matched: RegExpExecArray | null = regex.exec(inputText);
+  while (matched) {
+    const name = matched[1]?.trim();
+    const role = matched[2]?.trim();
+    if (name && role) {
+      const hint = `${name}は${role}`;
+      if (!hints.includes(hint)) {
+        hints.push(hint);
+      }
+    }
+    matched = regex.exec(inputText);
+  }
+  return hints;
+}
+
+function applyReturnBusGuideTextFallback(result: StructuredLineResult, inputText: string): StructuredLineResult {
+  if (result.return_transport.type !== "バス") {
+    return result;
+  }
+  const extractedGuides = extractReturnBusGuideFromText(inputText);
+  const nextBusGuide = isConcreteText(result.bus_guide)
+    ? result.bus_guide
+    : extractedGuides.length > 0
+      ? extractedGuides.join("・")
+      : result.bus_guide;
+  const roleHints = extractGuideRoleHintsFromText(inputText);
+  if (nextBusGuide === result.bus_guide && roleHints.length === 0) {
+    return result;
+  }
+
+  const currentNotes = result.notes ?? "";
+  const additionalHints = roleHints.filter((hint) => !currentNotes.includes(hint));
+  const nextNotes =
+    additionalHints.length > 0
+      ? [currentNotes.trim(), additionalHints.join("。")]
+          .filter((part) => part.length > 0)
+          .join(currentNotes.trim().length > 0 ? "\n" : "")
+      : result.notes;
+
+  return {
+    ...result,
+    bus_guide: nextBusGuide,
+    notes: nextNotes
+  };
+}
+
+function isNameMarkedBy(text: string, name: string, markerPattern: string): boolean {
+  const escapedName = escapeRegExp(name);
+  const pattern = new RegExp(
+    `${escapedName}[^、,，。\\n]{0,16}${markerPattern}|${markerPattern}[^、,，。\\n]{0,16}${escapedName}`,
+    "i"
+  );
+  return pattern.test(text);
+}
+
+function isNameMarkedNearby(text: string, name: string, markerPattern: string): boolean {
+  const index = text.indexOf(name);
+  if (index < 0) {
+    return false;
+  }
+  const markerRegex = new RegExp(markerPattern, "i");
+  const delimiters = [",", "，", "、", "。", "\n"];
+  let leftBoundary = -1;
+  for (const delimiter of delimiters) {
+    const pos = text.lastIndexOf(delimiter, index - 1);
+    if (pos > leftBoundary) {
+      leftBoundary = pos;
+    }
+  }
+  let rightBoundary = text.length;
+  for (const delimiter of delimiters) {
+    const pos = text.indexOf(delimiter, index + name.length);
+    if (pos >= 0 && pos < rightBoundary) {
+      rightBoundary = pos;
+    }
+  }
+
+  const before = text.slice(Math.max(leftBoundary + 1, index - 12), index);
+  const after = text.slice(index + name.length, Math.min(rightBoundary, index + name.length + 12));
+  return markerRegex.test(before) || markerRegex.test(after);
+}
+
+function resolveBusGuideAllowancePayee(result: StructuredLineResult): {
+  payee: string | null;
+  needsReview: boolean;
+  reviewReason: string | null;
+} {
+  const guideNames = splitGuideNames(result.bus_guide);
+  if (guideNames.length === 0) {
+    return {
+      payee: null,
+      needsReview: true,
+      reviewReason: "帰りバスの引率者が特定できないため、支払先の確認が必要です。"
+    };
+  }
+
+  const contextText = [result.notes ?? "", ...result.uncertain_points].join("\n");
+  const roleMap = new Map<string, "初回" | "経験者">();
+  const roleRegex = /([^\s、,，。]{1,12}さん)\s*は\s*(初回|経験者|同行経験者)/g;
+  let roleMatched: RegExpExecArray | null = roleRegex.exec(contextText);
+  while (roleMatched) {
+    const name = roleMatched[1]?.trim().replace(/[。．,，、]+$/g, "");
+    const roleToken = roleMatched[2] === "初回" ? "初回" : "経験者";
+    if (name) {
+      roleMap.set(name, roleToken);
+    }
+    roleMatched = roleRegex.exec(contextText);
+  }
+
+  const experienced = guideNames.filter(
+    (name) =>
+      roleMap.get(name) === "経験者" ||
+      isNameMarkedBy(contextText, name, "(経験者|同行経験者)") ||
+      isNameMarkedNearby(contextText, name, "(経験者|同行経験者)")
+  );
+  if (experienced.length === 1) {
+    return {
+      payee: experienced[0],
+      needsReview: false,
+      reviewReason: null
+    };
+  }
+
+  const firstTimers = guideNames.filter(
+    (name) => roleMap.get(name) === "初回" || isNameMarkedBy(contextText, name, "初回") || isNameMarkedNearby(contextText, name, "初回")
+  );
+  if (guideNames.length === 1 && firstTimers.length === 1) {
+    return {
+      payee: null,
+      needsReview: true,
+      reviewReason: "帰りバス引率が初回担当のみの記載のため、手当対象者の確認が必要です。"
+    };
+  }
+  if (firstTimers.length === 1) {
+    const nonFirstTimer = guideNames.filter((name) => name !== firstTimers[0]);
+    if (nonFirstTimer.length === 1) {
+      return {
+        payee: nonFirstTimer[0],
+        needsReview: false,
+        reviewReason: null
+      };
+    }
+  }
+
+  if (guideNames.length === 1) {
+    return {
+      payee: guideNames[0],
+      needsReview: false,
+      reviewReason: null
+    };
+  }
+
+  return {
+    payee: null,
+    needsReview: true,
+    reviewReason: "帰りバス引率者が複数のため、手当対象者の確認が必要です。"
+  };
+}
+
 function buildStandingRuleEventCandidates(
   result: StructuredLineResult,
   resolvedPracticeType: PracticeType
 ): PaymentForStorage[] {
   const candidates: PaymentForStorage[] = [];
   const eligibleMessageKind =
-    result.message_kind === "dispatch_confirmed" || result.message_kind === "same_day_change";
+    result.message_kind === "dispatch_confirmed" ||
+    result.message_kind === "same_day_change" ||
+    result.message_kind === "schedule";
   const eligiblePracticeType = resolvedPracticeType === "通常練習";
   const eligibleAttendance = result.attendance === "参加";
   if (!eligibleMessageKind || !eligiblePracticeType || !eligibleAttendance) {
@@ -1096,10 +1296,21 @@ function buildStandingRuleEventCandidates(
     });
   }
   if (result.return_transport.type === "バス" && result.bus_guide !== null) {
+    const busGuideResolution = resolveBusGuideAllowancePayee(result);
     candidates.push({
       type: "バス引率代",
       amount: 100,
-      payee: result.bus_guide,
+      payee: busGuideResolution.payee,
+      due_date: null,
+      payment_method: null,
+      billing_scope: "event",
+      direction: "return"
+    });
+  } else if (result.return_transport.type === "バス") {
+    candidates.push({
+      type: "バス引率代",
+      amount: 100,
+      payee: null,
       due_date: null,
       payment_method: null,
       billing_scope: "event",
@@ -2338,9 +2549,13 @@ async function savePracticeToD1(
       busGuide = null;
       busGuidePriority = messagePriorityValue;
     }
-  } else if (isConcreteText(result.bus_guide) && messagePriorityValue >= busGuidePriority) {
+  } else if (
+    isConcreteText(result.bus_guide) &&
+    returnType === "バス" &&
+    (messagePriorityValue >= busGuidePriority || !isConcreteText(busGuide))
+  ) {
     busGuide = result.bus_guide;
-    busGuidePriority = messagePriorityValue;
+    busGuidePriority = Math.max(busGuidePriority, messagePriorityValue);
     shouldReconcileEventPayments = true;
   }
 
@@ -2471,7 +2686,9 @@ async function savePracticeToD1(
 
   return {
     practiceSaved: true,
-    shouldReconcileEventPayments: shouldReconcileEventPayments && isDispatchOrChangeKind(result.message_kind),
+    shouldReconcileEventPayments:
+      shouldReconcileEventPayments &&
+      (isDispatchOrChangeKind(result.message_kind) || result.message_kind === "schedule"),
     messagePriorityValue
   };
 }
@@ -2525,13 +2742,13 @@ async function reconcileEventPayments(
     ...payment,
     rule_key: eventRuleKey(payment.direction, payment.type)
   }));
+  const expectedContext = toPracticeRowForCalculation(practice);
 
   const existingRows = await env.DB
     .prepare(
-      `SELECT id, payment_type, amount, payee, due_date, status, direction, rule_key, voided_at, needs_review
+      `SELECT id, payment_type, amount, payee, due_date, status, direction, rule_key, voided_at, needs_review, review_reason
        FROM payments
        WHERE practice_date = ?1
-         AND billing_scope = 'event'
          AND (
            rule_key IN ('transport:outbound:car', 'transport:return:car', 'transport:return:bus')
            OR
@@ -2551,18 +2768,62 @@ async function reconcileEventPayments(
       rule_key: string | null;
       voided_at: string | null;
       needs_review: number;
+      review_reason: string | null;
     }>();
 
   const existing = existingRows.results ?? [];
   const matchedIds = new Set<number>();
   const reviewWarnings: string[] = [];
+  let busGuideReviewNotified = false;
 
   for (const expectedPayment of expected) {
     if (!expectedPayment.rule_key) {
       continue;
     }
+    let resolvedExpectedPayee = expectedPayment.payee;
+    let expectedNeedsReview = 0;
+    let expectedReviewReason: string | null = null;
+    if (expectedPayment.type === "バス引率代" && resolvedExpectedPayee === null) {
+      const unresolved = resolveBusGuideAllowancePayee(expectedContext);
+      resolvedExpectedPayee = unresolved.payee;
+      expectedNeedsReview = unresolved.needsReview ? 1 : 0;
+      expectedReviewReason = unresolved.reviewReason;
+
+      if (resolvedExpectedPayee === null) {
+        const guideNames = splitGuideNames(expectedContext.bus_guide);
+        if (guideNames.length > 0) {
+          const legacyCandidates = await env.DB
+            .prepare(
+              `SELECT id, payee
+               FROM payments
+               WHERE practice_date = ?1
+                 AND payment_type = 'バス引率代'
+                 AND status = 'unpaid'
+                 AND voided_at IS NULL
+                 AND payee IS NOT NULL`
+            )
+            .bind(practice.practice_date)
+            .all<{ id: number; payee: string | null }>();
+          const matchedLegacyPayees = (legacyCandidates.results ?? [])
+            .map((row) => row.payee)
+            .filter((payee): payee is string => typeof payee === "string" && guideNames.includes(payee));
+          const uniqueLegacyPayees = [...new Set(matchedLegacyPayees)];
+          if (uniqueLegacyPayees.length === 1) {
+            resolvedExpectedPayee = uniqueLegacyPayees[0];
+            expectedNeedsReview = 0;
+            expectedReviewReason = null;
+          }
+        }
+      }
+
+      if (!busGuideReviewNotified && expectedNeedsReview === 1 && expectedReviewReason) {
+        reviewWarnings.push(`⚠️ ${expectedReviewReason}`);
+        busGuideReviewNotified = true;
+      }
+    }
     const expectedWithRuleKey = {
       ...expectedPayment,
+      payee: resolvedExpectedPayee,
       rule_key: expectedPayment.rule_key
     };
 
@@ -2571,15 +2832,18 @@ async function reconcileEventPayments(
     );
     if (activeMatch) {
       matchedIds.add(activeMatch.id);
-      if (activeMatch.needs_review === 1) {
+      if (
+        activeMatch.needs_review !== expectedNeedsReview ||
+        (activeMatch.review_reason ?? null) !== (expectedReviewReason ?? null)
+      ) {
         await env.DB.prepare(
           `UPDATE payments
-           SET needs_review = 0,
-               review_reason = NULL,
-               updated_at = ?1
-           WHERE id = ?2`
+           SET needs_review = ?1,
+               review_reason = ?2,
+               updated_at = ?3
+           WHERE id = ?4`
         )
-          .bind(now, activeMatch.id)
+          .bind(expectedNeedsReview, expectedReviewReason, now, activeMatch.id)
           .run();
       }
       continue;
@@ -2596,13 +2860,13 @@ async function reconcileEventPayments(
       await env.DB.prepare(
         `UPDATE payments
          SET voided_at = NULL,
-             needs_review = 0,
-             review_reason = NULL,
-             source = ?1,
-             updated_at = ?2
-         WHERE id = ?3`
+            needs_review = ?1,
+            review_reason = ?2,
+            source = ?3,
+            updated_at = ?4
+         WHERE id = ?5`
       )
-        .bind(sourceLabel, now, voidedReusable.id)
+        .bind(expectedNeedsReview, expectedReviewReason, sourceLabel, now, voidedReusable.id)
         .run();
       continue;
     }
@@ -2621,18 +2885,21 @@ async function reconcileEventPayments(
         source,
         created_at,
         updated_at,
-        needs_review
-      ) VALUES (?1, ?2, ?3, ?4, NULL, 'unpaid', 'event', ?5, ?6, ?7, ?8, ?8, 0)`
+        needs_review,
+        review_reason
+      ) VALUES (?1, ?2, ?3, ?4, NULL, 'unpaid', 'event', ?5, ?6, ?7, ?8, ?8, ?9, ?10)`
     )
       .bind(
         practice.practice_date,
         expectedPayment.type,
         expectedPayment.amount,
-        expectedPayment.payee,
+        resolvedExpectedPayee,
         expectedPayment.direction,
         expectedPayment.rule_key,
         sourceLabel,
-        now
+        now,
+        expectedNeedsReview,
+        expectedReviewReason
       )
       .run();
 
@@ -3329,9 +3596,8 @@ async function saveStructuredResultToD1(
   const paymentsForStorage = mapPaymentsForStorage(result);
   const shouldSkipLegacyPaymentUpsert =
     result.message_kind === "accounting_notice" && normalizedMonthlyCharges.length > 0;
-  const basePaymentsToUpsert = isDispatchOrChangeKind(result.message_kind)
-    ? paymentsForStorage.filter((payment) => payment.billing_scope !== "event")
-    : paymentsForStorage;
+  // Event payments are reconciled from practice state (rule_key管理) to avoid duplicate rows.
+  const basePaymentsToUpsert = paymentsForStorage.filter((payment) => payment.billing_scope !== "event");
   const paymentsToUpsert = shouldSkipLegacyPaymentUpsert ? [] : basePaymentsToUpsert;
   const hasExplicitPersonalAdjustment = paymentsToUpsert.some((payment) => payment.type === "個人練習差額");
   const hasExplicitPersonalFee = paymentsToUpsert.some((payment) => payment.type === "個人練習代");
@@ -3529,6 +3795,7 @@ async function callOpenAIForStructuredResult(
     "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。" +
     "配車表画像を読むときは、渡辺塁（塁/塁くん/ルイくん）本人が記載された行を最優先し、他人の行の交通手段を本人へ適用しないでください。" +
     "同一表内に『バス』行と『○○号』行が混在する場合でも、本人名がある行の値だけを本人情報として採用してください。" +
+    "同様に、帰りがバスの場合のbus_guideも本人行の記載を最優先し、本人行にある担当者名を抽出してください。" +
     "配車表などで『○○号』は『○○さんの車』として扱い、渡辺塁本人の割当が『渡辺→丹下号』のように明示される場合は" +
     "return_transport.type='車'、return_transport.person='丹下さん'のようにpersonまで必ず設定してください。" +
     "『志村号』等で車を確定してよいのは、渡辺塁本人名と同じ行（または明確に本人へ紐づくセル）にその号がある場合のみです。" +
@@ -4117,12 +4384,13 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       uncertain_points: reconciledDateUncertainty.uncertainPoints,
       needs_confirmation: reconciledDateUncertainty.needsConfirmation
     };
+    const busGuideTextFallbackApplied = applyReturnBusGuideTextFallback(contextResolvedResult, inputText);
 
     const existingPracticeForResolvedDate = resolved.resolvedPracticeDate
       ? await getPracticeByDate(env.DB, resolved.resolvedPracticeDate)
       : null;
     const transportApplied = applyPersonalPracticeStandardTransport(
-      contextResolvedResult,
+      busGuideTextFallbackApplied,
       resolved.resolvedPracticeType,
       existingPracticeForResolvedDate
     );
@@ -4424,6 +4692,7 @@ export class PairingSession implements DurableObject {
 export const TEST_HOOKS = {
   applyStandingPaymentRules,
   applyPersonalPracticeStandardTransport,
+  applyReturnBusGuideTextFallback,
   reconcileDateResolutionUncertainty,
   parseRuiContactCommand,
   buildRuiContactMessage,

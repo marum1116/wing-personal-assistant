@@ -1581,6 +1581,161 @@ async function main() {
   assert.equal(case4Rows[0]?.status, "paid");
   assert.equal(case4Rows[0]?.needs_review, 1);
 
+  // Bus Allowance Case A: 通常練習・帰りバス・1名引率はその人へ100円
+  const busCaseA = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-10",
+      outbound_transport: { type: "自力", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "遠山さん"
+    }) as any
+  );
+  assert.equal(busCaseA.result.payments.length, 1);
+  assert.equal(busCaseA.result.payments[0]?.type, "バス引率代");
+  assert.equal(busCaseA.result.payments[0]?.amount, 100);
+  assert.equal(busCaseA.result.payments[0]?.payee, "遠山さん");
+
+  // Bus Allowance Case B: 初回+経験者の2名引率は経験者へ100円
+  const busCaseB = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-11",
+      outbound_transport: { type: "自力", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "山田さん・遠山さん",
+      notes: "山田さんは初回バス引率、遠山さんは経験者として同行。"
+    }) as any
+  );
+  assert.equal(busCaseB.result.payments.length, 1);
+  assert.equal(busCaseB.result.payments[0]?.type, "バス引率代");
+  assert.equal(busCaseB.result.payments[0]?.payee, "遠山さん");
+
+  // Bus Allowance Case B2: scheduleでも本文フォールバックで引率/役割を補完できる
+  const busCaseB2Fallback = hooks.applyReturnBusGuideTextFallback(
+    baseResult({
+      message_kind: "schedule",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-15",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: null,
+      notes: "帰りはバス、帰り引率は山田さん・遠山さんと案内されていますが、渡辺塁本人に適用される確定情報かは不明です。"
+    }) as any,
+    "9/15 通常練習。帰りはバス。帰り引率は山田さん・遠山さん。山田さんは初回。遠山さんは経験者。"
+  );
+  assert.equal(busCaseB2Fallback.bus_guide, "山田さん・遠山さん");
+  assert.match(busCaseB2Fallback.notes ?? "", /山田さんは初回/);
+  assert.match(busCaseB2Fallback.notes ?? "", /遠山さんは経験者/);
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    hooks.applyStandingPaymentRules(busCaseB2Fallback as any).result as any,
+    "explicit",
+    1000
+  );
+  const busCaseB2Rows = raw
+    .prepare(
+      "SELECT payment_type, amount, payee, status, direction, rule_key, needs_review FROM payments WHERE practice_date='2026-09-15' AND voided_at IS NULL ORDER BY id"
+    )
+    .all() as Array<{
+      payment_type: string;
+      amount: number;
+      payee: string | null;
+      status: string;
+      direction: string;
+      rule_key: string | null;
+      needs_review: number;
+    }>;
+  assert.equal(busCaseB2Rows.length, 1);
+  assert.equal(busCaseB2Rows[0]?.payment_type, "バス引率代");
+  assert.equal(busCaseB2Rows[0]?.amount, 100);
+  assert.equal(busCaseB2Rows[0]?.payee, "遠山さん");
+  assert.equal(busCaseB2Rows[0]?.status, "unpaid");
+  assert.equal(busCaseB2Rows[0]?.direction, "return");
+  assert.equal(busCaseB2Rows[0]?.rule_key, "transport:return:bus");
+  assert.equal(busCaseB2Rows[0]?.needs_review, 0);
+
+  // Bus Allowance Case C: 2名引率だが役割不明なら支払先null + needs_reviewで残す
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    hooks.applyStandingPaymentRules(
+      baseResult({
+        message_kind: "dispatch_confirmed",
+        practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
+        practice_date: "2026-09-12",
+        outbound_transport: { type: "自力", person: null },
+        return_transport: { type: "バス", person: null },
+        bus_guide: "山田さん・遠山さん"
+      }) as any
+    ).result as any,
+    "explicit",
+    30
+  );
+  const busCaseCRows = raw
+    .prepare(
+      "SELECT payment_type, amount, payee, needs_review, rule_key, voided_at FROM payments WHERE practice_date='2026-09-12' AND payment_type='バス引率代' ORDER BY id"
+    )
+    .all() as Array<{
+      payment_type: string;
+      amount: number;
+      payee: string | null;
+      needs_review: number;
+      rule_key: string | null;
+      voided_at: string | null;
+    }>;
+  assert.equal(busCaseCRows.length, 1);
+  assert.equal(busCaseCRows[0]?.amount, 100);
+  assert.equal(busCaseCRows[0]?.payee, null);
+  assert.equal(busCaseCRows[0]?.needs_review, 1);
+  assert.equal(busCaseCRows[0]?.rule_key, "transport:return:bus");
+  assert.equal(busCaseCRows[0]?.voided_at, null);
+
+  // Bus Allowance Case D: 帰り車はバス引率代を生成しない（車代のみ）
+  const busCaseD = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-13",
+      outbound_transport: { type: "自力", person: null },
+      return_transport: { type: "車", person: "志村さん" },
+      bus_guide: "遠山さん"
+    }) as any
+  );
+  assert.equal(busCaseD.result.payments.length, 1);
+  assert.equal(busCaseD.result.payments[0]?.type, "車同乗代");
+  assert.equal(busCaseD.result.payments.some((payment) => payment.type === "バス引率代"), false);
+
+  // Bus Allowance Case E: 個人練習ではバス引率代を生成しない
+  const busCaseE = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "個人練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "個人練習",
+      practice_date: "2026-09-14",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "遠山さん",
+      payments: [{ type: "個人練習代", amount: 4040, payee: "丹下さん", due_date: null, payment_method: "PayPay" }]
+    }) as any
+  );
+  assert.equal(busCaseE.result.payments.length, 1);
+  assert.equal(busCaseE.result.payments[0]?.type, "個人練習代");
+
   // 回帰: 通常練習の車/バス
   const regularRows: Array<[string, number]> = [
     ["2026-08-30", 1],
