@@ -2686,9 +2686,7 @@ async function savePracticeToD1(
 
   return {
     practiceSaved: true,
-    shouldReconcileEventPayments:
-      shouldReconcileEventPayments &&
-      (isDispatchOrChangeKind(result.message_kind) || result.message_kind === "schedule"),
+    shouldReconcileEventPayments: isDispatchOrChangeKind(result.message_kind) || result.message_kind === "schedule",
     messagePriorityValue
   };
 }
