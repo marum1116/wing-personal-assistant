@@ -19,6 +19,9 @@ const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
 const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
 const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const CONTACT_RUI_COMMAND = "塁に連絡";
+const CONDITIONAL_PARTICIPATION_REVIEW_REASON = "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。";
+const CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX = "参加確定前の条件付き支払い案内";
+const PARTICIPATION_CONFIRM_ATTENDANCE_PRIORITY = 500;
 const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
@@ -227,6 +230,13 @@ type PracticeRow = {
 type RuiContactCommandParseResult = {
   dates: string[];
   labels: string[];
+};
+
+type ParticipationReviewReleaseRow = {
+  id: number;
+  amount: number | null;
+  payee: string | null;
+  payment_method: string | null;
 };
 
 type SaveStructuredResultOutcome = {
@@ -1859,6 +1869,123 @@ async function buildRuiContactMessage(
     sections.push(buildRuiContactPracticeBlock(headerLabel, practice).join("\n"));
   }
   return sections.join("\n\n");
+}
+
+function parseParticipationConfirmCommand(inputText: string, nowMs: number): string | null {
+  const trimmed = inputText.trim();
+  const matched = /^(\d{1,2})\/(\d{1,2})\s+参加確定$/.exec(trimmed);
+  if (!matched) {
+    return null;
+  }
+  const now = new Date(nowMs);
+  const year = Number(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric"
+    }).format(now)
+  );
+  const month = Number(matched[1]);
+  const day = Number(matched[2]);
+  const ymd = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (!parseYmdAsUtcDate(ymd)) {
+    return null;
+  }
+  return ymd;
+}
+
+function formatConditionalParticipationPaymentForLine(payment: {
+  amount: number | null;
+  payee: string | null;
+  payment_method: string | null;
+}): string {
+  const amountLabel = typeof payment.amount === "number" ? `${payment.amount}円` : "金額不明";
+  const payeeLabel = isConcreteText(payment.payee) ? payment.payee : "支払先不明";
+  const methodLabel = isConcreteText(payment.payment_method) ? payment.payment_method : "支払方法不明";
+  return `参加費${amountLabel}（${payeeLabel}／${methodLabel}）`;
+}
+
+async function confirmParticipationAndReleaseConditionalFees(
+  db: D1Database,
+  practiceDate: string
+): Promise<{
+  attendanceUpdated: boolean;
+  releasedPayments: ParticipationReviewReleaseRow[];
+}> {
+  const now = new Date().toISOString();
+  const attendanceUpdate = await db
+    .prepare(
+      `UPDATE practices
+       SET attendance = '参加',
+           attendance_priority = CASE
+             WHEN attendance_priority IS NULL OR attendance_priority < ?1 THEN ?1
+             ELSE attendance_priority
+           END,
+           updated_at = ?2
+       WHERE practice_date = ?3`
+    )
+    .bind(PARTICIPATION_CONFIRM_ATTENDANCE_PRIORITY, now, practiceDate)
+    .run();
+
+  const releasableRows = await db
+    .prepare(
+      `SELECT id, amount, payee, payment_method
+       FROM payments
+       WHERE practice_date = ?1
+         AND payment_type = '参加費'
+         AND status = 'unpaid'
+         AND voided_at IS NULL
+         AND needs_review = 1
+         AND review_reason LIKE ?2
+       ORDER BY id ASC`
+    )
+    .bind(practiceDate, `${CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX}%`)
+    .all<ParticipationReviewReleaseRow>();
+  const releasedPayments = releasableRows.results ?? [];
+
+  if (releasedPayments.length > 0) {
+    await db
+      .prepare(
+        `UPDATE payments
+         SET needs_review = 0,
+             review_reason = NULL,
+             updated_at = ?1
+         WHERE practice_date = ?2
+           AND payment_type = '参加費'
+           AND status = 'unpaid'
+           AND voided_at IS NULL
+           AND needs_review = 1
+           AND review_reason LIKE ?3`
+      )
+      .bind(now, practiceDate, `${CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX}%`)
+      .run();
+  }
+
+  return {
+    attendanceUpdated: Number(attendanceUpdate.meta.changes ?? 0) > 0,
+    releasedPayments
+  };
+}
+
+function buildParticipationConfirmMessage(
+  practiceDate: string,
+  releasedPayments: ParticipationReviewReleaseRow[]
+): string {
+  const dateLabel = formatDateForLine(practiceDate);
+  const lines: string[] = [`${dateLabel}の参加を確定しました。`];
+  if (releasedPayments.length === 0) {
+    lines.push("確認待ちだった参加費はありませんでした。");
+  } else if (releasedPayments.length === 1) {
+    lines.push(
+      `確認待ちだった${formatConditionalParticipationPaymentForLine(releasedPayments[0])}を未払いに移しました。`
+    );
+  } else {
+    lines.push(`確認待ちだった参加費${releasedPayments.length}件を未払いに移しました。`);
+    for (const payment of releasedPayments) {
+      lines.push(`・${formatConditionalParticipationPaymentForLine(payment)}`);
+    }
+  }
+  lines.push("※ バス引率代など、別理由の確認待ちは変更していません。");
+  return lines.join("\n");
 }
 
 function parsePositiveInt(value: string | null): number | null {
@@ -3914,7 +4041,7 @@ async function saveStructuredResultToD1(
     const reviewMeta: ConditionalPaymentReviewMeta = conditionalPaymentPending
       ? {
           needsReview: true,
-          reviewReason: "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。"
+          reviewReason: CONDITIONAL_PARTICIPATION_REVIEW_REASON
         }
       : {
           needsReview: false,
@@ -4274,6 +4401,34 @@ async function replyUnpaidList(
   };
 }
 
+async function handleParticipationConfirmCommand(
+  event: LineWebhookEvent,
+  env: Env,
+  practiceDate: string
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  console.log({ stage: "participation_confirm_start", practiceDate });
+  const outcome = await confirmParticipationAndReleaseConditionalFees(env.DB, practiceDate);
+  console.log({
+    stage: "participation_confirm_success",
+    practiceDate,
+    attendanceUpdated: outcome.attendanceUpdated,
+    releasedCount: outcome.releasedPayments.length
+  });
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: buildParticipationConfirmMessage(practiceDate, outcome.releasedPayments) }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
+}
+
 async function handleMarkPaidPostback(
   event: LineWebhookEvent,
   env: Env,
@@ -4533,6 +4688,11 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   console.log({ stage: "text_received" });
 
   const inputText = event.message.text;
+  const participationConfirmDate = parseParticipationConfirmCommand(inputText, event.timestamp ?? Date.now());
+  if (participationConfirmDate) {
+    await handleParticipationConfirmCommand(event, env, participationConfirmDate);
+    return;
+  }
   if (UNPAID_COMMANDS.has(inputText)) {
     const replyResult = await replyUnpaidList(event.replyToken, env);
     if (typeof replyResult.lineStatus === "number") {
@@ -5023,6 +5183,7 @@ export const TEST_HOOKS = {
   saveRecentPracticeContext,
   loadRecentPracticeContext,
   saveStructuredResultToD1,
+  confirmParticipationAndReleaseConditionalFees,
   getUnifiedUnpaidPayments,
   markEventPaymentPaid,
   markMonthlyPaymentPaid,

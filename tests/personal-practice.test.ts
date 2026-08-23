@@ -1341,6 +1341,51 @@ async function main() {
     ),
     false
   );
+  raw
+    .prepare(
+      "INSERT INTO payments (practice_date,payment_type,amount,payee,due_date,payment_method,status,billing_scope,direction,source,created_at,updated_at,rule_key,voided_at,needs_review,review_reason) VALUES ('2026-11-24','バス引率代',100,NULL,NULL,NULL,'unpaid','event','return','羽魂練習会',datetime('now'),datetime('now'),'transport:return:bus',NULL,1,'帰りバスの引率者が特定できないため、支払先の確認が必要です。')"
+    )
+    .run();
+  const confirmOutcome = await hooks.confirmParticipationAndReleaseConditionalFees(env.DB as any, "2026-11-24");
+  assert.equal(confirmOutcome.releasedPayments.length, 1);
+  assert.equal(confirmOutcome.releasedPayments[0]?.amount, 800);
+  assert.equal(confirmOutcome.releasedPayments[0]?.payee, "神邊さん");
+  assert.equal(confirmOutcome.releasedPayments[0]?.payment_method, "PayPay");
+  const confirmedFeeRow = raw
+    .prepare(
+      "SELECT needs_review, review_reason FROM payments WHERE practice_date='2026-11-24' AND payment_type='参加費' AND amount=800 AND payee='神邊さん' LIMIT 1"
+    )
+    .get() as { needs_review: number; review_reason: string | null };
+  assert.equal(confirmedFeeRow.needs_review, 0);
+  assert.equal(confirmedFeeRow.review_reason, null);
+  const untouchedBusReview = raw
+    .prepare(
+      "SELECT needs_review, review_reason FROM payments WHERE practice_date='2026-11-24' AND payment_type='バス引率代' LIMIT 1"
+    )
+    .get() as { needs_review: number; review_reason: string | null };
+  assert.equal(untouchedBusReview.needs_review, 1);
+  assert.match(untouchedBusReview.review_reason ?? "", /確認が必要/);
+  const regularScheduleConfirmedUnpaid = await hooks.getUnifiedUnpaidPayments(env.DB as any, 20);
+  assert.equal(
+    regularScheduleConfirmedUnpaid.payments.some(
+      (item: any) =>
+        item.payment_kind === "event" &&
+        item.practice_date === "2026-11-24" &&
+        item.payment_type === "参加費" &&
+        item.amount === 800 &&
+        item.payee === "神邊さん"
+    ),
+    true
+  );
+  assert.equal(
+    regularScheduleConfirmedUnpaid.payments.some(
+      (item: any) =>
+        item.payment_kind === "event" &&
+        item.practice_date === "2026-11-24" &&
+        item.payment_type === "バス引率代"
+    ),
+    false
+  );
 
   // Requested Regression: 後続補足メッセージのattendance不明は既存同日参加で補完する
   const attendanceFallback = hooks.applyKnownPracticeFallbackForSparseMessage(
