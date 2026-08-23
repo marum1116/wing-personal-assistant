@@ -244,6 +244,11 @@ type SaveStructuredResultOutcome = {
   }>;
 };
 
+type ConditionalPaymentReviewMeta = {
+  needsReview: boolean;
+  reviewReason: string | null;
+};
+
 type StructuredLineResult = {
   message_kind: MessageKind;
   practice_type: PracticeType;
@@ -926,6 +931,36 @@ function shouldDropAiPayments(messageKind: MessageKind): boolean {
   );
 }
 
+function isEventPaymentType(paymentType: PaymentType): boolean {
+  return paymentType === "車同乗代" || paymentType === "バス引率代";
+}
+
+function shouldKeepExplicitSchedulePayment(payment: ParsedPayment): boolean {
+  if (isEventPaymentType(payment.type)) {
+    return false;
+  }
+  if (typeof payment.amount !== "number") {
+    return false;
+  }
+  return (
+    isConcreteText(payment.payee) ||
+    isConcreteText(payment.payment_method) ||
+    isConcreteText(payment.due_date)
+  );
+}
+
+function hasConditionalPaymentCue(inputText: string): boolean {
+  const normalized = inputText.replace(/\s+/g, "").toLowerCase();
+  return (
+    normalized.includes("okとなりましたら") ||
+    normalized.includes("okになりましたら") ||
+    normalized.includes("okなら") ||
+    normalized.includes("確定したら") ||
+    normalized.includes("参加できたら") ||
+    normalized.includes("参加okとなりましたら")
+  );
+}
+
 function normalizePersonalPracticePayments(payments: ParsedPayment[]): ParsedPayment[] {
   const personalFee = payments.filter((payment) => payment.type === "個人練習代");
   const personalAdjustment = payments.filter((payment) => payment.type === "個人練習差額");
@@ -1142,6 +1177,28 @@ function applyReturnBusGuideTextFallback(result: StructuredLineResult, inputText
     ...result,
     bus_guide: nextBusGuide,
     notes: nextNotes
+  };
+}
+
+function applyKnownPracticeFallbackForSparseMessage(
+  result: StructuredLineResult,
+  existingPractice: PracticeRow | null
+): { result: StructuredLineResult; appliedAttendanceFallback: boolean } {
+  if (!existingPractice) {
+    return { result, appliedAttendanceFallback: false };
+  }
+  if (result.attendance !== "不明") {
+    return { result, appliedAttendanceFallback: false };
+  }
+  if (existingPractice.attendance !== "参加" && existingPractice.attendance !== "不参加") {
+    return { result, appliedAttendanceFallback: false };
+  }
+  return {
+    result: {
+      ...result,
+      attendance: existingPractice.attendance
+    },
+    appliedAttendanceFallback: true
   };
 }
 
@@ -1364,8 +1421,13 @@ function applyStandingPaymentRules(
       after: afterPayments
     });
   } else {
-    // 通常練習は既存どおり schedule/dispatch系のAI支払いを破棄する。
-    basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
+    if (result.message_kind === "schedule") {
+      // 通常練習のscheduleは原則AI支払いを落とすが、明示的な都度請求は保持する。
+      basePayments = result.payments.filter((payment) => shouldKeepExplicitSchedulePayment(payment));
+    } else {
+      // 通常練習のdispatch/general_rule系は既存どおりAI支払いを破棄する。
+      basePayments = shouldDropAiPayments(result.message_kind) ? [] : [...result.payments];
+    }
   }
   const mergedPayments = [...basePayments];
   const existingCounts = new Map<string, number>();
@@ -1818,7 +1880,7 @@ async function getUnpaidEventPayments(
   limit: number
 ): Promise<{ totalCount: number; payments: UnpaidPaymentRow[] }> {
   const totalRow = await db
-    .prepare("SELECT COUNT(*) AS count FROM payments WHERE status = 'unpaid' AND voided_at IS NULL")
+    .prepare("SELECT COUNT(*) AS count FROM payments WHERE status = 'unpaid' AND voided_at IS NULL AND needs_review = 0")
     .first<{
       count: number;
     }>();
@@ -1831,6 +1893,7 @@ async function getUnpaidEventPayments(
        FROM payments
        WHERE status = 'unpaid'
          AND voided_at IS NULL
+         AND needs_review = 0
        ORDER BY (due_date IS NULL) ASC, due_date ASC, practice_date ASC, id ASC
        LIMIT ?1`
     )
@@ -1861,7 +1924,7 @@ async function getUnpaidMonthlyPayments(
   }>;
 }> {
   const totalRow = await db
-    .prepare("SELECT COUNT(*) AS count FROM monthly_payments WHERE status = 'unpaid'")
+    .prepare("SELECT COUNT(*) AS count FROM monthly_payments WHERE status = 'unpaid' AND needs_review = 0")
     .first<{ count: number }>();
   const totalCount = Number(totalRow?.count ?? 0);
 
@@ -1870,6 +1933,7 @@ async function getUnpaidMonthlyPayments(
       `SELECT id, billing_month, monthly_type, amount, payee, due_date, payment_method, breakdown_text, status
        FROM monthly_payments
        WHERE status = 'unpaid'
+         AND needs_review = 0
        ORDER BY (due_date IS NULL) ASC, due_date ASC, billing_month ASC, id ASC
        LIMIT ?1`
     )
@@ -3205,8 +3269,9 @@ async function upsertNonEventPaymentToD1(
   env: Env,
   practiceDate: string,
   sourceLabel: string,
-  payment: PaymentForStorage
-): Promise<void> {
+  payment: PaymentForStorage,
+  conditionalReview: ConditionalPaymentReviewMeta
+): Promise<string | null> {
   const now = new Date().toISOString();
   const existing = await env.DB.prepare(
     `SELECT id
@@ -3234,13 +3299,23 @@ async function upsertNonEventPaymentToD1(
       `UPDATE payments
        SET due_date = COALESCE(?1, due_date),
            payment_method = COALESCE(?2, payment_method),
-           source = ?3,
-           updated_at = ?4
-       WHERE id = ?5`
+           needs_review = ?3,
+           review_reason = ?4,
+           source = ?5,
+           updated_at = ?6
+       WHERE id = ?7`
     )
-      .bind(payment.due_date, payment.payment_method, sourceLabel, now, existing.id)
+      .bind(
+        payment.due_date,
+        payment.payment_method,
+        conditionalReview.needsReview ? 1 : 0,
+        conditionalReview.reviewReason,
+        sourceLabel,
+        now,
+        existing.id
+      )
       .run();
-    return;
+    return conditionalReview.needsReview ? `⚠️ ${conditionalReview.reviewReason}` : null;
   }
 
   await env.DB.prepare(
@@ -3254,10 +3329,12 @@ async function upsertNonEventPaymentToD1(
       status,
       billing_scope,
       direction,
+      needs_review,
+      review_reason,
       source,
       created_at,
       updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unpaid', ?7, ?8, ?9, ?10, ?10)`
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unpaid', ?7, ?8, ?9, ?10, ?11, ?12, ?12)`
   )
     .bind(
       practiceDate,
@@ -3268,10 +3345,13 @@ async function upsertNonEventPaymentToD1(
       payment.payment_method,
       payment.billing_scope,
       payment.direction,
+      conditionalReview.needsReview ? 1 : 0,
+      conditionalReview.reviewReason,
       sourceLabel,
       now
     )
     .run();
+  return conditionalReview.needsReview ? `⚠️ ${conditionalReview.reviewReason}` : null;
 }
 
 async function upsertPersonalPracticePaymentToD1(
@@ -3763,7 +3843,8 @@ async function saveStructuredResultToD1(
   sourceLabel: string,
   result: StructuredLineResult,
   practiceTypeBasis: StoredPracticeTypeBasis,
-  practiceTypePriority: number
+  practiceTypePriority: number,
+  conditionalPaymentPending = false
 ): Promise<SaveStructuredResultOutcome> {
   const savedMonthlyCharges: SaveStructuredResultOutcome["savedMonthlyCharges"] = [];
   const reviewWarnings: string[] = [];
@@ -3830,7 +3911,25 @@ async function saveStructuredResultToD1(
       }
       continue;
     }
-    await upsertNonEventPaymentToD1(env, result.practice_date, sourceLabel, payment);
+    const reviewMeta: ConditionalPaymentReviewMeta = conditionalPaymentPending
+      ? {
+          needsReview: true,
+          reviewReason: "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。"
+        }
+      : {
+          needsReview: false,
+          reviewReason: null
+        };
+    const nonEventWarning = await upsertNonEventPaymentToD1(
+      env,
+      result.practice_date,
+      sourceLabel,
+      payment,
+      reviewMeta
+    );
+    if (nonEventWarning && !reviewWarnings.includes(nonEventWarning)) {
+      reviewWarnings.push(nonEventWarning);
+    }
   }
 
   if (!practiceSave.shouldReconcileEventPayments) {
@@ -4603,8 +4702,12 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     const existingPracticeForResolvedDate = resolved.resolvedPracticeDate
       ? await getPracticeByDate(env.DB, resolved.resolvedPracticeDate)
       : null;
-    const transportApplied = applyPersonalPracticeStandardTransport(
+    const knownPracticeFallbackApplied = applyKnownPracticeFallbackForSparseMessage(
       busGuideTextFallbackApplied,
+      existingPracticeForResolvedDate
+    );
+    const transportApplied = applyPersonalPracticeStandardTransport(
+      knownPracticeFallbackApplied.result,
       resolved.resolvedPracticeType,
       existingPracticeForResolvedDate
     );
@@ -4613,6 +4716,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       practiceTypeBasis: resolvedTypeMeta.basis,
       practiceTypePriority: resolvedTypeMeta.priority
     });
+    const conditionalPaymentPending = hasConditionalPaymentCue(inputText);
     console.log({
       stage: "message_classification_resolved",
       messageKind: standingApplied.result.message_kind,
@@ -4621,6 +4725,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       resolvedPracticeDate: resolved.resolvedPracticeDate,
       dateBasis: resolved.dateBasis,
       typeBasis: resolved.typeBasis,
+      knownAttendanceFallbackApplied: knownPracticeFallbackApplied.appliedAttendanceFallback,
+      conditionalPaymentPending,
       defaultOutboundApplied: transportApplied.appliedOutbound,
       defaultReturnApplied: transportApplied.appliedReturn
     });
@@ -4644,7 +4750,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
         sourceLabel,
         standingApplied.result,
         resolvedTypeMeta.basis,
-        resolvedTypeMeta.priority
+        resolvedTypeMeta.priority,
+        conditionalPaymentPending
       );
       console.log({
         stage: "d1_save_success",
@@ -4907,6 +5014,7 @@ export const TEST_HOOKS = {
   applyStandingPaymentRules,
   applyPersonalPracticeStandardTransport,
   applyReturnBusGuideTextFallback,
+  applyKnownPracticeFallbackForSparseMessage,
   reconcileDateResolutionUncertainty,
   parseRuiContactCommand,
   buildRuiContactMessage,

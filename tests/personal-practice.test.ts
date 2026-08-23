@@ -1281,6 +1281,109 @@ async function main() {
   );
   assert.equal(regularScheduleDrop.result.payments.length, 0);
 
+  // Requested Regression: 通常練習 schedule でも明示的な都度請求は保持する
+  const regularScheduleKeepExplicit = hooks.applyStandingPaymentRules(
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-11-24",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      attendance: "不明",
+      outbound_transport: { type: "不明", person: null },
+      return_transport: { type: "不明", person: null },
+      payments: [{ type: "参加費", amount: 800, payee: "神邊さん", due_date: null, payment_method: "PayPay" }]
+    }) as any
+  );
+  assert.equal(regularScheduleKeepExplicit.result.payments.length, 1);
+  assert.equal(regularScheduleKeepExplicit.result.payments[0]?.type, "参加費");
+  assert.equal(regularScheduleKeepExplicit.result.payments[0]?.amount, 800);
+  assert.equal(regularScheduleKeepExplicit.result.payments[0]?.payee, "神邊さん");
+  assert.equal(regularScheduleKeepExplicit.result.payments[0]?.payment_method, "PayPay");
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    regularScheduleKeepExplicit.result as any,
+    "explicit",
+    1000,
+    true
+  );
+  const regularSchedulePendingRow = raw
+    .prepare(
+      "SELECT payment_type, amount, payee, payment_method, status, needs_review, review_reason, voided_at FROM payments WHERE practice_date='2026-11-24' AND payment_type='参加費' LIMIT 1"
+    )
+    .get() as {
+      payment_type: string;
+      amount: number;
+      payee: string | null;
+      payment_method: string | null;
+      status: string;
+      needs_review: number;
+      review_reason: string | null;
+      voided_at: string | null;
+    };
+  assert.equal(regularSchedulePendingRow.payment_type, "参加費");
+  assert.equal(regularSchedulePendingRow.amount, 800);
+  assert.equal(regularSchedulePendingRow.payee, "神邊さん");
+  assert.equal(regularSchedulePendingRow.payment_method, "PayPay");
+  assert.equal(regularSchedulePendingRow.status, "unpaid");
+  assert.equal(regularSchedulePendingRow.needs_review, 1);
+  assert.match(regularSchedulePendingRow.review_reason ?? "", /確認待ち/);
+  assert.equal(regularSchedulePendingRow.voided_at, null);
+  const regularSchedulePendingUnpaid = await hooks.getUnifiedUnpaidPayments(env.DB as any, 20);
+  assert.equal(
+    regularSchedulePendingUnpaid.payments.some(
+      (item: any) =>
+        item.payment_kind === "event" &&
+        item.practice_date === "2026-11-24" &&
+        item.payment_type === "参加費" &&
+        item.amount === 800
+    ),
+    false
+  );
+
+  // Requested Regression: 後続補足メッセージのattendance不明は既存同日参加で補完する
+  const attendanceFallback = hooks.applyKnownPracticeFallbackForSparseMessage(
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-08-24",
+      attendance: "不明",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null }
+    }) as any,
+    {
+      practice_date: "2026-08-24",
+      attendance: "参加",
+      outbound_type: "バス",
+      outbound_person: null,
+      return_type: "バス",
+      return_person: null,
+      bus_guide: "山田さん・遠山さん",
+      meeting_time: null,
+      meeting_place: null,
+      outbound_companions: null,
+      return_dropoff_place: null,
+      return_release_place: null,
+      source: "羽魂練習会",
+      notes: null,
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_priority: 1000,
+      attendance_priority: 300,
+      outbound_priority: 300,
+      return_priority: 300,
+      bus_guide_priority: 300,
+      meeting_time_priority: 0,
+      meeting_place_priority: 0,
+      outbound_companions_priority: 0,
+      return_dropoff_place_priority: 0,
+      return_release_place_priority: 0,
+      last_message_kind: "schedule"
+    } as any
+  );
+  assert.equal(attendanceFallback.appliedAttendanceFallback, true);
+  assert.equal(attendanceFallback.result.attendance, "参加");
+
   // Requested Regression: 個人練習差額は message_kind だけで削除しない
   const personalAdjustmentOnSchedule = hooks.applyStandingPaymentRules(
     baseResult({
