@@ -136,6 +136,16 @@ type UnpaidPaymentRow = {
   status: PaymentStatus;
 };
 
+type ReviewPendingPaymentRow = {
+  id: number;
+  practice_date: string;
+  payment_type: string;
+  amount: number | null;
+  payee: string | null;
+  payment_method: string | null;
+  review_reason: string | null;
+};
+
 type UnifiedUnpaidItem =
   | {
       payment_kind: "event";
@@ -1647,6 +1657,36 @@ function buildUnpaidListMessage(payments: UnifiedUnpaidItem[], totalCount: numbe
   };
 }
 
+function buildReviewPendingReasonForLine(payment: ReviewPendingPaymentRow): string {
+  if (payment.payment_type === "バス引率代" && !isConcreteText(payment.payee)) {
+    return "支払先が不明のため確認が必要です。";
+  }
+  return isConcreteText(payment.review_reason) ? payment.review_reason : "内容確認が必要です。";
+}
+
+function buildReviewPendingNoticeMessage(payments: ReviewPendingPaymentRow[]): LineReplyMessage | null {
+  if (payments.length === 0) {
+    return null;
+  }
+  const lines: string[] = ["確認が必要な支払いがあります。", ""];
+  for (const payment of payments) {
+    const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
+    lines.push(`・${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`);
+    if (payment.payee) {
+      lines.push(`　支払先：${payment.payee}`);
+    }
+    if (payment.payment_method) {
+      lines.push(`　支払方法：${payment.payment_method}`);
+    }
+    lines.push(`　理由：${buildReviewPendingReasonForLine(payment)}`);
+  }
+  lines.push("", "※ 上記は確認待ちのため、未払い一覧には表示していません。");
+  return {
+    type: "text",
+    text: lines.join("\n")
+  };
+}
+
 function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
   if (payment.payment_kind === "event") {
     const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
@@ -2080,6 +2120,34 @@ async function getUnpaidMonthlyPayments(
   return {
     totalCount,
     payments: result.results ?? []
+  };
+}
+
+async function getReviewPendingEventPayments(
+  db: D1Database,
+  limit: number
+): Promise<{ totalCount: number; payments: ReviewPendingPaymentRow[] }> {
+  const totalRow = await db
+    .prepare("SELECT COUNT(*) AS count FROM payments WHERE status = 'unpaid' AND voided_at IS NULL AND needs_review = 1")
+    .first<{ count: number }>();
+  const totalCount = Number(totalRow?.count ?? 0);
+
+  const rows = await db
+    .prepare(
+      `SELECT id, practice_date, payment_type, amount, payee, payment_method, review_reason
+       FROM payments
+       WHERE status = 'unpaid'
+         AND voided_at IS NULL
+         AND needs_review = 1
+       ORDER BY practice_date ASC, id ASC
+       LIMIT ?1`
+    )
+    .bind(limit)
+    .all<ReviewPendingPaymentRow>();
+
+  return {
+    totalCount,
+    payments: rows.results ?? []
   };
 }
 
@@ -4379,16 +4447,24 @@ async function replyUnpaidList(
 ): Promise<{ totalCount: number; displayedCount: number; lineStatus?: number }> {
   console.log({ stage: "unpaid_list_start" });
   const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+  const reviewPending = await getReviewPendingEventPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
   console.log({
     stage: "unpaid_list_success",
     unpaidCount: unpaid.totalCount,
-    displayedCount: unpaid.payments.length
+    displayedCount: unpaid.payments.length,
+    reviewPendingCount: reviewPending.totalCount
   });
+
+  const messages: LineReplyMessage[] = [buildUnpaidListMessage(unpaid.payments, unpaid.totalCount)];
+  const reviewPendingNotice = buildReviewPendingNoticeMessage(reviewPending.payments);
+  if (reviewPendingNotice) {
+    messages.push(reviewPendingNotice);
+  }
 
   console.log({ stage: "line_reply_start" });
   const lineStatus = await replyMessages(
     replyToken,
-    [buildUnpaidListMessage(unpaid.payments, unpaid.totalCount)],
+    messages,
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
   if (typeof lineStatus === "number") {
@@ -5185,6 +5261,7 @@ export const TEST_HOOKS = {
   saveStructuredResultToD1,
   confirmParticipationAndReleaseConditionalFees,
   getUnifiedUnpaidPayments,
+  getReviewPendingEventPayments,
   markEventPaymentPaid,
   markMonthlyPaymentPaid,
   getReminderTargets,

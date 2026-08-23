@@ -1386,6 +1386,14 @@ async function main() {
     ),
     false
   );
+  const reviewPendingEvent = await hooks.getReviewPendingEventPayments(env.DB as any, 20);
+  assert.equal(reviewPendingEvent.totalCount >= 1, true);
+  const pendingBusGuide = reviewPendingEvent.payments.find(
+    (row: any) => row.practice_date === "2026-11-24" && row.payment_type === "バス引率代"
+  );
+  assert.ok(pendingBusGuide);
+  assert.equal(pendingBusGuide?.payee ?? null, null);
+  assert.match(pendingBusGuide?.review_reason ?? "", /支払先の確認が必要/);
 
   // Requested Regression: 後続補足メッセージのattendance不明は既存同日参加で補完する
   const attendanceFallback = hooks.applyKnownPracticeFallbackForSparseMessage(
