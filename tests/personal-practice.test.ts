@@ -266,12 +266,13 @@ async function main() {
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
   assert.match(contactTodayText, /【今日 8\/20（木）】/);
+  assert.match(contactTodayText, /練習場所：白幡台小/);
   assert.match(contactTodayText, /集合：17:55ごろ KSP/);
   assert.match(contactTodayText, /行き：バス/);
-  assert.match(contactTodayText, /一緒：太郎、次郎/);
   assert.match(contactTodayText, /帰り：バス/);
   assert.match(contactTodayText, /引率：山田さん・遠山さん/);
   assert.match(contactTodayText, /解散：溝の口南口/);
+  assert.ok(!contactTodayText.includes("一緒："));
   assert.match(contactTodayText, /【明日 8\/21（金）】\n練習情報なし/);
 
   // 塁に連絡 Case: 明日だけ練習あり（帰り車 + 降車場所）
@@ -302,11 +303,12 @@ async function main() {
   );
   assert.match(contactTomorrowText, /【今日 8\/20（木）】\n練習情報なし/);
   assert.match(contactTomorrowText, /【明日 8\/21（金）】/);
+  assert.match(contactTomorrowText, /練習場所：不明/);
   assert.match(contactTomorrowText, /集合：18:20 志村さん宅/);
   assert.match(contactTomorrowText, /行き：志村さんの車/);
   assert.match(contactTomorrowText, /帰り：志村さんの車/);
   assert.match(contactTomorrowText, /降りる場所：溝の口駅前/);
-  assert.match(contactTomorrowText, /一緒：不明/);
+  assert.ok(!contactTomorrowText.includes("一緒："));
 
   // 塁に連絡 Case: 今日・明日両方あり
   const { env: contactEnvBoth } = createTestEnv();
@@ -429,8 +431,9 @@ async function main() {
     ["今日 8/20（木）"]
   );
   assert.match(contactPartialText, /【今日 8\/20（木）】/);
+  assert.match(contactPartialText, /練習場所：白幡台小/);
   assert.match(contactPartialText, /集合：KSP/);
-  assert.match(contactPartialText, /一緒：不明/);
+  assert.ok(!contactPartialText.includes("一緒："));
   assert.match(contactPartialText, /行き：不明/);
   assert.match(contactPartialText, /帰り：バス/);
   assert.match(contactPartialText, /引率：不明/);
@@ -463,6 +466,7 @@ async function main() {
     ["2026-08-20"],
     ["8/20（木）"]
   );
+  assert.match(contactRuleFallbackText, /練習場所：白幡台小/);
   assert.match(contactRuleFallbackText, /集合：17:55ごろ KSP（または18:20 溝の口南口）/);
   assert.match(contactRuleFallbackText, /解散：溝の口南口/);
 
@@ -492,6 +496,7 @@ async function main() {
     ["2026-08-24"],
     ["8/24（月）"]
   );
+  assert.match(contactRuleFallbackMonText, /練習場所：犬蔵中/);
   assert.match(contactRuleFallbackMonText, /集合：17:55ごろ KSP（または18:20 溝の口南口）/);
   assert.match(contactRuleFallbackMonText, /解散：溝の口南口/);
 

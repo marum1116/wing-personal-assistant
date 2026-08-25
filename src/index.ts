@@ -1858,13 +1858,23 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
     return lines;
   }
 
+  const practiceDate = parseYmdAsUtcDate(practice.practice_date);
+  const weekday = practiceDate ? practiceDate.getUTCDay() : -1;
+  const isWeekdayRegularPractice = (weekday === 1 || weekday === 2 || weekday === 4) && practice.practice_type === "通常練習";
+  let practiceLocation = "不明";
+  if (practice.practice_type === "通常練習") {
+    if (weekday === 1 || weekday === 2) {
+      practiceLocation = "犬蔵中";
+    } else if (weekday === 4) {
+      practiceLocation = "白幡台小";
+    }
+  }
+  lines.push(`練習場所：${practiceLocation}`);
+
   const meetingParts = [practice.meeting_time, practice.meeting_place].filter((value): value is string =>
     isConcreteText(value)
   );
   let meetingLabel = meetingParts.length > 0 ? meetingParts.join(" ") : "不明";
-  const practiceDate = parseYmdAsUtcDate(practice.practice_date);
-  const weekday = practiceDate ? practiceDate.getUTCDay() : -1;
-  const isWeekdayRegularPractice = (weekday === 1 || weekday === 2 || weekday === 4) && practice.practice_type === "通常練習";
   if (meetingLabel === "不明" && isWeekdayRegularPractice) {
     meetingLabel = "17:55ごろ KSP（または18:20 溝の口南口）";
   }
@@ -1874,7 +1884,6 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
     ? transportToLineLabel({ type: practice.outbound_type, person: practice.outbound_person ?? null })
     : "不明";
   lines.push(`行き：${outboundLabel}`);
-  lines.push(`一緒：${isConcreteText(practice.outbound_companions) ? practice.outbound_companions : "不明"}`);
 
   const returnLabel = isConcreteTransportType(practice.return_type)
     ? transportToLineLabel({ type: practice.return_type, person: practice.return_person ?? null })
