@@ -85,6 +85,7 @@ function createTestEnv() {
       meeting_time TEXT,
       meeting_place TEXT,
       outbound_companions TEXT,
+      same_grade_boys TEXT,
       return_dropoff_place TEXT,
       return_release_place TEXT,
       source TEXT NOT NULL,
@@ -101,6 +102,7 @@ function createTestEnv() {
       meeting_time_priority INTEGER NOT NULL DEFAULT 0,
       meeting_place_priority INTEGER NOT NULL DEFAULT 0,
       outbound_companions_priority INTEGER NOT NULL DEFAULT 0,
+      same_grade_boys_priority INTEGER NOT NULL DEFAULT 0,
       return_dropoff_place_priority INTEGER NOT NULL DEFAULT 0,
       return_release_place_priority INTEGER NOT NULL DEFAULT 0,
       last_message_kind TEXT
@@ -181,6 +183,7 @@ function baseResult(overrides: Record<string, unknown>) {
     meeting_time: null,
     meeting_place: null,
     outbound_companions: null,
+    same_grade_boys: null,
     return_dropoff_place: null,
     return_release_place: null,
     payments: [],
@@ -499,6 +502,106 @@ async function main() {
   assert.match(contactRuleFallbackMonText, /練習場所：犬蔵中/);
   assert.match(contactRuleFallbackMonText, /集合：17:55ごろ KSP（または18:20 溝の口南口）/);
   assert.match(contactRuleFallbackMonText, /解散：溝の口南口/);
+
+  // 塁に連絡 Case: 同学年男子4名の参加者を「一緒」に名字で表示
+  const { env: contactEnvSameGrade } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvSameGrade,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-25",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "車", person: "志村さん" },
+      same_grade_boys: ["村中佑史", "山田健太"]
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactSameGradeText = await hooks.buildRuiContactMessage(
+    contactEnvSameGrade.DB as any,
+    "羽魂練習会",
+    ["2026-08-25"],
+    ["8/25（火）"]
+  );
+  assert.match(contactSameGradeText, /一緒：村中、山田/);
+  assert.ok(!contactSameGradeText.includes("村中佑史"));
+  assert.ok(!contactSameGradeText.includes("山田健太"));
+
+  // 塁に連絡 Case: 交通手段が異なっても参加者表示は維持
+  await hooks.saveStructuredResultToD1(
+    contactEnvSameGrade,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "same_day_change",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-25",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "藤田さん",
+      same_grade_boys: ["丹下洸", "中村詠太"]
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactSameGradeChangedText = await hooks.buildRuiContactMessage(
+    contactEnvSameGrade.DB as any,
+    "羽魂練習会",
+    ["2026-08-25"],
+    ["8/25（火）"]
+  );
+  assert.match(contactSameGradeChangedText, /一緒：丹下、中村/);
+
+  // 塁に連絡 Case: 4名全員参加
+  await hooks.saveStructuredResultToD1(
+    contactEnvSameGrade,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-26",
+      same_grade_boys: ["村中佑史", "山田健太", "丹下洸", "中村詠太"]
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactSameGradeAllText = await hooks.buildRuiContactMessage(
+    contactEnvSameGrade.DB as any,
+    "羽魂練習会",
+    ["2026-08-26"],
+    ["8/26（水）"]
+  );
+  assert.match(contactSameGradeAllText, /一緒：村中、山田、丹下、中村/);
+
+  // 塁に連絡 Case: 対象4名以外は表示しない（不明扱いは行自体を省略）
+  await hooks.saveStructuredResultToD1(
+    contactEnvSameGrade,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-28",
+      same_grade_boys: ["佐藤太郎", "高橋次郎"]
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactSameGradeNoneText = await hooks.buildRuiContactMessage(
+    contactEnvSameGrade.DB as any,
+    "羽魂練習会",
+    ["2026-08-28"],
+    ["8/28（金）"]
+  );
+  assert.ok(!contactSameGradeNoneText.includes("一緒："));
 
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(

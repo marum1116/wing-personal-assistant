@@ -19,6 +19,13 @@ const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
 const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
 const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const CONTACT_RUI_COMMAND = "塁に連絡";
+const SAME_GRADE_BOY_FULL_NAMES = ["村中佑史", "山田健太", "丹下洸", "中村詠太"] as const;
+const SAME_GRADE_BOY_SURNAME_MAP: Record<(typeof SAME_GRADE_BOY_FULL_NAMES)[number], string> = {
+  村中佑史: "村中",
+  山田健太: "山田",
+  丹下洸: "丹下",
+  中村詠太: "中村"
+};
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON = "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。";
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX = "参加確定前の条件付き支払い案内";
 const PARTICIPATION_CONFIRM_ATTENDANCE_PRIORITY = 500;
@@ -91,6 +98,7 @@ type PracticeType = "通常練習" | "個人練習" | "不明";
 type PracticeTypeExtractionBasis = "explicit" | "inferred" | "unknown";
 type MonthlyType = "regular_training_total" | "shimura_car_fee";
 type PaymentMethod = "PayPay" | "現金" | "楽天Pay" | "その他" | "不明";
+type SameGradeBoyFullName = (typeof SAME_GRADE_BOY_FULL_NAMES)[number];
 
 type ParsedTransport = {
   type: TransportType;
@@ -220,6 +228,7 @@ type PracticeRow = {
   outbound_companions: string | null;
   return_dropoff_place: string | null;
   return_release_place: string | null;
+  same_grade_boys: string | null;
   source: string;
   notes: string | null;
   practice_type: PracticeType | null;
@@ -234,6 +243,7 @@ type PracticeRow = {
   outbound_companions_priority: number | null;
   return_dropoff_place_priority: number | null;
   return_release_place_priority: number | null;
+  same_grade_boys_priority: number | null;
   last_message_kind: MessageKind | null;
 };
 
@@ -285,6 +295,7 @@ type StructuredLineResult = {
   outbound_companions: string | null;
   return_dropoff_place: string | null;
   return_release_place: string | null;
+  same_grade_boys: SameGradeBoyFullName[] | null;
   payments: ParsedPayment[];
   notes: string | null;
   needs_confirmation: boolean;
@@ -366,6 +377,10 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     outbound_companions: { type: ["string", "null"] },
     return_dropoff_place: { type: ["string", "null"] },
     return_release_place: { type: ["string", "null"] },
+    same_grade_boys: {
+      type: ["array", "null"],
+      items: { type: "string", enum: [...SAME_GRADE_BOY_FULL_NAMES] }
+    },
     payments: {
       type: "array",
       items: {
@@ -407,6 +422,7 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     "outbound_companions",
     "return_dropoff_place",
     "return_release_place",
+    "same_grade_boys",
     "payments",
     "notes",
     "needs_confirmation",
@@ -1794,6 +1810,94 @@ function formatYmdWithJapaneseWeekday(ymd: string): string {
   return `${month}/${day}（${weekdayJp}）`;
 }
 
+function normalizeSameGradeBoyName(rawName: string): SameGradeBoyFullName | null {
+  const normalized = rawName.replace(/\s+/g, "").replace(/さん$|くん$/g, "");
+  if (normalized.includes("村中")) {
+    return "村中佑史";
+  }
+  if (normalized.includes("山田")) {
+    return "山田健太";
+  }
+  if (normalized.includes("丹下")) {
+    return "丹下洸";
+  }
+  if (normalized.includes("中村")) {
+    return "中村詠太";
+  }
+  return null;
+}
+
+function normalizeSameGradeBoys(value: string[] | null): SameGradeBoyFullName[] | null {
+  if (value === null) {
+    return null;
+  }
+  const normalized: SameGradeBoyFullName[] = [];
+  for (const rawName of value) {
+    const name = normalizeSameGradeBoyName(rawName);
+    if (!name) {
+      continue;
+    }
+    if (!normalized.includes(name)) {
+      normalized.push(name);
+    }
+  }
+  return normalized;
+}
+
+function serializeSameGradeBoys(value: SameGradeBoyFullName[] | null): string | null {
+  if (value === null) {
+    return null;
+  }
+  return JSON.stringify(value);
+}
+
+function parseStoredSameGradeBoys(value: string | null): SameGradeBoyFullName[] | null {
+  if (!isConcreteText(value)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    return normalizeSameGradeBoys(parsed.map((item) => (typeof item === "string" ? item : "")));
+  } catch {
+    return null;
+  }
+}
+
+function buildSameGradeBoysLine(value: string | null): string | null {
+  const normalized = parseStoredSameGradeBoys(value);
+  if (!normalized || normalized.length === 0) {
+    return null;
+  }
+  const surnames = SAME_GRADE_BOY_FULL_NAMES
+    .filter((name) => normalized.includes(name))
+    .map((name) => SAME_GRADE_BOY_SURNAME_MAP[name]);
+  if (surnames.length === 0) {
+    return null;
+  }
+  return `一緒：${surnames.join("、")}`;
+}
+
+function defaultPracticeLocation(practiceDate: string, practiceType: PracticeType | null): string | null {
+  if (practiceType !== "通常練習") {
+    return null;
+  }
+  const parsed = parseYmdAsUtcDate(practiceDate);
+  if (!parsed) {
+    return null;
+  }
+  const weekday = parsed.getUTCDay();
+  if (weekday === 1 || weekday === 2) {
+    return "犬蔵中";
+  }
+  if (weekday === 4) {
+    return "白幡台小";
+  }
+  return null;
+}
+
 function parseRuiContactCommand(inputText: string, nowMs: number): RuiContactCommandParseResult | null {
   const trimmed = inputText.trim();
   const today = getJstDateString(nowMs);
@@ -1837,9 +1941,10 @@ async function getPracticeByDateAndSource(
   const row = await db
     .prepare(
       `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide,
-              meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, source, notes,
+              meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, same_grade_boys, source, notes,
               practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
               bus_guide_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
+              same_grade_boys_priority,
               return_dropoff_place_priority, return_release_place_priority, last_message_kind
        FROM practices
        WHERE practice_date = ?1
@@ -1884,6 +1989,10 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
     ? transportToLineLabel({ type: practice.outbound_type, person: practice.outbound_person ?? null })
     : "不明";
   lines.push(`行き：${outboundLabel}`);
+  const sameGradeBoysLine = buildSameGradeBoysLine(practice.same_grade_boys);
+  if (sameGradeBoysLine) {
+    lines.push(sameGradeBoysLine);
+  }
 
   const returnLabel = isConcreteTransportType(practice.return_type)
     ? transportToLineLabel({ type: practice.return_type, person: practice.return_person ?? null })
@@ -2644,6 +2753,7 @@ function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResul
     outbound_companions: practice.outbound_companions,
     return_dropoff_place: practice.return_dropoff_place,
     return_release_place: practice.return_release_place,
+    same_grade_boys: parseStoredSameGradeBoys(practice.same_grade_boys),
     payments: [],
     notes: practice.notes,
     needs_confirmation: false,
@@ -2655,9 +2765,10 @@ async function getPracticeByDate(db: D1Database, practiceDate: string): Promise<
   const row = await db
     .prepare(
       `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide,
-              meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, source, notes,
+              meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, same_grade_boys, source, notes,
               practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
               bus_guide_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
+              same_grade_boys_priority,
               return_dropoff_place_priority, return_release_place_priority, last_message_kind
        FROM practices
        WHERE practice_date = ?1
@@ -2740,6 +2851,7 @@ async function savePracticeToD1(
     outbound_companions: null,
     return_dropoff_place: null,
     return_release_place: null,
+    same_grade_boys: null,
     source: sourceLabel,
     notes: null,
     practice_type: "不明",
@@ -2752,6 +2864,7 @@ async function savePracticeToD1(
     meeting_time_priority: 0,
     meeting_place_priority: 0,
     outbound_companions_priority: 0,
+    same_grade_boys_priority: 0,
     return_dropoff_place_priority: 0,
     return_release_place_priority: 0,
     last_message_kind: null
@@ -2773,6 +2886,8 @@ async function savePracticeToD1(
   let meetingPlacePriority = fallback.meeting_place_priority ?? 0;
   let outboundCompanions = fallback.outbound_companions;
   let outboundCompanionsPriority = fallback.outbound_companions_priority ?? 0;
+  let sameGradeBoys = fallback.same_grade_boys;
+  let sameGradeBoysPriority = fallback.same_grade_boys_priority ?? 0;
   let returnDropoffPlace = fallback.return_dropoff_place;
   let returnDropoffPlacePriority = fallback.return_dropoff_place_priority ?? 0;
   let returnReleasePlace = fallback.return_release_place;
@@ -2843,6 +2958,11 @@ async function savePracticeToD1(
     outboundCompanions = result.outbound_companions;
     outboundCompanionsPriority = messagePriorityValue;
   }
+  const normalizedSameGradeBoys = normalizeSameGradeBoys(result.same_grade_boys);
+  if (normalizedSameGradeBoys !== null && messagePriorityValue >= sameGradeBoysPriority) {
+    sameGradeBoys = serializeSameGradeBoys(normalizedSameGradeBoys);
+    sameGradeBoysPriority = messagePriorityValue;
+  }
   if (isConcreteText(result.return_dropoff_place) && messagePriorityValue >= returnDropoffPlacePriority) {
     returnDropoffPlace = result.return_dropoff_place;
     returnDropoffPlacePriority = messagePriorityValue;
@@ -2871,6 +2991,7 @@ async function savePracticeToD1(
       meeting_time,
       meeting_place,
       outbound_companions,
+      same_grade_boys,
       return_dropoff_place,
       return_release_place,
       source,
@@ -2885,12 +3006,13 @@ async function savePracticeToD1(
       meeting_time_priority,
       meeting_place_priority,
       outbound_companions_priority,
+      same_grade_boys_priority,
       return_dropoff_place_priority,
       return_release_place_priority,
       last_message_kind,
       created_at,
       updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?28)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?30)
     ON CONFLICT(practice_date) DO UPDATE SET
       attendance = excluded.attendance,
       outbound_type = excluded.outbound_type,
@@ -2901,6 +3023,7 @@ async function savePracticeToD1(
       meeting_time = excluded.meeting_time,
       meeting_place = excluded.meeting_place,
       outbound_companions = excluded.outbound_companions,
+      same_grade_boys = excluded.same_grade_boys,
       return_dropoff_place = excluded.return_dropoff_place,
       return_release_place = excluded.return_release_place,
       source = excluded.source,
@@ -2915,6 +3038,7 @@ async function savePracticeToD1(
       meeting_time_priority = excluded.meeting_time_priority,
       meeting_place_priority = excluded.meeting_place_priority,
       outbound_companions_priority = excluded.outbound_companions_priority,
+      same_grade_boys_priority = excluded.same_grade_boys_priority,
       return_dropoff_place_priority = excluded.return_dropoff_place_priority,
       return_release_place_priority = excluded.return_release_place_priority,
       last_message_kind = excluded.last_message_kind,
@@ -2931,6 +3055,7 @@ async function savePracticeToD1(
       meetingTime,
       meetingPlace,
       outboundCompanions,
+      sameGradeBoys,
       returnDropoffPlace,
       returnReleasePlace,
       sourceLabel,
@@ -2945,6 +3070,7 @@ async function savePracticeToD1(
       meetingTimePriority,
       meetingPlacePriority,
       outboundCompanionsPriority,
+      sameGradeBoysPriority,
       returnDropoffPlacePriority,
       returnReleasePlacePriority,
       result.message_kind,
@@ -4309,6 +4435,9 @@ async function callOpenAIForStructuredResult(
     "判断できなければ必ず不明にしてください。" +
     "meeting_time/meeting_place/outbound_companions/return_dropoff_place/return_release_placeも同様に、本文に明示があるときのみ設定し、" +
     "根拠がなければ必ずnullにしてください。" +
+    "same_grade_boysは、村中佑史・山田健太・丹下洸・中村詠太の4名のうち、その日の練習参加が明示または画像で確認できる人だけをフルネーム配列で入れてください。" +
+    "交通手段が同じかどうかは判定条件にしません。塁本人・保護者・引率者・運転者は含めないでください。" +
+    "4名について参加情報が読み取れない場合はsame_grade_boysをnullにしてください。4名が全員不参加と明確に判断できる場合のみ空配列を返してください。" +
     "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。" +
     "配車表画像を読むときは、渡辺塁（塁/塁くん/ルイくん）本人が記載された行を最優先し、他人の行の交通手段を本人へ適用しないでください。" +
     "同一表内に『バス』行と『○○号』行が混在する場合でも、本人名がある行の値だけを本人情報として採用してください。" +
