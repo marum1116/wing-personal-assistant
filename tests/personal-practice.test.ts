@@ -68,6 +68,10 @@ class MockKvNamespace {
   async put(key: string, value: string, _options?: { expirationTtl?: number }): Promise<void> {
     this.map.set(key, value);
   }
+
+  async delete(key: string): Promise<void> {
+    this.map.delete(key);
+  }
 }
 
 function createTestEnv() {
@@ -239,6 +243,21 @@ async function main() {
   const contactSingle = hooks.parseRuiContactCommand("8/24 塁に連絡", fixedNow);
   assert.ok(contactSingle);
   assert.deepEqual(contactSingle.dates, ["2026-08-24"]);
+
+  // 調整さん同期コマンド解釈
+  const syncRegular = hooks.parseChouseisanSyncCommand(
+    "通常練習：https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1"
+  );
+  assert.ok(syncRegular);
+  assert.equal(syncRegular.target, "regular");
+  assert.equal(syncRegular.urlRegular, "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1");
+
+  const syncPersonal = hooks.parseChouseisanSyncCommand(
+    "個別練習：https://chouseisan.com/s?h=00d65c5c4943469f830cb6183b09db70"
+  );
+  assert.ok(syncPersonal);
+  assert.equal(syncPersonal.target, "personal");
+  assert.equal(syncPersonal.urlPersonal, "https://chouseisan.com/s?h=00d65c5c4943469f830cb6183b09db70");
 
   // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
   const { env: contactEnvToday } = createTestEnv();
@@ -636,6 +655,63 @@ async function main() {
     Date.now()
   );
   assert.equal(reqCaseB.resolvedPracticeType, "通常練習");
+
+  // Weekday fallback: 土日は個人練習へ固定せず不明扱い
+  assert.equal(hooks.inferPracticeTypeByWeekday("2026-08-15"), "不明");
+  assert.equal(hooks.inferPracticeTypeByWeekday("2026-08-16"), "不明");
+
+  // Chouseisan hint: 週末でも調整さん予定があればpractice_typeを解決
+  await env.STATE.put(
+    "practice_type_hint:2026-09-06",
+    JSON.stringify({
+      regular: true,
+      personal: false,
+      updated_at: new Date().toISOString()
+    })
+  );
+  const hintRegularResolved = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "hint-regular-user",
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-09-06",
+      practice_type: "不明",
+      practice_type_basis: "unknown",
+      practice_type_evidence: null,
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(hintRegularResolved.resolvedPracticeType, "通常練習");
+  assert.equal(hintRegularResolved.typeBasis, "chouseisan_schedule");
+
+  // Chouseisan hint conflict: 通常/個別が同日重複なら自動確定しない
+  await env.STATE.put(
+    "practice_type_hint:2026-09-13",
+    JSON.stringify({
+      regular: true,
+      personal: true,
+      updated_at: new Date().toISOString()
+    })
+  );
+  const hintConflictResolved = await hooks.resolvePracticeContext(
+    env,
+    sourceId,
+    "hint-conflict-user",
+    baseResult({
+      message_kind: "schedule",
+      practice_date: "2026-09-13",
+      practice_type: "不明",
+      practice_type_basis: "unknown",
+      practice_type_evidence: null,
+      payments: []
+    }) as any,
+    Date.now()
+  );
+  assert.equal(hintConflictResolved.resolvedPracticeType, "不明");
+  assert.equal(hintConflictResolved.needsConfirmation, true);
+  assert.ok(hintConflictResolved.addedUncertainPoints.some((point: string) => point.includes("練習種別の確認が必要")));
 
   // Requested Case C: 月曜日でも本文明示個人練習なら個人練習を優先
   const reqCaseC = await hooks.resolvePracticeContext(

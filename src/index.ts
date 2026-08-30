@@ -2,6 +2,10 @@ interface Env {
   LINE_CHANNEL_SECRET: string;
   LINE_CHANNEL_ACCESS_TOKEN: string;
   OPENAI_API_KEY: string;
+  GOOGLE_SERVICE_ACCOUNT_EMAIL?: string;
+  GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
+  GOOGLE_CALENDAR_ID?: string;
+  GOOGLE_CALENDAR_TIMEZONE?: string;
   DB: D1Database;
   STATE: KVNamespace;
   PAIRING: DurableObjectNamespace;
@@ -29,10 +33,13 @@ const SAME_GRADE_BOY_SURNAME_MAP: Record<(typeof SAME_GRADE_BOY_FULL_NAMES)[numb
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON = "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。";
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX = "参加確定前の条件付き支払い案内";
 const PARTICIPATION_CONFIRM_ATTENDANCE_PRIORITY = 500;
+const DEFAULT_REGULAR_CHOUSEISAN_URL = "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1";
+const DEFAULT_PERSONAL_CHOUSEISAN_URL = "https://chouseisan.com/s?h=00d65c5c4943469f830cb6183b09db70";
 const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
 const RECENT_CONTEXT_TTL_SECONDS = 30 * 60;
+const PRACTICE_TYPE_HINT_TTL_SECONDS = 180 * 24 * 60 * 60;
 const MAX_UNPAID_DISPLAY_COUNT = 10;
 const MAX_REMINDER_DISPLAY_COUNT = 20;
 const MAX_REMINDER_QUICK_REPLY_COUNT = 10;
@@ -194,6 +201,7 @@ type ReminderPaymentRow = {
 type StoredPracticeTypeBasis =
   | "explicit"
   | "d1_same_date"
+  | "chouseisan_schedule"
   | "kv_recent_context"
   | "weekday_default"
   | "ai_inferred"
@@ -203,6 +211,7 @@ type ResolvedContextBasis =
   | "explicit_message"
   | "message_pair"
   | "d1_same_date"
+  | "chouseisan_schedule"
   | "d1_personal_fee_unique"
   | "kv_recent_context"
   | "weekday_default"
@@ -213,6 +222,51 @@ type RecentPracticeContext = {
   practice_date: string;
   practice_type: PracticeType;
   timestamp_ms: number;
+};
+
+type PracticeTypeHintRecord = {
+  regular: boolean;
+  personal: boolean;
+  updated_at: string;
+  sources?: {
+    regular?: {
+      url: string;
+      event_id: string;
+      event_name: string;
+      synced_at: string;
+    };
+    personal?: {
+      url: string;
+      event_id: string;
+      event_name: string;
+      synced_at: string;
+    };
+  };
+};
+
+type ChouseisanSyncTarget = "regular" | "personal" | "both";
+
+type ChouseisanSyncCommand = {
+  target: ChouseisanSyncTarget;
+  urlRegular: string | null;
+  urlPersonal: string | null;
+};
+
+type ChouseisanSnapshot = {
+  event: {
+    id: string;
+    name: string;
+    detail?: string | null;
+    upd_datetime?: string | null;
+  };
+  choices: Array<{
+    choice: string;
+  }>;
+  members: Array<{
+    name: string;
+    attend: string | null;
+    kouho: number[] | null;
+  }>;
 };
 
 type PracticeRow = {
@@ -503,6 +557,587 @@ function recentContextKey(userId: string, sourceId: SourceId): string {
   return `recent_context:${userId}:${sourceId}`;
 }
 
+function practiceTypeHintKey(practiceDate: string): string {
+  return `practice_type_hint:${practiceDate}`;
+}
+
+function practiceTypeHintIndexKey(kind: Exclude<ChouseisanSyncTarget, "both">): string {
+  return `practice_type_hint_index:${kind}`;
+}
+
+function normalizeChouseisanUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!/^https:\/\/chouseisan\.com\/s\?h=/i.test(trimmed)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname !== "chouseisan.com") {
+      return null;
+    }
+    const hash = parsed.searchParams.get("h");
+    if (!hash || !/^[a-z0-9]+$/i.test(hash)) {
+      return null;
+    }
+    return `https://chouseisan.com/s?h=${hash}`;
+  } catch {
+    return null;
+  }
+}
+
+function parseChouseisanSyncCommand(inputText: string): ChouseisanSyncCommand | null {
+  const trimmed = inputText.trim();
+  const compact = trimmed.replace(/：/g, ":");
+  const urlMatched = compact.match(/https:\/\/chouseisan\.com\/s\?h=[a-z0-9]+/i);
+  const normalizedUrl = urlMatched ? normalizeChouseisanUrl(urlMatched[0]) : null;
+
+  if (/^調整さん同期$/u.test(compact)) {
+    return {
+      target: "both",
+      urlRegular: DEFAULT_REGULAR_CHOUSEISAN_URL,
+      urlPersonal: DEFAULT_PERSONAL_CHOUSEISAN_URL
+    };
+  }
+  if (/^通常(?:練習)?調整さん同期$/u.test(compact)) {
+    return {
+      target: "regular",
+      urlRegular: DEFAULT_REGULAR_CHOUSEISAN_URL,
+      urlPersonal: null
+    };
+  }
+  if (/^(?:個別|個人)(?:練習)?調整さん同期$/u.test(compact)) {
+    return {
+      target: "personal",
+      urlRegular: null,
+      urlPersonal: DEFAULT_PERSONAL_CHOUSEISAN_URL
+    };
+  }
+
+  if (!normalizedUrl) {
+    return null;
+  }
+  const regularMentioned = /(通常練習|通常)/u.test(compact);
+  const personalMentioned = /(個別練習|個人練習|個別|個人)/u.test(compact);
+  if (regularMentioned && personalMentioned) {
+    return null;
+  }
+  if (regularMentioned) {
+    return {
+      target: "regular",
+      urlRegular: normalizedUrl,
+      urlPersonal: null
+    };
+  }
+  if (personalMentioned) {
+    return {
+      target: "personal",
+      urlRegular: null,
+      urlPersonal: normalizedUrl
+    };
+  }
+  return null;
+}
+
+function inferYearFromChouseisan(snapshot: ChouseisanSnapshot, nowMs: number): number {
+  const fromUpdated = snapshot.event.upd_datetime ? new Date(snapshot.event.upd_datetime) : null;
+  if (fromUpdated && !Number.isNaN(fromUpdated.getTime())) {
+    return fromUpdated.getUTCFullYear();
+  }
+  return Number(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric"
+    }).format(new Date(nowMs))
+  );
+}
+
+function parseChoiceDateToYmd(choiceText: string, year: number): string | null {
+  const matched = /(\d{1,2})\/(\d{1,2})/.exec(choiceText);
+  if (!matched) {
+    return null;
+  }
+  const month = Number(matched[1]);
+  const day = Number(matched[2]);
+  const ymd = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return parseYmdAsUtcDate(ymd) ? ymd : null;
+}
+
+async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot> {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "user-agent": "wing-personal-assistant/1.0 (+schedule sync)"
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`調整さん取得に失敗しました: status=${response.status}`);
+  }
+  const html = await response.text();
+  const matched = html.match(/window\.Chouseisan\s*=\s*(\{[\s\S]*?\});/);
+  if (!matched || !matched[1]) {
+    throw new Error("調整さんページに埋め込みデータが見つかりませんでした。");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(matched[1]);
+  } catch {
+    throw new Error("調整さん埋め込みデータのJSON解析に失敗しました。");
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof (parsed as Record<string, unknown>).event !== "object" ||
+    (parsed as Record<string, unknown>).event === null ||
+    !Array.isArray((parsed as Record<string, unknown>).choices)
+  ) {
+    throw new Error("調整さんデータ形式が想定外です。");
+  }
+  const event = (parsed as Record<string, unknown>).event as Record<string, unknown>;
+  const choices = (parsed as Record<string, unknown>).choices as Array<Record<string, unknown>>;
+  if (typeof event.id !== "string" || typeof event.name !== "string") {
+    throw new Error("調整さんイベント情報が不足しています。");
+  }
+  const membersRaw = Array.isArray(event.members) ? (event.members as Array<Record<string, unknown>>) : [];
+  return {
+    event: {
+      id: event.id,
+      name: event.name,
+      detail: typeof event.detail === "string" ? event.detail : null,
+      upd_datetime: typeof event.upd_datetime === "string" ? event.upd_datetime : null
+    },
+    choices: choices
+      .filter((item) => typeof item.choice === "string")
+      .map((item) => ({ choice: String(item.choice) })),
+    members: membersRaw
+      .filter((item) => typeof item.name === "string")
+      .map((item) => ({
+        name: String(item.name),
+        attend: typeof item.attend === "string" ? item.attend : null,
+        kouho: Array.isArray(item.kouho)
+          ? item.kouho
+              .map((v) => (typeof v === "number" ? v : Number.NaN))
+              .filter((v) => Number.isFinite(v))
+          : null
+      }))
+  };
+}
+
+async function loadPracticeTypeHintRecord(env: Env, practiceDate: string): Promise<PracticeTypeHintRecord | null> {
+  const raw = await env.STATE.get(practiceTypeHintKey(practiceDate));
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as PracticeTypeHintRecord;
+    if (typeof parsed.regular !== "boolean" || typeof parsed.personal !== "boolean" || typeof parsed.updated_at !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function savePracticeTypeHintRecord(env: Env, practiceDate: string, record: PracticeTypeHintRecord): Promise<void> {
+  await env.STATE.put(practiceTypeHintKey(practiceDate), JSON.stringify(record), {
+    expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
+  });
+}
+
+async function loadPracticeTypeHintIndex(
+  env: Env,
+  kind: Exclude<ChouseisanSyncTarget, "both">
+): Promise<string[]> {
+  const raw = await env.STATE.get(practiceTypeHintIndexKey(kind));
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((item): item is string => typeof item === "string");
+  } catch {
+    return [];
+  }
+}
+
+async function savePracticeTypeHintIndex(
+  env: Env,
+  kind: Exclude<ChouseisanSyncTarget, "both">,
+  dates: string[]
+): Promise<void> {
+  await env.STATE.put(practiceTypeHintIndexKey(kind), JSON.stringify(dates), {
+    expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
+  });
+}
+
+function normalizeParticipantName(name: string): string {
+  return name.replace(/\s+/g, "").replace(/[　]/g, "");
+}
+
+function isRuiParticipantName(name: string): boolean {
+  const normalized = normalizeParticipantName(name);
+  return normalized.includes("渡辺塁") || normalized === "塁" || normalized.includes("塁くん") || normalized.includes("ルイ");
+}
+
+function parseAttendMarks(member: { attend: string | null; kouho: number[] | null }, choiceCount: number): number[] {
+  if (member.kouho && member.kouho.length > 0) {
+    return member.kouho.slice(0, choiceCount);
+  }
+  if (!member.attend) {
+    return [];
+  }
+  return member.attend
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isFinite(value))
+    .slice(0, choiceCount);
+}
+
+function ruiStatusFromAttendMark(mark: number): "circle" | "triangle" | "cross" | "unknown" {
+  if (mark === 1) {
+    return "circle";
+  }
+  if (mark === 2) {
+    return "triangle";
+  }
+  if (mark === 3) {
+    return "cross";
+  }
+  return "unknown";
+}
+
+function parseChoiceDateTime(choiceText: string, year: number): { start: string; end: string } | null {
+  const dateMatched = /(\d{1,2})\/(\d{1,2})/.exec(choiceText);
+  if (!dateMatched) {
+    return null;
+  }
+  const month = Number(dateMatched[1]);
+  const day = Number(dateMatched[2]);
+  const baseDate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (!parseYmdAsUtcDate(baseDate)) {
+    return null;
+  }
+  const timeMatches = [...choiceText.matchAll(/(\d{1,2}):(\d{2})/g)];
+  if (timeMatches.length === 0) {
+    return {
+      start: `${baseDate}T09:00:00`,
+      end: `${baseDate}T11:00:00`
+    };
+  }
+  const startHour = Number(timeMatches[0]?.[1] ?? "9");
+  const startMinute = Number(timeMatches[0]?.[2] ?? "0");
+  const start = new Date(Date.UTC(year, month - 1, day, startHour, startMinute, 0));
+  let end: Date;
+  if (timeMatches.length >= 2) {
+    const endHour = Number(timeMatches[1]?.[1] ?? String(startHour + 2));
+    const endMinute = Number(timeMatches[1]?.[2] ?? "0");
+    end = new Date(Date.UTC(year, month - 1, day, endHour, endMinute, 0));
+    if (end.getTime() <= start.getTime()) {
+      end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+    }
+  } else {
+    end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+  }
+  const toLocalIsoNoZ = (value: Date): string => {
+    const y = value.getUTCFullYear();
+    const m = String(value.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(value.getUTCDate()).padStart(2, "0");
+    const hh = String(value.getUTCHours()).padStart(2, "0");
+    const mm = String(value.getUTCMinutes()).padStart(2, "0");
+    return `${y}-${m}-${d}T${hh}:${mm}:00`;
+  };
+  return {
+    start: toLocalIsoNoZ(start),
+    end: toLocalIsoNoZ(end)
+  };
+}
+
+function weekdayTokenFromYmd(practiceDate: string): string | null {
+  const parsed = parseYmdAsUtcDate(practiceDate);
+  if (!parsed) {
+    return null;
+  }
+  return ["日", "月", "火", "水", "木", "金", "土"][parsed.getUTCDay()] ?? null;
+}
+
+function inferLocationFromChouseisanDetail(detail: string | null | undefined, practiceDate: string): string | null {
+  if (!detail) {
+    return null;
+  }
+  const weekdayToken = weekdayTokenFromYmd(practiceDate);
+  if (!weekdayToken) {
+    return null;
+  }
+  const lines = detail
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  let currentLocation: string | null = null;
+  const locationByWeekday = new Map<string, string>();
+  for (const line of lines) {
+    if (/(中|小|体育館|コート|会場)/.test(line) && !/曜日|練習時間|参加費/.test(line)) {
+      currentLocation = line.replace(/^⭐️?/, "").trim();
+      continue;
+    }
+    if (!currentLocation) {
+      continue;
+    }
+    const matches = [...line.matchAll(/([月火水木金土日])曜日/g)];
+    for (const match of matches) {
+      const day = match[1];
+      if (day) {
+        locationByWeekday.set(day, currentLocation);
+      }
+    }
+  }
+  return locationByWeekday.get(weekdayToken) ?? null;
+}
+
+type GoogleCalendarEventPayload = {
+  summary: string;
+  description: string;
+  location: string | null;
+  start: string;
+  end: string;
+};
+
+async function getGoogleCalendarAccessToken(env: Env): Promise<string | null> {
+  const email = env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const privateKeyRaw = env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY;
+  if (!email || !privateKeyRaw) {
+    return null;
+  }
+  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
+  const nowSec = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: email,
+    scope: "https://www.googleapis.com/auth/calendar",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: nowSec,
+    exp: nowSec + 3600
+  };
+  const base64Url = (input: string): string =>
+    btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const encoder = new TextEncoder();
+  const signingInput = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
+  const keyData = Uint8Array.from(
+    atob(privateKey.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s+/g, "")),
+    (c) => c.charCodeAt(0)
+  );
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    keyData.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signatureBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, encoder.encode(signingInput));
+  const signature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+  const assertion = `${signingInput}.${signature}`;
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion
+    })
+  });
+  if (!tokenRes.ok) {
+    return null;
+  }
+  const tokenJson = (await tokenRes.json()) as { access_token?: string };
+  return typeof tokenJson.access_token === "string" ? tokenJson.access_token : null;
+}
+
+function ruiCalendarEventKey(kind: Exclude<ChouseisanSyncTarget, "both">, practiceDate: string): string {
+  return `rui_calendar_event:${kind}:${practiceDate}`;
+}
+
+async function upsertGoogleCalendarEvent(
+  env: Env,
+  practiceKind: Exclude<ChouseisanSyncTarget, "both">,
+  practiceDate: string,
+  payload: GoogleCalendarEventPayload
+): Promise<"created" | "updated" | "skipped"> {
+  const accessToken = await getGoogleCalendarAccessToken(env);
+  if (!accessToken) {
+    return "skipped";
+  }
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const timeZone = env.GOOGLE_CALENDAR_TIMEZONE ?? "Asia/Tokyo";
+  const mappingKey = ruiCalendarEventKey(practiceKind, practiceDate);
+  const existingRaw = await env.STATE.get(mappingKey);
+  const existing = existingRaw
+    ? (JSON.parse(existingRaw) as { eventId?: string; status?: "circle" | "triangle" })
+    : null;
+  const body = {
+    summary: payload.summary,
+    description: payload.description,
+    location: payload.location ?? undefined,
+    start: { dateTime: payload.start, timeZone },
+    end: { dateTime: payload.end, timeZone },
+    extendedProperties: {
+      private: {
+        app: "wing-personal-assistant",
+        practiceKind,
+        practiceDate
+      }
+    }
+  };
+  if (existing?.eventId) {
+    const updateRes = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(existing.eventId)}`,
+      {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify(body)
+      }
+    );
+    if (updateRes.ok) {
+      await env.STATE.put(
+        mappingKey,
+        JSON.stringify({ eventId: existing.eventId, status: payload.summary.includes("仮）") ? "triangle" : "circle" }),
+        { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+      );
+      return "updated";
+    }
+  }
+  const createRes = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  if (!createRes.ok) {
+    return "skipped";
+  }
+  const created = (await createRes.json()) as { id?: string };
+  if (typeof created.id === "string") {
+    await env.STATE.put(
+      mappingKey,
+      JSON.stringify({ eventId: created.id, status: payload.summary.includes("仮）") ? "triangle" : "circle" }),
+      { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+    );
+    return "created";
+  }
+  return "skipped";
+}
+
+async function deleteGoogleCalendarEventIfExists(
+  env: Env,
+  practiceKind: Exclude<ChouseisanSyncTarget, "both">,
+  practiceDate: string
+): Promise<"deleted" | "skipped"> {
+  const accessToken = await getGoogleCalendarAccessToken(env);
+  if (!accessToken) {
+    return "skipped";
+  }
+  const mappingKey = ruiCalendarEventKey(practiceKind, practiceDate);
+  const existingRaw = await env.STATE.get(mappingKey);
+  if (!existingRaw) {
+    return "skipped";
+  }
+  const existing = JSON.parse(existingRaw) as { eventId?: string };
+  if (!existing.eventId) {
+    return "skipped";
+  }
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const deleteRes = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(existing.eventId)}`,
+    {
+      method: "DELETE",
+      headers: {
+        authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+  if (deleteRes.ok || deleteRes.status === 404) {
+    if (typeof (env.STATE as { delete?: unknown }).delete === "function") {
+      await (env.STATE as { delete: (key: string) => Promise<void> }).delete(mappingKey);
+    } else {
+      await env.STATE.put(mappingKey, JSON.stringify({}), { expirationTtl: 60 });
+    }
+    return "deleted";
+  }
+  return "skipped";
+}
+
+async function syncRuiCalendarFromChouseisan(
+  env: Env,
+  kind: Exclude<ChouseisanSyncTarget, "both">,
+  snapshot: ChouseisanSnapshot,
+  year: number
+): Promise<{ created: number; updated: number; deleted: number; skipped: number }> {
+  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name));
+  if (!ruiMember) {
+    return { created: 0, updated: 0, deleted: 0, skipped: snapshot.choices.length };
+  }
+  const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
+  let created = 0;
+  let updated = 0;
+  let deleted = 0;
+  let skipped = 0;
+  for (let i = 0; i < snapshot.choices.length; i += 1) {
+    const choice = snapshot.choices[i];
+    if (!choice) {
+      continue;
+    }
+    const practiceDate = parseChoiceDateToYmd(choice.choice, year);
+    if (!practiceDate) {
+      skipped += 1;
+      continue;
+    }
+    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
+    if (status === "cross" || status === "unknown") {
+      const deletedResult = await deleteGoogleCalendarEventIfExists(env, kind, practiceDate);
+      if (deletedResult === "deleted") {
+        deleted += 1;
+      } else {
+        skipped += 1;
+      }
+      continue;
+    }
+    const timing = parseChoiceDateTime(choice.choice, year);
+    if (!timing) {
+      skipped += 1;
+      continue;
+    }
+    const practiceType = kind === "regular" ? "通常練習" : "個人練習";
+    const location =
+      inferLocationFromChouseisanDetail(snapshot.event.detail, practiceDate) ??
+      defaultPracticeLocation(practiceDate, practiceType) ??
+      null;
+    const title = status === "circle" ? "wing練習" : "仮）wing練習";
+    const syncOutcome = await upsertGoogleCalendarEvent(env, kind, practiceDate, {
+      summary: title,
+      description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${status === "circle" ? "○" : "△"}）`,
+      location,
+      start: timing.start,
+      end: timing.end
+    });
+    if (syncOutcome === "created") {
+      created += 1;
+    } else if (syncOutcome === "updated") {
+      updated += 1;
+    } else {
+      skipped += 1;
+    }
+  }
+  return { created, updated, deleted, skipped };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -788,10 +1423,30 @@ function inferPracticeTypeByWeekday(practiceDate: string | null): PracticeType {
   if (weekday === 1 || weekday === 2 || weekday === 4) {
     return "通常練習";
   }
-  if (weekday === 5 || weekday === 6 || weekday === 0) {
+  if (weekday === 5) {
     return "個人練習";
   }
   return "不明";
+}
+
+async function resolvePracticeTypeByChouseisanHint(
+  env: Env,
+  practiceDate: string
+): Promise<{ practiceType: PracticeType; conflict: boolean }> {
+  const record = await loadPracticeTypeHintRecord(env, practiceDate);
+  if (!record) {
+    return { practiceType: "不明", conflict: false };
+  }
+  if (record.regular && !record.personal) {
+    return { practiceType: "通常練習", conflict: false };
+  }
+  if (!record.regular && record.personal) {
+    return { practiceType: "個人練習", conflict: false };
+  }
+  if (record.regular && record.personal) {
+    return { practiceType: "不明", conflict: true };
+  }
+  return { practiceType: "不明", conflict: false };
 }
 
 function resolvePracticeType(result: StructuredLineResult): {
@@ -891,6 +1546,13 @@ async function resolvePracticeContext(
       }
     }
   }
+  let chouseisanConflict = false;
+  let chouseisanHintType: PracticeType = "不明";
+  if (resolvedPracticeDate) {
+    const resolvedByHint = await resolvePracticeTypeByChouseisanHint(env, resolvedPracticeDate);
+    chouseisanHintType = resolvedByHint.practiceType;
+    chouseisanConflict = resolvedByHint.conflict;
+  }
 
   if (result.practice_type !== "不明" && result.practice_type_basis === "explicit") {
     resolvedPracticeType = result.practice_type;
@@ -898,6 +1560,14 @@ async function resolvePracticeContext(
   } else if (existingType !== "不明") {
     resolvedPracticeType = existingType;
     typeBasis = "d1_same_date";
+  } else if (chouseisanHintType !== "不明") {
+    resolvedPracticeType = chouseisanHintType;
+    typeBasis = "chouseisan_schedule";
+  } else if (chouseisanConflict) {
+    resolvedPracticeType = "不明";
+    typeBasis = "unknown";
+    needsConfirmation = true;
+    addedUncertainPoints.push("通常練習と個人練習の調整さん予定が同日に重複しているため、練習種別の確認が必要です。");
   } else if (recentApplicable && recent && recent.practice_type !== "不明") {
     resolvedPracticeType = recent.practice_type;
     typeBasis = "kv_recent_context";
@@ -931,6 +1601,8 @@ function resolvedTypeBasisToPracticeTypeBasis(
       return { basis: "explicit", priority: 1000 };
     case "d1_same_date":
       return { basis: "d1_same_date", priority: 900 };
+    case "chouseisan_schedule":
+      return { basis: "chouseisan_schedule", priority: 875 };
     case "kv_recent_context":
       return { basis: "kv_recent_context", priority: 850 };
     case "weekday_default":
@@ -1896,6 +2568,172 @@ function defaultPracticeLocation(practiceDate: string, practiceType: PracticeTyp
     return "白幡台小";
   }
   return null;
+}
+
+async function syncChouseisanSchedule(
+  env: Env,
+  kind: Exclude<ChouseisanSyncTarget, "both">,
+  url: string,
+  nowMs: number
+): Promise<{
+  eventName: string;
+  eventId: string;
+  addedOrUpdated: number;
+  removed: number;
+  conflictCount: number;
+  calendarSync: { created: number; updated: number; deleted: number; skipped: number };
+}> {
+  const snapshot = await fetchChouseisanSnapshot(url);
+  const year = inferYearFromChouseisan(snapshot, nowMs);
+  const nextDates = [...new Set(snapshot.choices.map((choice) => parseChoiceDateToYmd(choice.choice, year)).filter((value): value is string => !!value))];
+  const nextDateSet = new Set(nextDates);
+  const previousDates = await loadPracticeTypeHintIndex(env, kind);
+  const nowIso = new Date(nowMs).toISOString();
+  let addedOrUpdated = 0;
+  let removed = 0;
+  let conflictCount = 0;
+
+  for (const date of previousDates) {
+    if (nextDateSet.has(date)) {
+      continue;
+    }
+    const existing = await loadPracticeTypeHintRecord(env, date);
+    if (!existing) {
+      continue;
+    }
+    const nextRecord: PracticeTypeHintRecord = {
+      ...existing,
+      regular: kind === "regular" ? false : existing.regular,
+      personal: kind === "personal" ? false : existing.personal,
+      updated_at: nowIso
+    };
+    if (nextRecord.regular || nextRecord.personal) {
+      await savePracticeTypeHintRecord(env, date, nextRecord);
+      if (nextRecord.regular && nextRecord.personal) {
+        conflictCount += 1;
+      }
+    } else if (typeof (env.STATE as { delete?: unknown }).delete === "function") {
+      await (env.STATE as { delete: (key: string) => Promise<void> }).delete(practiceTypeHintKey(date));
+    } else {
+      await savePracticeTypeHintRecord(env, date, nextRecord);
+    }
+    removed += 1;
+  }
+
+  for (const date of nextDates) {
+    const existing = await loadPracticeTypeHintRecord(env, date);
+    const nextRecord: PracticeTypeHintRecord = {
+      regular: kind === "regular" ? true : existing?.regular ?? false,
+      personal: kind === "personal" ? true : existing?.personal ?? false,
+      updated_at: nowIso,
+      sources: {
+        ...(existing?.sources ?? {}),
+        ...(kind === "regular"
+          ? {
+              regular: {
+                url,
+                event_id: snapshot.event.id,
+                event_name: snapshot.event.name,
+                synced_at: nowIso
+              }
+            }
+          : {
+              personal: {
+                url,
+                event_id: snapshot.event.id,
+                event_name: snapshot.event.name,
+                synced_at: nowIso
+              }
+            })
+      }
+    };
+    await savePracticeTypeHintRecord(env, date, nextRecord);
+    if (nextRecord.regular && nextRecord.personal) {
+      conflictCount += 1;
+    }
+    addedOrUpdated += 1;
+  }
+
+  await savePracticeTypeHintIndex(env, kind, nextDates);
+  const calendarSync = await syncRuiCalendarFromChouseisan(env, kind, snapshot, year);
+  return {
+    eventName: snapshot.event.name,
+    eventId: snapshot.event.id,
+    addedOrUpdated,
+    removed,
+    conflictCount,
+    calendarSync
+  };
+}
+
+async function handleChouseisanSyncCommand(
+  event: LineWebhookEvent,
+  env: Env,
+  command: ChouseisanSyncCommand
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const nowMs = event.timestamp ?? Date.now();
+  const lines: string[] = ["調整さん予定の同期結果"];
+  try {
+    if (command.target === "both") {
+      if (!command.urlRegular || !command.urlPersonal) {
+        throw new Error("通常練習用と個別練習用のURLが必要です。");
+      }
+      const regular = await syncChouseisanSchedule(env, "regular", command.urlRegular, nowMs);
+      const personal = await syncChouseisanSchedule(env, "personal", command.urlPersonal, nowMs);
+      lines.push(
+        `・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`,
+        `・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`,
+        `・Googleカレンダー(通常): 作成${regular.calendarSync.created} / 更新${regular.calendarSync.updated} / 削除${regular.calendarSync.deleted} / 保留${regular.calendarSync.skipped}`,
+        `・Googleカレンダー(個別): 作成${personal.calendarSync.created} / 更新${personal.calendarSync.updated} / 削除${personal.calendarSync.deleted} / 保留${personal.calendarSync.skipped}`
+      );
+      const conflictCount = Math.max(regular.conflictCount, personal.conflictCount);
+      if (conflictCount > 0) {
+        lines.push(`・同日競合: ${conflictCount}日（自動確定せず要確認）`);
+      }
+    } else if (command.target === "regular") {
+      if (!command.urlRegular) {
+        throw new Error("通常練習用の調整さんURLが必要です。");
+      }
+      const regular = await syncChouseisanSchedule(env, "regular", command.urlRegular, nowMs);
+      lines.push(`・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`);
+      lines.push(
+        `・Googleカレンダー(通常): 作成${regular.calendarSync.created} / 更新${regular.calendarSync.updated} / 削除${regular.calendarSync.deleted} / 保留${regular.calendarSync.skipped}`
+      );
+      if (regular.conflictCount > 0) {
+        lines.push(`・同日競合: ${regular.conflictCount}日（自動確定せず要確認）`);
+      }
+    } else {
+      if (!command.urlPersonal) {
+        throw new Error("個別練習用の調整さんURLが必要です。");
+      }
+      const personal = await syncChouseisanSchedule(env, "personal", command.urlPersonal, nowMs);
+      lines.push(`・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`);
+      lines.push(
+        `・Googleカレンダー(個別): 作成${personal.calendarSync.created} / 更新${personal.calendarSync.updated} / 削除${personal.calendarSync.deleted} / 保留${personal.calendarSync.skipped}`
+      );
+      if (personal.conflictCount > 0) {
+        lines.push(`・同日競合: ${personal.conflictCount}日（自動確定せず要確認）`);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "不明なエラー";
+    lines.length = 0;
+    lines.push("調整さん予定の同期に失敗しました。", `理由: ${message}`);
+  }
+
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: lines.join("\n") }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
 }
 
 function parseRuiContactCommand(inputText: string, nowMs: number): RuiContactCommandParseResult | null {
@@ -4902,6 +5740,11 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   console.log({ stage: "text_received" });
 
   const inputText = event.message.text;
+  const chouseisanSyncCommand = parseChouseisanSyncCommand(inputText);
+  if (chouseisanSyncCommand) {
+    await handleChouseisanSyncCommand(event, env, chouseisanSyncCommand);
+    return;
+  }
   const participationConfirmDate = parseParticipationConfirmCommand(inputText, event.timestamp ?? Date.now());
   if (participationConfirmDate) {
     await handleParticipationConfirmCommand(event, env, participationConfirmDate);
@@ -5385,11 +6228,13 @@ export class PairingSession implements DurableObject {
 }
 
 export const TEST_HOOKS = {
+  inferPracticeTypeByWeekday,
   applyStandingPaymentRules,
   applyPersonalPracticeStandardTransport,
   applyReturnBusGuideTextFallback,
   applyKnownPracticeFallbackForSparseMessage,
   reconcileDateResolutionUncertainty,
+  parseChouseisanSyncCommand,
   parseRuiContactCommand,
   buildRuiContactMessage,
   resolvePairedImageDataUrlForTextEvent,
