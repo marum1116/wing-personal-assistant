@@ -5234,6 +5234,49 @@ function normalizeMonthlyCharge(
   return charge;
 }
 
+function hasGroupAccountingCoachFeeContext(result: StructuredLineResult, sourceText: string): boolean {
+  const context = [sourceText, result.notes ?? "", ...result.uncertain_points].join("\n");
+  if (!context.trim()) {
+    return false;
+  }
+  const compact = context.replace(/\s+/g, "");
+  const hasGroupScope = /(全体|参加者全体|全員分|集めた金額|総額|会費全体|みんな|皆さん)/u.test(compact);
+  const hasAccountingFrom = /(会計から|会計より|会計担当|会計→|会計⇒|会計->)/u.test(compact);
+  const hasCoachFee = /(指導料|コーチ代|謝礼)/u.test(compact);
+  const hasShimuraTarget = /志村(?:さん)?(?:へ|に|宛|あて|お渡し|支払)/u.test(compact);
+  return hasGroupScope && hasAccountingFrom && hasCoachFee && hasShimuraTarget;
+}
+
+function applyGroupAccountingPaymentGuard(
+  result: StructuredLineResult,
+  sourceText: string
+): {
+  result: StructuredLineResult;
+  droppedPayments: number;
+  droppedMonthlyCharges: number;
+} {
+  const guardEligible = result.message_kind === "accounting_notice" || result.message_kind === "general_rule";
+  if (!guardEligible || !hasGroupAccountingCoachFeeContext(result, sourceText)) {
+    return {
+      result,
+      droppedPayments: 0,
+      droppedMonthlyCharges: 0
+    };
+  }
+
+  const droppedPayments = result.payments.length;
+  const droppedMonthlyCharges = result.monthly_charges.length;
+  return {
+    result: {
+      ...result,
+      payments: [],
+      monthly_charges: []
+    },
+    droppedPayments,
+    droppedMonthlyCharges
+  };
+}
+
 async function upsertMonthlyPaymentToD1(
   db: D1Database,
   sourceLabel: string,
@@ -5435,12 +5478,23 @@ async function saveStructuredResultToD1(
   result: StructuredLineResult,
   practiceTypeBasis: StoredPracticeTypeBasis,
   practiceTypePriority: number,
-  conditionalPaymentPending = false
+  conditionalPaymentPending = false,
+  sourceTextForGuard = ""
 ): Promise<SaveStructuredResultOutcome> {
+  const guarded = applyGroupAccountingPaymentGuard(result, sourceTextForGuard);
+  const effectiveResult = guarded.result;
+  if (guarded.droppedPayments > 0 || guarded.droppedMonthlyCharges > 0) {
+    console.log({
+      stage: "group_accounting_payment_guard_applied",
+      droppedPayments: guarded.droppedPayments,
+      droppedMonthlyCharges: guarded.droppedMonthlyCharges
+    });
+  }
+
   const savedMonthlyCharges: SaveStructuredResultOutcome["savedMonthlyCharges"] = [];
   const reviewWarnings: string[] = [];
-  const normalizedMonthlyCharges = result.monthly_charges
-    .map((charge) => normalizeMonthlyCharge(result, charge))
+  const normalizedMonthlyCharges = effectiveResult.monthly_charges
+    .map((charge) => normalizeMonthlyCharge(effectiveResult, charge))
     .filter((charge): charge is MonthlyCharge => charge !== null);
 
   for (const charge of normalizedMonthlyCharges) {
@@ -5459,8 +5513,8 @@ async function saveStructuredResultToD1(
     }
   }
 
-  const practiceSave = await savePracticeToD1(env, sourceLabel, result, practiceTypeBasis, practiceTypePriority);
-  if (!result.practice_date) {
+  const practiceSave = await savePracticeToD1(env, sourceLabel, effectiveResult, practiceTypeBasis, practiceTypePriority);
+  if (!effectiveResult.practice_date) {
     return {
       practiceSaved: practiceSave.practiceSaved,
       paymentCount: 0,
@@ -5469,7 +5523,7 @@ async function saveStructuredResultToD1(
     };
   }
 
-  const latestPractice = await getPracticeByDate(env.DB, result.practice_date);
+  const latestPractice = await getPracticeByDate(env.DB, effectiveResult.practice_date);
   if (!latestPractice) {
     return {
       practiceSaved: practiceSave.practiceSaved,
@@ -5479,9 +5533,9 @@ async function saveStructuredResultToD1(
     };
   }
 
-  const paymentsForStorage = mapPaymentsForStorage(result);
+  const paymentsForStorage = mapPaymentsForStorage(effectiveResult);
   const shouldSkipLegacyPaymentUpsert =
-    result.message_kind === "accounting_notice" && normalizedMonthlyCharges.length > 0;
+    effectiveResult.message_kind === "accounting_notice" && normalizedMonthlyCharges.length > 0;
   // Event payments are reconciled from practice state (rule_key管理) to avoid duplicate rows.
   const basePaymentsToUpsert = paymentsForStorage.filter((payment) => payment.billing_scope !== "event");
   const paymentsToUpsert = shouldSkipLegacyPaymentUpsert ? [] : basePaymentsToUpsert;
@@ -5491,7 +5545,7 @@ async function saveStructuredResultToD1(
     if (payment.type === "個人練習代" || payment.type === "個人練習差額") {
       const warning = await upsertPersonalPracticePaymentToD1(
         env,
-        result.practice_date,
+        effectiveResult.practice_date,
         sourceLabel,
         payment,
         hasExplicitPersonalAdjustment,
@@ -5513,7 +5567,7 @@ async function saveStructuredResultToD1(
         };
     const nonEventWarning = await upsertNonEventPaymentToD1(
       env,
-      result.practice_date,
+      effectiveResult.practice_date,
       sourceLabel,
       payment,
       reviewMeta
@@ -5530,7 +5584,7 @@ async function saveStructuredResultToD1(
        WHERE practice_date = ?1
          AND voided_at IS NULL`
     )
-      .bind(result.practice_date)
+      .bind(effectiveResult.practice_date)
       .first<{ count: number }>();
     return {
       practiceSaved: practiceSave.practiceSaved,
@@ -5640,10 +5694,6 @@ function formatStructuredResultForLine(sourceLabel: string, result: StructuredLi
     for (const payment of result.payments) {
       lines.push(formatPaymentLine(payment));
     }
-  }
-
-  if (result.notes) {
-    lines.push("", "補足：", result.notes);
   }
 
   if (result.needs_confirmation || result.uncertain_points.length > 0) {
@@ -6356,10 +6406,19 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       practiceTypeBasis: resolvedTypeMeta.basis,
       practiceTypePriority: resolvedTypeMeta.priority
     });
+    const groupAccountingGuarded = applyGroupAccountingPaymentGuard(standingApplied.result, inputText);
+    if (groupAccountingGuarded.droppedPayments > 0 || groupAccountingGuarded.droppedMonthlyCharges > 0) {
+      console.log({
+        stage: "group_accounting_payment_guard_applied",
+        droppedPayments: groupAccountingGuarded.droppedPayments,
+        droppedMonthlyCharges: groupAccountingGuarded.droppedMonthlyCharges
+      });
+    }
+    const guardedResult = groupAccountingGuarded.result;
     const conditionalPaymentPending = hasConditionalPaymentCue(inputText);
     console.log({
       stage: "message_classification_resolved",
-      messageKind: standingApplied.result.message_kind,
+      messageKind: guardedResult.message_kind,
       openAiPracticeType: parsed.practice_type,
       resolvedPracticeType: standingApplied.resolvedPracticeType,
       resolvedPracticeDate: resolved.resolvedPracticeDate,
@@ -6372,7 +6431,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     });
     console.log({
       stage: "standing_payment_rules_applied",
-      messageKind: standingApplied.result.message_kind,
+      messageKind: guardedResult.message_kind,
       practiceType: standingApplied.resolvedPracticeType,
       addedPaymentCount: standingApplied.addedPaymentCount
     });
@@ -6388,10 +6447,11 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       saveResult = await saveStructuredResultToD1(
         env,
         sourceLabel,
-        standingApplied.result,
+        guardedResult,
         resolvedTypeMeta.basis,
         resolvedTypeMeta.priority,
-        conditionalPaymentPending
+        conditionalPaymentPending,
+        inputText
       );
       console.log({
         stage: "d1_save_success",
@@ -6403,26 +6463,26 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       console.error("D1 save failed", { errorType });
     }
 
-    let replyResult: StructuredLineResult = standingApplied.result;
-    if (standingApplied.result.practice_date && standingApplied.resolvedPracticeType === "個人練習") {
+    let replyResult: StructuredLineResult = guardedResult;
+    if (guardedResult.practice_date && standingApplied.resolvedPracticeType === "個人練習") {
       const activePersonalPayments = await getActiveUnpaidPersonalPracticePaymentsForPractice(
         env.DB,
-        standingApplied.result.practice_date
+        guardedResult.practice_date
       );
       replyResult = {
-        ...standingApplied.result,
+        ...guardedResult,
         payments: activePersonalPayments
       };
     } else if (
-      isDispatchOrChangeKind(standingApplied.result.message_kind) &&
-      standingApplied.result.practice_date
+      isDispatchOrChangeKind(guardedResult.message_kind) &&
+      guardedResult.practice_date
     ) {
       const activeEventPayments = await getActiveUnpaidEventPaymentsForPractice(
         env.DB,
-        standingApplied.result.practice_date
+        guardedResult.practice_date
       );
       replyResult = {
-        ...standingApplied.result,
+        ...guardedResult,
         payments: activeEventPayments
       };
     }
@@ -6439,13 +6499,13 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       messages.push({ type: "text", text: saveResult.reviewWarnings[0] });
     }
 
-    if (standingApplied.result.practice_date && standingApplied.resolvedPracticeType !== "不明") {
+    if (guardedResult.practice_date && standingApplied.resolvedPracticeType !== "不明") {
       try {
         await saveRecentPracticeContext(
           env,
           userId,
           selectedSourceId,
-          standingApplied.result.practice_date,
+          guardedResult.practice_date,
           standingApplied.resolvedPracticeType,
           receivedAtMs
         );
@@ -6664,6 +6724,7 @@ export const TEST_HOOKS = {
   resolvePracticeContext,
   saveRecentPracticeContext,
   loadRecentPracticeContext,
+  formatStructuredResultForLine,
   saveStructuredResultToD1,
   confirmParticipationAndReleaseConditionalFees,
   getUnifiedUnpaidPayments,

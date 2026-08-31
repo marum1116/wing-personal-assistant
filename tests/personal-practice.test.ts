@@ -272,6 +272,24 @@ async function main() {
   assert.equal(syncAutoUrlOnly.target, "auto");
   assert.equal(syncAutoUrlOnly.urlAuto, "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1");
 
+  // 読み取り結果表示: notes(補足)は表示せず、確認が必要は維持
+  const formattedWithoutNotes = hooks.formatStructuredResultForLine(
+    "羽魂練習会",
+    baseResult({
+      practice_date: "2026-08-31",
+      attendance: "参加",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: "神邊さん" },
+      notes: "本人行は渡辺塁で、行きはバスです。",
+      uncertain_points: ["帰りの集合場所の確認が必要です。"],
+      needs_confirmation: true
+    }) as any
+  );
+  assert.equal(formattedWithoutNotes.includes("補足："), false);
+  assert.equal(formattedWithoutNotes.includes("本人行は渡辺塁で"), false);
+  assert.equal(formattedWithoutNotes.includes("確認が必要："), true);
+  assert.equal(formattedWithoutNotes.includes("帰りの集合場所の確認が必要です。"), true);
+
   // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
   const { env: contactEnvToday } = createTestEnv();
   await hooks.saveStructuredResultToD1(
@@ -2336,6 +2354,68 @@ async function main() {
     .prepare("SELECT COUNT(*) AS count FROM payments WHERE practice_date='2026-09-03' AND voided_at IS NULL")
     .get() as { count: number };
   assert.equal(reactivatedCount.count, 2);
+
+  // 回帰: 全体会計（会計→志村さん指導料）は保存前TSガードで除外
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "accounting_notice",
+      practice_date: "2027-01-05",
+      attendance: "不明",
+      payments: [{ type: "参加費", amount: 7000, payee: "志村さん", due_date: null, payment_method: "現金" }],
+      monthly_charges: [
+        {
+          billing_month: "2027-01",
+          monthly_type: "regular_training_total",
+          amount: 7000,
+          payee: "志村さん",
+          due_date: null,
+          payment_method: "現金",
+          breakdown_text: "全体で集めた金額を会計から志村さんへ指導料として支払う"
+        }
+      ]
+    }) as any,
+    "explicit",
+    30,
+    false,
+    "全体として集めた金額を会計から志村さんへ指導料として支払います。"
+  );
+  const globalAccountingEventCount = raw
+    .prepare("SELECT COUNT(*) AS count FROM payments WHERE practice_date='2027-01-05'")
+    .get() as { count: number };
+  assert.equal(globalAccountingEventCount.count, 0);
+  const globalAccountingMonthlyCount = raw
+    .prepare("SELECT COUNT(*) AS count FROM monthly_payments WHERE billing_month='2027-01'")
+    .get() as { count: number };
+  assert.equal(globalAccountingMonthlyCount.count, 0);
+
+  // 回帰: 渡辺家向けの通常支払い（例: 800円）は従来どおり保存
+  await hooks.saveStructuredResultToD1(
+    env,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "schedule",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2027-01-06",
+      attendance: "参加",
+      payments: [{ type: "参加費", amount: 800, payee: "神邊さん", due_date: null, payment_method: "PayPay" }]
+    }) as any,
+    "explicit",
+    1000
+  );
+  const normalFamilyPayment = raw
+    .prepare(
+      "SELECT payment_type, amount, payee, status, needs_review FROM payments WHERE practice_date='2027-01-06' AND payment_type='参加費' LIMIT 1"
+    )
+    .get() as { payment_type: string; amount: number; payee: string; status: string; needs_review: number };
+  assert.equal(normalFamilyPayment.payment_type, "参加費");
+  assert.equal(normalFamilyPayment.amount, 800);
+  assert.equal(normalFamilyPayment.payee, "神邊さん");
+  assert.equal(normalFamilyPayment.status, "unpaid");
+  assert.equal(normalFamilyPayment.needs_review, 0);
 
   // 回帰: 月次支払い + 未払い一覧
   await hooks.saveStructuredResultToD1(
