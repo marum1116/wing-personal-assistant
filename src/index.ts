@@ -702,6 +702,12 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       throw new Error(`調整さん取得に失敗しました: status=${response.status}`);
     }
     const html = await response.text();
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const htmlTitle = titleMatch ? decodeHtmlBasicEntities((titleMatch[1] ?? "").trim()) : "";
+    const htmlPrefix = html
+      .slice(0, 220)
+      .replace(/\s+/g, " ")
+      .trim();
     const parsedRoot = extractChouseisanRootObject(html);
     if (parsedRoot) {
       parsed = parsedRoot;
@@ -717,11 +723,16 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       url,
       attempt,
       status: response.status,
+      finalUrl: response.url,
+      redirected: response.redirected,
       htmlLength: html.length,
+      htmlTitle,
+      htmlPrefix,
       hasWindowChouseisan: /window\.Chouseisan/i.test(html),
       hasJsonParse: /JSON\.parse\(/.test(html),
       hasEventToken: html.includes("\"event\""),
-      hasChoiceToken: html.includes("\"choices\"")
+      hasChoiceToken: html.includes("\"choices\""),
+      hasCfChallengeToken: /cf-chl|__cf_chl_|checking your browser|attention required/iu.test(html)
     });
   }
   if (!parsed && !fallbackSnapshot) {
