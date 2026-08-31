@@ -686,6 +686,17 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
   let parsed: unknown | null = null;
   let fallbackSnapshot: ChouseisanSnapshot | null = null;
   let statusCode = 0;
+  let lastDiag:
+    | {
+        htmlLength: number;
+        htmlTitle: string;
+        hasWindowChouseisan: boolean;
+        hasJsonParse: boolean;
+        hasEventToken: boolean;
+        hasChoiceToken: boolean;
+        hasCfChallengeToken: boolean;
+      }
+    | null = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const requestUrl = attempt === 0 ? url : `${url}&_ts=${Date.now()}`;
     const response = await fetch(requestUrl, {
@@ -708,6 +719,20 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       .slice(0, 220)
       .replace(/\s+/g, " ")
       .trim();
+    const hasWindowChouseisan = /window\.Chouseisan/i.test(html);
+    const hasJsonParse = /JSON\.parse\(/.test(html);
+    const hasEventToken = html.includes("\"event\"");
+    const hasChoiceToken = html.includes("\"choices\"");
+    const hasCfChallengeToken = /cf-chl|__cf_chl_|checking your browser|attention required/iu.test(html);
+    lastDiag = {
+      htmlLength: html.length,
+      htmlTitle,
+      hasWindowChouseisan,
+      hasJsonParse,
+      hasEventToken,
+      hasChoiceToken,
+      hasCfChallengeToken
+    };
     const parsedRoot = extractChouseisanRootObject(html);
     if (parsedRoot) {
       parsed = parsedRoot;
@@ -728,15 +753,18 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       htmlLength: html.length,
       htmlTitle,
       htmlPrefix,
-      hasWindowChouseisan: /window\.Chouseisan/i.test(html),
-      hasJsonParse: /JSON\.parse\(/.test(html),
-      hasEventToken: html.includes("\"event\""),
-      hasChoiceToken: html.includes("\"choices\""),
-      hasCfChallengeToken: /cf-chl|__cf_chl_|checking your browser|attention required/iu.test(html)
+      hasWindowChouseisan,
+      hasJsonParse,
+      hasEventToken,
+      hasChoiceToken,
+      hasCfChallengeToken
     });
   }
   if (!parsed && !fallbackSnapshot) {
-    throw new Error(`調整さんページに埋め込みデータが見つかりませんでした。(status=${statusCode})`);
+    const diag = lastDiag
+      ? ` title=${lastDiag.htmlTitle || "(none)"} len=${lastDiag.htmlLength} window=${lastDiag.hasWindowChouseisan ? 1 : 0} jsonParse=${lastDiag.hasJsonParse ? 1 : 0} event=${lastDiag.hasEventToken ? 1 : 0} choices=${lastDiag.hasChoiceToken ? 1 : 0} cf=${lastDiag.hasCfChallengeToken ? 1 : 0}`
+      : "";
+    throw new Error(`調整さんページに埋め込みデータが見つかりませんでした。(status=${statusCode}${diag})`);
   }
   if (!parsed && fallbackSnapshot) {
     console.log({ stage: "chouseisan_fallback_used", url, choices: fallbackSnapshot.choices.length });
