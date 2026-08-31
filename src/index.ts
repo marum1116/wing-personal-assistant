@@ -738,6 +738,11 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       parsed = parsedRoot;
       break;
     }
+    const assignmentFallback = extractChouseisanSnapshotFromAssignmentText(html, url);
+    if (assignmentFallback) {
+      fallbackSnapshot = assignmentFallback;
+      break;
+    }
     const htmlFallback = extractChouseisanSnapshotFallback(html, url);
     if (htmlFallback) {
       fallbackSnapshot = htmlFallback;
@@ -940,6 +945,107 @@ function extractChouseisanRootObject(html: string): unknown | null {
     }
   }
   return null;
+}
+
+function extractChouseisanSnapshotFromAssignmentText(html: string, url: string): ChouseisanSnapshot | null {
+  const objectText = extractChouseisanAssignmentObjectText(html);
+  if (!objectText) {
+    return null;
+  }
+  const eventName = extractJsonStringField(objectText, "name");
+  const eventDetail = extractJsonStringField(objectText, "detail");
+  const eventIdFromBody = extractJsonStringField(objectText, "id");
+  const eventIdFromUrl = (url.match(/[?&]h=([a-z0-9]+)/i) ?? [])[1] ?? null;
+  const eventId = eventIdFromBody ?? eventIdFromUrl ?? `fallback-${Date.now()}`;
+  const updDatetime = extractJsonStringField(objectText, "upd_datetime");
+  const choices: Array<{ choice: string }> = [];
+  const choiceRegex = /"choice"\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  let matched: RegExpExecArray | null = null;
+  while ((matched = choiceRegex.exec(objectText)) !== null) {
+    const decoded = decodeEscapedJsonString(matched[1] ?? "");
+    if (decoded) {
+      choices.push({ choice: decoded });
+    }
+  }
+  if (choices.length === 0) {
+    return null;
+  }
+  return {
+    event: {
+      id: eventId,
+      name: eventName ?? "調整さん予定",
+      detail: eventDetail,
+      upd_datetime: updDatetime
+    },
+    choices,
+    members: []
+  };
+}
+
+function extractChouseisanAssignmentObjectText(html: string): string | null {
+  const assignMatched = /window\.Chouseisan\s*=\s*/i.exec(html);
+  if (!assignMatched || typeof assignMatched.index !== "number") {
+    return null;
+  }
+  const valueStart = assignMatched.index + assignMatched[0].length;
+  const startBrace = html.indexOf("{", valueStart);
+  if (startBrace < 0) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  for (let i = startBrace; i < html.length; i += 1) {
+    const ch = html[i] ?? "";
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return html.slice(startBrace, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function extractJsonStringField(text: string, fieldName: string): string | null {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matched = new RegExp(`"${escapedField}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "i").exec(text);
+  if (!matched || !matched[1]) {
+    return null;
+  }
+  return decodeEscapedJsonString(matched[1]);
+}
+
+function decodeEscapedJsonString(value: string): string | null {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return null;
+  }
 }
 
 function extractJsonObjectByToken(html: string, token: string): unknown | null {
