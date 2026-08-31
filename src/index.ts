@@ -33,8 +33,6 @@ const SAME_GRADE_BOY_SURNAME_MAP: Record<(typeof SAME_GRADE_BOY_FULL_NAMES)[numb
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON = "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。";
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX = "参加確定前の条件付き支払い案内";
 const PARTICIPATION_CONFIRM_ATTENDANCE_PRIORITY = 500;
-const DEFAULT_REGULAR_CHOUSEISAN_URL = "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1";
-const DEFAULT_PERSONAL_CHOUSEISAN_URL = "https://chouseisan.com/s?h=00d65c5c4943469f830cb6183b09db70";
 const OPENAI_MODEL = "gpt-5.6-luna";
 const PAIR_WINDOW_MS = 5000;
 const PAIR_WAIT_MS = 1200;
@@ -565,6 +563,10 @@ function practiceTypeHintIndexKey(kind: Exclude<ChouseisanSyncTarget, "both">): 
   return `practice_type_hint_index:${kind}`;
 }
 
+function chouseisanUrlKey(kind: Exclude<ChouseisanSyncTarget, "both">): string {
+  return `chouseisan_url:${kind}`;
+}
+
 function normalizeChouseisanUrl(raw: string): string | null {
   const trimmed = raw.trim();
   if (!/^https:\/\/chouseisan\.com\/s\?h=/i.test(trimmed)) {
@@ -594,14 +596,14 @@ function parseChouseisanSyncCommand(inputText: string): ChouseisanSyncCommand | 
   if (/^調整さん同期$/u.test(compact)) {
     return {
       target: "both",
-      urlRegular: DEFAULT_REGULAR_CHOUSEISAN_URL,
-      urlPersonal: DEFAULT_PERSONAL_CHOUSEISAN_URL
+      urlRegular: null,
+      urlPersonal: null
     };
   }
   if (/^通常(?:練習)?調整さん同期$/u.test(compact)) {
     return {
       target: "regular",
-      urlRegular: DEFAULT_REGULAR_CHOUSEISAN_URL,
+      urlRegular: null,
       urlPersonal: null
     };
   }
@@ -609,7 +611,7 @@ function parseChouseisanSyncCommand(inputText: string): ChouseisanSyncCommand | 
     return {
       target: "personal",
       urlRegular: null,
-      urlPersonal: DEFAULT_PERSONAL_CHOUSEISAN_URL
+      urlPersonal: null
     };
   }
 
@@ -673,16 +675,11 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
     throw new Error(`調整さん取得に失敗しました: status=${response.status}`);
   }
   const html = await response.text();
-  const matched = html.match(/window\.Chouseisan\s*=\s*(\{[\s\S]*?\});/);
-  if (!matched || !matched[1]) {
+  const parsedRoot = extractChouseisanRootObject(html);
+  if (!parsedRoot) {
     throw new Error("調整さんページに埋め込みデータが見つかりませんでした。");
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(matched[1]);
-  } catch {
-    throw new Error("調整さん埋め込みデータのJSON解析に失敗しました。");
-  }
+  const parsed = parsedRoot;
   if (
     typeof parsed !== "object" ||
     parsed === null ||
@@ -720,6 +717,64 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
           : null
       }))
   };
+}
+
+function extractChouseisanRootObject(html: string): unknown | null {
+  const marker = "window.Chouseisan";
+  const markerIndex = html.indexOf(marker);
+  if (markerIndex < 0) {
+    return null;
+  }
+  const equalIndex = html.indexOf("=", markerIndex);
+  if (equalIndex < 0) {
+    return null;
+  }
+  const startBrace = html.indexOf("{", equalIndex);
+  if (startBrace < 0) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  for (let i = startBrace; i < html.length; i += 1) {
+    const ch = html[i] ?? "";
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const objectText = html.slice(startBrace, i + 1);
+        try {
+          return JSON.parse(objectText);
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 async function loadPracticeTypeHintRecord(env: Env, practiceDate: string): Promise<PracticeTypeHintRecord | null> {
@@ -2677,12 +2732,24 @@ async function handleChouseisanSyncCommand(
   const nowMs = event.timestamp ?? Date.now();
   const lines: string[] = ["調整さん予定の同期結果"];
   try {
+    const resolveUrl = async (kind: Exclude<ChouseisanSyncTarget, "both">, directUrl: string | null): Promise<string | null> => {
+      if (directUrl) {
+        await env.STATE.put(chouseisanUrlKey(kind), directUrl, {
+          expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
+        });
+        return directUrl;
+      }
+      return await env.STATE.get(chouseisanUrlKey(kind));
+    };
+
     if (command.target === "both") {
-      if (!command.urlRegular || !command.urlPersonal) {
+      const regularUrl = await resolveUrl("regular", command.urlRegular);
+      const personalUrl = await resolveUrl("personal", command.urlPersonal);
+      if (!regularUrl || !personalUrl) {
         throw new Error("通常練習用と個別練習用のURLが必要です。");
       }
-      const regular = await syncChouseisanSchedule(env, "regular", command.urlRegular, nowMs);
-      const personal = await syncChouseisanSchedule(env, "personal", command.urlPersonal, nowMs);
+      const regular = await syncChouseisanSchedule(env, "regular", regularUrl, nowMs);
+      const personal = await syncChouseisanSchedule(env, "personal", personalUrl, nowMs);
       lines.push(
         `・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`,
         `・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`,
@@ -2694,10 +2761,11 @@ async function handleChouseisanSyncCommand(
         lines.push(`・同日競合: ${conflictCount}日（自動確定せず要確認）`);
       }
     } else if (command.target === "regular") {
-      if (!command.urlRegular) {
+      const regularUrl = await resolveUrl("regular", command.urlRegular);
+      if (!regularUrl) {
         throw new Error("通常練習用の調整さんURLが必要です。");
       }
-      const regular = await syncChouseisanSchedule(env, "regular", command.urlRegular, nowMs);
+      const regular = await syncChouseisanSchedule(env, "regular", regularUrl, nowMs);
       lines.push(`・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`);
       lines.push(
         `・Googleカレンダー(通常): 作成${regular.calendarSync.created} / 更新${regular.calendarSync.updated} / 削除${regular.calendarSync.deleted} / 保留${regular.calendarSync.skipped}`
@@ -2706,10 +2774,11 @@ async function handleChouseisanSyncCommand(
         lines.push(`・同日競合: ${regular.conflictCount}日（自動確定せず要確認）`);
       }
     } else {
-      if (!command.urlPersonal) {
+      const personalUrl = await resolveUrl("personal", command.urlPersonal);
+      if (!personalUrl) {
         throw new Error("個別練習用の調整さんURLが必要です。");
       }
-      const personal = await syncChouseisanSchedule(env, "personal", command.urlPersonal, nowMs);
+      const personal = await syncChouseisanSchedule(env, "personal", personalUrl, nowMs);
       lines.push(`・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`);
       lines.push(
         `・Googleカレンダー(個別): 作成${personal.calendarSync.created} / 更新${personal.calendarSync.updated} / 削除${personal.calendarSync.deleted} / 保留${personal.calendarSync.skipped}`

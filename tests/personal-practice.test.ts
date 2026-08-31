@@ -259,6 +259,12 @@ async function main() {
   assert.equal(syncPersonal.target, "personal");
   assert.equal(syncPersonal.urlPersonal, "https://chouseisan.com/s?h=00d65c5c4943469f830cb6183b09db70");
 
+  const syncBothNoUrl = hooks.parseChouseisanSyncCommand("調整さん同期");
+  assert.ok(syncBothNoUrl);
+  assert.equal(syncBothNoUrl.target, "both");
+  assert.equal(syncBothNoUrl.urlRegular, null);
+  assert.equal(syncBothNoUrl.urlPersonal, null);
+
   // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
   const { env: contactEnvToday } = createTestEnv();
   await hooks.saveStructuredResultToD1(
