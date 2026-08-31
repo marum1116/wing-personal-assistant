@@ -683,21 +683,31 @@ function parseChoiceDateToYmd(choiceText: string, year: number): string | null {
 }
 
 async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot> {
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "user-agent": "wing-personal-assistant/1.0 (+schedule sync)"
+  let parsed: unknown | null = null;
+  let statusCode = 0;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const requestUrl = attempt === 0 ? url : `${url}&_ts=${Date.now()}`;
+    const response = await fetch(requestUrl, {
+      method: "GET",
+      headers: {
+        "accept-language": "ja,en-US;q=0.9,en;q=0.8",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      }
+    });
+    statusCode = response.status;
+    if (!response.ok) {
+      throw new Error(`調整さん取得に失敗しました: status=${response.status}`);
     }
-  });
-  if (!response.ok) {
-    throw new Error(`調整さん取得に失敗しました: status=${response.status}`);
+    const html = await response.text();
+    const parsedRoot = extractChouseisanRootObject(html);
+    if (parsedRoot) {
+      parsed = parsedRoot;
+      break;
+    }
   }
-  const html = await response.text();
-  const parsedRoot = extractChouseisanRootObject(html);
-  if (!parsedRoot) {
-    throw new Error("調整さんページに埋め込みデータが見つかりませんでした。");
+  if (!parsed) {
+    throw new Error(`調整さんページに埋め込みデータが見つかりませんでした。(status=${statusCode})`);
   }
-  const parsed = parsedRoot;
   if (
     typeof parsed !== "object" ||
     parsed === null ||
@@ -2647,7 +2657,8 @@ async function syncChouseisanSchedule(
   env: Env,
   kind: ChouseisanSyncKind,
   url: string,
-  nowMs: number
+  nowMs: number,
+  prefetched?: { snapshot: ChouseisanSnapshot; year: number }
 ): Promise<{
   eventName: string;
   eventId: string;
@@ -2656,8 +2667,8 @@ async function syncChouseisanSchedule(
   conflictCount: number;
   calendarSync: { created: number; updated: number; deleted: number; skipped: number };
 }> {
-  const snapshot = await fetchChouseisanSnapshot(url);
-  const year = inferYearFromChouseisan(snapshot, nowMs);
+  const snapshot = prefetched?.snapshot ?? (await fetchChouseisanSnapshot(url));
+  const year = prefetched?.year ?? inferYearFromChouseisan(snapshot, nowMs);
   const nextDates = [...new Set(snapshot.choices.map((choice) => parseChoiceDateToYmd(choice.choice, year)).filter((value): value is string => !!value))];
   const nextDateSet = new Set(nextDates);
   const previousDates = await loadPracticeTypeHintIndex(env, kind);
@@ -2775,7 +2786,10 @@ async function handleChouseisanSyncCommand(
       await env.STATE.put(chouseisanUrlKey(inferredKind), autoUrl, {
         expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
       });
-      const syncResult = await syncChouseisanSchedule(env, inferredKind, autoUrl, nowMs);
+      const syncResult = await syncChouseisanSchedule(env, inferredKind, autoUrl, nowMs, {
+        snapshot,
+        year: inferYearFromChouseisan(snapshot, nowMs)
+      });
       const label = inferredKind === "regular" ? "通常練習" : "個別練習";
       lines.push(`・${label}: ${syncResult.addedOrUpdated}日を同期（削除${syncResult.removed}日）`);
       lines.push(
