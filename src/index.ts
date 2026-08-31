@@ -690,6 +690,8 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
     const response = await fetch(requestUrl, {
       method: "GET",
       headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
         "accept-language": "ja,en-US;q=0.9,en;q=0.8",
         "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
       }
@@ -748,14 +750,29 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
 }
 
 function extractChouseisanRootObject(html: string): unknown | null {
-  const marker = "window.Chouseisan";
-  const markerIndex = html.indexOf(marker);
+  const markerMatched = /window\.Chouseisan/i.exec(html);
+  const markerIndex = markerMatched ? markerMatched.index : -1;
   if (markerIndex < 0) {
-    return null;
+    return extractJsonObjectByToken(html, "\"event\"") ?? extractJsonObjectByToken(html, "\"choices\"");
   }
   const equalIndex = html.indexOf("=", markerIndex);
   if (equalIndex < 0) {
     return null;
+  }
+  const parseCallMatched = /JSON\.parse\(\s*(['"])([\s\S]*?)\1\s*\)/.exec(html.slice(equalIndex, equalIndex + 400000));
+  if (parseCallMatched && parseCallMatched[2]) {
+    try {
+      const quote = parseCallMatched[1] ?? "\"";
+      const raw = parseCallMatched[2];
+      const normalized =
+        quote === "'"
+          ? `"${raw.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`
+          : `${quote}${raw}${quote}`;
+      const jsonText = JSON.parse(normalized);
+      return JSON.parse(jsonText);
+    } catch {
+      // fall through
+    }
   }
   const startBrace = html.indexOf("{", equalIndex);
   if (startBrace < 0) {
@@ -796,6 +813,59 @@ function extractChouseisanRootObject(html: string): unknown | null {
         const objectText = html.slice(startBrace, i + 1);
         try {
           return JSON.parse(objectText);
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function extractJsonObjectByToken(html: string, token: string): unknown | null {
+  const tokenIndex = html.indexOf(token);
+  if (tokenIndex < 0) {
+    return null;
+  }
+  const startBrace = html.lastIndexOf("{", tokenIndex);
+  if (startBrace < 0) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  for (let i = startBrace; i < html.length; i += 1) {
+    const ch = html[i] ?? "";
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const candidate = html.slice(startBrace, i + 1);
+        try {
+          return JSON.parse(candidate);
         } catch {
           return null;
         }
