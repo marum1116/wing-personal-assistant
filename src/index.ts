@@ -871,16 +871,15 @@ function decodeHtmlBasicEntities(value: string): string {
 }
 
 function extractChouseisanRootObject(html: string): unknown | null {
-  const markerMatched = /window\.Chouseisan/i.exec(html);
-  const markerIndex = markerMatched ? markerMatched.index : -1;
-  if (markerIndex < 0) {
+  const assignMatched = /window\.Chouseisan\s*=\s*/i.exec(html);
+  if (!assignMatched || typeof assignMatched.index !== "number") {
     return extractJsonObjectByToken(html, "\"event\"") ?? extractJsonObjectByToken(html, "\"choices\"");
   }
-  const equalIndex = html.indexOf("=", markerIndex);
-  if (equalIndex < 0) {
+  const valueStart = assignMatched.index + assignMatched[0].length;
+  if (valueStart < 0 || valueStart >= html.length) {
     return null;
   }
-  const parseCallMatched = /JSON\.parse\(\s*(['"])([\s\S]*?)\1\s*\)/.exec(html.slice(equalIndex, equalIndex + 400000));
+  const parseCallMatched = /JSON\.parse\(\s*(['"])([\s\S]*?)\1\s*\)/.exec(html.slice(valueStart, valueStart + 400000));
   if (parseCallMatched && parseCallMatched[2]) {
     try {
       const quote = parseCallMatched[1] ?? "\"";
@@ -895,7 +894,7 @@ function extractChouseisanRootObject(html: string): unknown | null {
       // fall through
     }
   }
-  const startBrace = html.indexOf("{", equalIndex);
+  const startBrace = html.indexOf("{", valueStart);
   if (startBrace < 0) {
     return null;
   }
