@@ -699,7 +699,7 @@ async function main() {
   assert.equal(hintRegularResolved.resolvedPracticeType, "通常練習");
   assert.equal(hintRegularResolved.typeBasis, "chouseisan_schedule");
 
-  // Chouseisan hint conflict: 通常/個別が同日重複なら自動確定しない
+  // Chouseisan hint conflict: 通常/個別が同日重複した場合は通常練習を優先
   await env.STATE.put(
     "practice_type_hint:2026-09-13",
     JSON.stringify({
@@ -722,9 +722,9 @@ async function main() {
     }) as any,
     Date.now()
   );
-  assert.equal(hintConflictResolved.resolvedPracticeType, "不明");
-  assert.equal(hintConflictResolved.needsConfirmation, true);
-  assert.ok(hintConflictResolved.addedUncertainPoints.some((point: string) => point.includes("練習種別の確認が必要")));
+  assert.equal(hintConflictResolved.resolvedPracticeType, "通常練習");
+  assert.equal(hintConflictResolved.typeBasis, "chouseisan_schedule");
+  assert.equal(hintConflictResolved.needsConfirmation, false);
 
   // Requested Case C: 月曜日でも本文明示個人練習なら個人練習を優先
   const reqCaseC = await hooks.resolvePracticeContext(

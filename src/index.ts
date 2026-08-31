@@ -1823,7 +1823,8 @@ async function resolvePracticeTypeByChouseisanHint(
     return { practiceType: "個人練習", conflict: false };
   }
   if (record.regular && record.personal) {
-    return { practiceType: "不明", conflict: true };
+    // 業務ルール: 同日競合時は通常練習を優先する
+    return { practiceType: "通常練習", conflict: true };
   }
   return { practiceType: "不明", conflict: false };
 }
@@ -3092,7 +3093,7 @@ async function handleChouseisanSyncCommand(
         `・Googleカレンダー(${label === "通常練習" ? "通常" : "個別"}): 作成${syncResult.calendarSync.created} / 更新${syncResult.calendarSync.updated} / 削除${syncResult.calendarSync.deleted} / 保留${syncResult.calendarSync.skipped}`
       );
       if (syncResult.conflictCount > 0) {
-        lines.push(`・同日競合: ${syncResult.conflictCount}日（自動確定せず要確認）`);
+        lines.push(`・同日競合: ${syncResult.conflictCount}日（通常練習を優先して確定）`);
       }
       lines.push(`・URL登録: ${label} 用として保存しました`);
     } else if (command.target === "both") {
@@ -3111,7 +3112,7 @@ async function handleChouseisanSyncCommand(
       );
       const conflictCount = Math.max(regular.conflictCount, personal.conflictCount);
       if (conflictCount > 0) {
-        lines.push(`・同日競合: ${conflictCount}日（自動確定せず要確認）`);
+        lines.push(`・同日競合: ${conflictCount}日（通常練習を優先して確定）`);
       }
     } else if (command.target === "regular") {
       const regularUrl = await resolveUrl("regular", command.urlRegular);
@@ -3124,7 +3125,7 @@ async function handleChouseisanSyncCommand(
         `・Googleカレンダー(通常): 作成${regular.calendarSync.created} / 更新${regular.calendarSync.updated} / 削除${regular.calendarSync.deleted} / 保留${regular.calendarSync.skipped}`
       );
       if (regular.conflictCount > 0) {
-        lines.push(`・同日競合: ${regular.conflictCount}日（自動確定せず要確認）`);
+        lines.push(`・同日競合: ${regular.conflictCount}日（通常練習を優先して確定）`);
       }
     } else {
       const personalUrl = await resolveUrl("personal", command.urlPersonal);
@@ -3137,7 +3138,7 @@ async function handleChouseisanSyncCommand(
         `・Googleカレンダー(個別): 作成${personal.calendarSync.created} / 更新${personal.calendarSync.updated} / 削除${personal.calendarSync.deleted} / 保留${personal.calendarSync.skipped}`
       );
       if (personal.conflictCount > 0) {
-        lines.push(`・同日競合: ${personal.conflictCount}日（自動確定せず要確認）`);
+        lines.push(`・同日競合: ${personal.conflictCount}日（通常練習を優先して確定）`);
       }
     }
   } catch (error) {
