@@ -684,6 +684,7 @@ function parseChoiceDateToYmd(choiceText: string, year: number): string | null {
 
 async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot> {
   let parsed: unknown | null = null;
+  let fallbackSnapshot: ChouseisanSnapshot | null = null;
   let statusCode = 0;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const requestUrl = attempt === 0 ? url : `${url}&_ts=${Date.now()}`;
@@ -706,9 +707,29 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       parsed = parsedRoot;
       break;
     }
+    const htmlFallback = extractChouseisanSnapshotFallback(html, url);
+    if (htmlFallback) {
+      fallbackSnapshot = htmlFallback;
+      break;
+    }
+    console.log({
+      stage: "chouseisan_embed_not_found",
+      url,
+      attempt,
+      status: response.status,
+      htmlLength: html.length,
+      hasWindowChouseisan: /window\.Chouseisan/i.test(html),
+      hasJsonParse: /JSON\.parse\(/.test(html),
+      hasEventToken: html.includes("\"event\""),
+      hasChoiceToken: html.includes("\"choices\"")
+    });
   }
-  if (!parsed) {
+  if (!parsed && !fallbackSnapshot) {
     throw new Error(`調整さんページに埋め込みデータが見つかりませんでした。(status=${statusCode})`);
+  }
+  if (!parsed && fallbackSnapshot) {
+    console.log({ stage: "chouseisan_fallback_used", url, choices: fallbackSnapshot.choices.length });
+    return fallbackSnapshot;
   }
   if (
     typeof parsed !== "object" ||
@@ -747,6 +768,67 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
           : null
       }))
   };
+}
+
+function extractChouseisanSnapshotFallback(html: string, url: string): ChouseisanSnapshot | null {
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const rawTitle = titleMatch ? decodeHtmlBasicEntities(titleMatch[1] ?? "").trim() : "";
+  const eventName = rawTitle.replace(/\s*\|\s*Chouseisan\s*$/i, "").trim();
+  const detailMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([\s\S]*?)["'][^>]*>/i);
+  const detail = detailMatch ? decodeHtmlBasicEntities(detailMatch[1] ?? "").trim() : null;
+  const dateRegex = /(^|[^\d])(\d{1,2})\/(\d{1,2})(?!\d)/g;
+  const choiceSet = new Set<string>();
+  let matched: RegExpExecArray | null = null;
+  while ((matched = dateRegex.exec(html)) !== null) {
+    const month = Number(matched[2]);
+    const day = Number(matched[3]);
+    if (!Number.isFinite(month) || !Number.isFinite(day)) {
+      continue;
+    }
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+      continue;
+    }
+    choiceSet.add(`${month}/${day}`);
+  }
+  if (choiceSet.size === 0) {
+    return null;
+  }
+  const hashMatched = url.match(/[?&]h=([a-z0-9]+)/i);
+  const eventId = hashMatched && hashMatched[1] ? hashMatched[1] : `fallback-${Date.now()}`;
+  return {
+    event: {
+      id: eventId,
+      name: eventName || "調整さん予定",
+      detail: detail || null,
+      upd_datetime: null
+    },
+    choices: [...choiceSet].map((choice) => ({ choice })),
+    members: []
+  };
+}
+
+function decodeHtmlBasicEntities(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#x2F;/gi, "/")
+    .replace(/&#10;/g, "\n")
+    .replace(/&#13;/g, "\r")
+    .replace(/&#(\d+);/g, (_all, num) => {
+      const code = Number(num);
+      if (!Number.isFinite(code)) {
+        return "";
+      }
+      try {
+        return String.fromCharCode(code);
+      } catch {
+        return "";
+      }
+    });
 }
 
 function extractChouseisanRootObject(html: string): unknown | null {
