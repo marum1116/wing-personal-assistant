@@ -265,6 +265,13 @@ async function main() {
   assert.equal(syncBothNoUrl.urlRegular, null);
   assert.equal(syncBothNoUrl.urlPersonal, null);
 
+  const syncAutoUrlOnly = hooks.parseChouseisanSyncCommand(
+    "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1"
+  );
+  assert.ok(syncAutoUrlOnly);
+  assert.equal(syncAutoUrlOnly.target, "auto");
+  assert.equal(syncAutoUrlOnly.urlAuto, "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1");
+
   // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
   const { env: contactEnvToday } = createTestEnv();
   await hooks.saveStructuredResultToD1(

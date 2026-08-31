@@ -242,12 +242,14 @@ type PracticeTypeHintRecord = {
   };
 };
 
-type ChouseisanSyncTarget = "regular" | "personal" | "both";
+type ChouseisanSyncKind = "regular" | "personal";
+type ChouseisanSyncTarget = ChouseisanSyncKind | "both" | "auto";
 
 type ChouseisanSyncCommand = {
   target: ChouseisanSyncTarget;
   urlRegular: string | null;
   urlPersonal: string | null;
+  urlAuto?: string | null;
 };
 
 type ChouseisanSnapshot = {
@@ -559,11 +561,11 @@ function practiceTypeHintKey(practiceDate: string): string {
   return `practice_type_hint:${practiceDate}`;
 }
 
-function practiceTypeHintIndexKey(kind: Exclude<ChouseisanSyncTarget, "both">): string {
+function practiceTypeHintIndexKey(kind: ChouseisanSyncKind): string {
   return `practice_type_hint_index:${kind}`;
 }
 
-function chouseisanUrlKey(kind: Exclude<ChouseisanSyncTarget, "both">): string {
+function chouseisanUrlKey(kind: ChouseisanSyncKind): string {
   return `chouseisan_url:${kind}`;
 }
 
@@ -636,6 +638,22 @@ function parseChouseisanSyncCommand(inputText: string): ChouseisanSyncCommand | 
       urlRegular: null,
       urlPersonal: normalizedUrl
     };
+  }
+  return {
+    target: "auto",
+    urlRegular: null,
+    urlPersonal: null,
+    urlAuto: normalizedUrl
+  };
+}
+
+function inferChouseisanKindFromSnapshot(snapshot: ChouseisanSnapshot): ChouseisanSyncKind | null {
+  const text = `${snapshot.event.name}\n${snapshot.event.detail ?? ""}`;
+  if (/(個別練習|個人練習|個別|個人)/u.test(text)) {
+    return "personal";
+  }
+  if (/(通常練習|羽魂練習会|ウイングソウル|練習日|通常)/u.test(text)) {
+    return "regular";
   }
   return null;
 }
@@ -801,7 +819,7 @@ async function savePracticeTypeHintRecord(env: Env, practiceDate: string, record
 
 async function loadPracticeTypeHintIndex(
   env: Env,
-  kind: Exclude<ChouseisanSyncTarget, "both">
+  kind: ChouseisanSyncKind
 ): Promise<string[]> {
   const raw = await env.STATE.get(practiceTypeHintIndexKey(kind));
   if (!raw) {
@@ -820,7 +838,7 @@ async function loadPracticeTypeHintIndex(
 
 async function savePracticeTypeHintIndex(
   env: Env,
-  kind: Exclude<ChouseisanSyncTarget, "both">,
+  kind: ChouseisanSyncKind,
   dates: string[]
 ): Promise<void> {
   await env.STATE.put(practiceTypeHintIndexKey(kind), JSON.stringify(dates), {
@@ -1011,13 +1029,13 @@ async function getGoogleCalendarAccessToken(env: Env): Promise<string | null> {
   return typeof tokenJson.access_token === "string" ? tokenJson.access_token : null;
 }
 
-function ruiCalendarEventKey(kind: Exclude<ChouseisanSyncTarget, "both">, practiceDate: string): string {
+function ruiCalendarEventKey(kind: ChouseisanSyncKind, practiceDate: string): string {
   return `rui_calendar_event:${kind}:${practiceDate}`;
 }
 
 async function upsertGoogleCalendarEvent(
   env: Env,
-  practiceKind: Exclude<ChouseisanSyncTarget, "both">,
+  practiceKind: ChouseisanSyncKind,
   practiceDate: string,
   payload: GoogleCalendarEventPayload
 ): Promise<"created" | "updated" | "skipped"> {
@@ -1092,7 +1110,7 @@ async function upsertGoogleCalendarEvent(
 
 async function deleteGoogleCalendarEventIfExists(
   env: Env,
-  practiceKind: Exclude<ChouseisanSyncTarget, "both">,
+  practiceKind: ChouseisanSyncKind,
   practiceDate: string
 ): Promise<"deleted" | "skipped"> {
   const accessToken = await getGoogleCalendarAccessToken(env);
@@ -1131,7 +1149,7 @@ async function deleteGoogleCalendarEventIfExists(
 
 async function syncRuiCalendarFromChouseisan(
   env: Env,
-  kind: Exclude<ChouseisanSyncTarget, "both">,
+  kind: ChouseisanSyncKind,
   snapshot: ChouseisanSnapshot,
   year: number
 ): Promise<{ created: number; updated: number; deleted: number; skipped: number }> {
@@ -2627,7 +2645,7 @@ function defaultPracticeLocation(practiceDate: string, practiceType: PracticeTyp
 
 async function syncChouseisanSchedule(
   env: Env,
-  kind: Exclude<ChouseisanSyncTarget, "both">,
+  kind: ChouseisanSyncKind,
   url: string,
   nowMs: number
 ): Promise<{
@@ -2732,7 +2750,7 @@ async function handleChouseisanSyncCommand(
   const nowMs = event.timestamp ?? Date.now();
   const lines: string[] = ["調整さん予定の同期結果"];
   try {
-    const resolveUrl = async (kind: Exclude<ChouseisanSyncTarget, "both">, directUrl: string | null): Promise<string | null> => {
+    const resolveUrl = async (kind: ChouseisanSyncKind, directUrl: string | null): Promise<string | null> => {
       if (directUrl) {
         await env.STATE.put(chouseisanUrlKey(kind), directUrl, {
           expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
@@ -2742,7 +2760,32 @@ async function handleChouseisanSyncCommand(
       return await env.STATE.get(chouseisanUrlKey(kind));
     };
 
-    if (command.target === "both") {
+    if (command.target === "auto") {
+      const autoUrl = command.urlAuto ?? null;
+      if (!autoUrl) {
+        throw new Error("調整さんURLが必要です。");
+      }
+      const snapshot = await fetchChouseisanSnapshot(autoUrl);
+      const inferredKind = inferChouseisanKindFromSnapshot(snapshot);
+      if (!inferredKind) {
+        throw new Error(
+          "URLから通常練習/個別練習を判定できませんでした。`通常練習：<URL>` または `個別練習：<URL>` の形式で送信してください。"
+        );
+      }
+      await env.STATE.put(chouseisanUrlKey(inferredKind), autoUrl, {
+        expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
+      });
+      const syncResult = await syncChouseisanSchedule(env, inferredKind, autoUrl, nowMs);
+      const label = inferredKind === "regular" ? "通常練習" : "個別練習";
+      lines.push(`・${label}: ${syncResult.addedOrUpdated}日を同期（削除${syncResult.removed}日）`);
+      lines.push(
+        `・Googleカレンダー(${label === "通常練習" ? "通常" : "個別"}): 作成${syncResult.calendarSync.created} / 更新${syncResult.calendarSync.updated} / 削除${syncResult.calendarSync.deleted} / 保留${syncResult.calendarSync.skipped}`
+      );
+      if (syncResult.conflictCount > 0) {
+        lines.push(`・同日競合: ${syncResult.conflictCount}日（自動確定せず要確認）`);
+      }
+      lines.push(`・URL登録: ${label} 用として保存しました`);
+    } else if (command.target === "both") {
       const regularUrl = await resolveUrl("regular", command.urlRegular);
       const personalUrl = await resolveUrl("personal", command.urlPersonal);
       if (!regularUrl || !personalUrl) {
