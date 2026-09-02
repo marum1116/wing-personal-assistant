@@ -985,6 +985,7 @@ function extractChouseisanSnapshotFromAssignmentText(html: string, url: string):
   if (choices.length === 0) {
     return null;
   }
+  const members = extractChouseisanMembersFromAssignmentObjectText(objectText);
   return {
     event: {
       id: eventId,
@@ -993,8 +994,37 @@ function extractChouseisanSnapshotFromAssignmentText(html: string, url: string):
       upd_datetime: updDatetime
     },
     choices,
-    members: []
+    members
   };
+}
+
+function extractChouseisanMembersFromAssignmentObjectText(
+  objectText: string
+): Array<{ name: string; attend: string | null; kouho: number[] | null }> {
+  const membersMatch = objectText.match(/"members"\s*:\s*(\[[\s\S]*?\])\s*,\s*"choices"/);
+  if (!membersMatch || !membersMatch[1]) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(membersMatch[1]) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+      .filter((item) => typeof item.name === "string")
+      .map((item) => ({
+        name: String(item.name),
+        attend: typeof item.attend === "string" ? item.attend : null,
+        kouho: Array.isArray(item.kouho)
+          ? item.kouho
+              .map((v) => (typeof v === "number" ? v : Number.NaN))
+              .filter((v) => Number.isFinite(v))
+          : null
+      }));
+  } catch {
+    return [];
+  }
 }
 
 function extractChouseisanAssignmentObjectText(html: string): string | null {
@@ -3219,8 +3249,11 @@ function normalizeNameWithoutSpaces(name: string): string {
 
 function isMonthlyFeeTargetRuiName(name: string): boolean {
   const normalized = normalizeNameWithoutSpaces(name);
-  const withoutGradePrefix = normalized.replace(/^[0-9０-９一二三四五六七八九十]+年/u, "");
-  return withoutGradePrefix === "渡辺塁";
+  const withoutGradePrefix = normalized.replace(/^[0-9０-９一二三四五六七八九十]+年(?:生)?/u, "");
+  if (withoutGradePrefix === "渡辺塁") {
+    return true;
+  }
+  return /^.*渡辺塁(?:くん)?$/u.test(normalized);
 }
 
 function formatYen(amount: number): string {

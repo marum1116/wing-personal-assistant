@@ -282,6 +282,7 @@ async function main() {
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺 塁"), true);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺　塁"), true);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("1年 渡辺　塁"), true);
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("1年生渡辺塁"), true);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺花子"), false);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺瑠衣"), false);
 
