@@ -272,6 +272,146 @@ async function main() {
   assert.equal(syncAutoUrlOnly.target, "auto");
   assert.equal(syncAutoUrlOnly.urlAuto, "https://chouseisan.com/s?h=ba239d290a79461d895704480810f8d1");
 
+  // 月謝コマンド: トリガー判定
+  assert.equal(hooks.isMonthlyFeeCommand("月謝"), true);
+  assert.equal(hooks.isMonthlyFeeCommand(" 月謝 "), true);
+  assert.equal(hooks.isMonthlyFeeCommand("月謝一覧"), false);
+
+  // 月謝コマンド: 渡辺塁の名前判定（空白差を許容）
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺塁"), true);
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺 塁"), true);
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺　塁"), true);
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("1年 渡辺　塁"), true);
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺花子"), false);
+  assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺瑠衣"), false);
+
+  // 月謝コマンド: 月木5回(4000円)・火3回(3750円)・見守り200円・計7950円
+  const monthlyFeeSnapshot = {
+    event: {
+      id: "regular-2026-09",
+      name: "9月通常練習",
+      detail: null,
+      upd_datetime: "2026-08-30T10:00:00.000Z"
+    },
+    choices: [
+      { choice: "9/7(月) 19:00〜" }, // 月 ○
+      { choice: "9/8(火) 19:00〜" }, // 火 ○
+      { choice: "9/10(木) 19:00〜" }, // 木 ○
+      { choice: "9/13(日) 18:00〜" }, // 日 ○ (除外)
+      { choice: "9/14(月) 19:00〜" }, // 月 ○
+      { choice: "9/15(火) 19:00〜" }, // 火 ○
+      { choice: "9/17(木) 19:00〜" }, // 木 △ (除外)
+      { choice: "9/19(土) 18:00〜" }, // 土 ○ (除外)
+      { choice: "9/21(月) 19:00〜" }, // 月 ○
+      { choice: "9/22(火) 19:00〜" }, // 火 ○
+      { choice: "9/24(木) 19:00〜" }, // 木 ○
+      { choice: "9/25(金) 19:00〜" }, // 金 ○ (除外)
+      { choice: "9/29(火) 19:00〜" } // 火 × (除外)
+    ],
+    members: [
+      {
+        name: "1年 渡辺　塁",
+        attend: "1,1,1,1,1,1,2,1,1,1,1,1,3",
+        kouho: null
+      },
+      {
+        name: "1年 中村詠太",
+        attend: "1,1,1,1,1,1,1,1,1,1,1,1,1",
+        kouho: null
+      }
+    ]
+  };
+  const monthlyFeeCalculated = hooks.calculateMonthlyFeeFromRegularSnapshot(monthlyFeeSnapshot as any, fixedNow);
+  assert.equal(monthlyFeeCalculated.ok, true);
+  if (!monthlyFeeCalculated.ok) {
+    throw new Error("monthly fee calculation must be successful");
+  }
+  assert.equal(monthlyFeeCalculated.value.monThuCount, 5);
+  assert.equal(monthlyFeeCalculated.value.tueCount, 3);
+  assert.equal(monthlyFeeCalculated.value.monThuAmount, 4000);
+  assert.equal(monthlyFeeCalculated.value.tueAmount, 3750);
+  assert.equal(monthlyFeeCalculated.value.supervisionFee, 200);
+  assert.equal(monthlyFeeCalculated.value.totalAmount, 7950);
+
+  const { raw: monthlyRaw, env: monthlyEnv } = createTestEnv();
+  await monthlyEnv.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular");
+  await monthlyEnv.STATE.put("chouseisan_url:personal", "https://chouseisan.com/s?h=personal");
+  const monthlyFeeText = await hooks.buildMonthlyFeeReplyText(
+    monthlyEnv as any,
+    fixedNow,
+    async (url: string) => {
+      assert.equal(url, "https://chouseisan.com/s?h=regular");
+      return monthlyFeeSnapshot as any;
+    }
+  );
+  assert.match(monthlyFeeText, /^わたなべ るい/m);
+  assert.match(monthlyFeeText, /月木　5回　4,000円/);
+  assert.match(monthlyFeeText, /火　　3回　3,750円/);
+  assert.match(monthlyFeeText, /見守り代　200円/);
+  assert.match(monthlyFeeText, /計　7,950円/);
+
+  // 月謝コマンド: URL未登録時は0円計算しない
+  const { env: monthlyNoUrlEnv } = createTestEnv();
+  const monthlyNoUrlText = await hooks.buildMonthlyFeeReplyText(monthlyNoUrlEnv as any, fixedNow, async () => {
+    throw new Error("must not fetch without url");
+  });
+  assert.match(monthlyNoUrlText, /通常練習用の調整さんが登録されていません/);
+
+  // 月謝コマンド: fetch失敗時は0円計算しない
+  const { env: monthlyFetchFailEnv } = createTestEnv();
+  await monthlyFetchFailEnv.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular");
+  const monthlyFetchFailText = await hooks.buildMonthlyFeeReplyText(monthlyFetchFailEnv as any, fixedNow, async () => {
+    throw new Error("network failed");
+  });
+  assert.match(monthlyFetchFailText, /調整さんを読み込めませんでした/);
+
+  // 月謝コマンド: 渡辺塁の回答行がない場合は0円計算しない
+  const monthlyNoRuiText = await hooks.buildMonthlyFeeReplyText(
+    monthlyFetchFailEnv as any,
+    fixedNow,
+    async () =>
+      ({
+        event: { id: "x", name: "x", detail: null, upd_datetime: "2026-08-30T10:00:00.000Z" },
+        choices: [{ choice: "9/7(月) 19:00〜" }],
+        members: [{ name: "中村詠太", attend: "1", kouho: null }]
+      }) as any
+  );
+  assert.match(monthlyNoRuiText, /渡辺塁の回答が調整さんで見つかりません/);
+
+  // 月謝コマンド: 複数月混在時は合算しない
+  const monthlyMultiMonthText = await hooks.buildMonthlyFeeReplyText(
+    monthlyFetchFailEnv as any,
+    fixedNow,
+    async () =>
+      ({
+        event: { id: "x", name: "x", detail: null, upd_datetime: "2026-08-30T10:00:00.000Z" },
+        choices: [{ choice: "9/7(月) 19:00〜" }, { choice: "10/1(木) 19:00〜" }],
+        members: [{ name: "渡辺塁", attend: "1,1", kouho: null }]
+      }) as any
+  );
+  assert.match(monthlyMultiMonthText, /複数月の日程が含まれているため、月謝対象月を一意に決められません/);
+
+  // 月謝コマンド: DB副作用なし（payments/monthly_paymentsを作成しない）
+  const beforePaymentCount = monthlyRaw
+    .prepare("SELECT COUNT(*) AS count FROM payments")
+    .get() as { count: number };
+  const beforeMonthlyCount = monthlyRaw
+    .prepare("SELECT COUNT(*) AS count FROM monthly_payments")
+    .get() as { count: number };
+  await hooks.buildMonthlyFeeReplyText(
+    monthlyEnv as any,
+    fixedNow,
+    async () => monthlyFeeSnapshot as any
+  );
+  const afterPaymentCount = monthlyRaw
+    .prepare("SELECT COUNT(*) AS count FROM payments")
+    .get() as { count: number };
+  const afterMonthlyCount = monthlyRaw
+    .prepare("SELECT COUNT(*) AS count FROM monthly_payments")
+    .get() as { count: number };
+  assert.equal(beforePaymentCount.count, afterPaymentCount.count);
+  assert.equal(beforeMonthlyCount.count, afterMonthlyCount.count);
+
   // 読み取り結果表示: notes(補足)は表示せず、確認が必要は維持
   const formattedWithoutNotes = hooks.formatStructuredResultForLine(
     "羽魂練習会",

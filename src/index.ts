@@ -23,6 +23,11 @@ const SOURCE_OPTIONS: Array<{ id: SourceId; label: string; data: string }> = [
 const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
 const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const CONTACT_RUI_COMMAND = "塁に連絡";
+const MONTHLY_FEE_COMMAND = "月謝";
+const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
+const REGULAR_FEE_MON_THU_YEN = 800;
+const REGULAR_FEE_TUE_YEN = 1250;
+const MONTHLY_SUPERVISION_FEE_YEN = 200;
 const SAME_GRADE_BOY_FULL_NAMES = ["村中佑史", "山田健太", "丹下洸", "中村詠太"] as const;
 const SAME_GRADE_BOY_SURNAME_MAP: Record<(typeof SAME_GRADE_BOY_FULL_NAMES)[number], string> = {
   村中佑史: "村中",
@@ -267,6 +272,16 @@ type ChouseisanSnapshot = {
     attend: string | null;
     kouho: number[] | null;
   }>;
+};
+
+type MonthlyFeeCalculationResult = {
+  targetMonth: string;
+  monThuCount: number;
+  tueCount: number;
+  monThuAmount: number;
+  tueAmount: number;
+  supervisionFee: number;
+  totalAmount: number;
 };
 
 type PracticeRow = {
@@ -3192,6 +3207,161 @@ function parseRuiContactCommand(inputText: string, nowMs: number): RuiContactCom
     dates: [ymd],
     labels: [formatYmdWithJapaneseWeekday(ymd)]
   };
+}
+
+function isMonthlyFeeCommand(inputText: string): boolean {
+  return inputText.trim() === MONTHLY_FEE_COMMAND;
+}
+
+function normalizeNameWithoutSpaces(name: string): string {
+  return name.replace(/[ \t\r\n　]+/g, "");
+}
+
+function isMonthlyFeeTargetRuiName(name: string): boolean {
+  const normalized = normalizeNameWithoutSpaces(name);
+  const withoutGradePrefix = normalized.replace(/^[0-9０-９一二三四五六七八九十]+年/u, "");
+  return withoutGradePrefix === "渡辺塁";
+}
+
+function formatYen(amount: number): string {
+  return `${amount.toLocaleString("ja-JP")}円`;
+}
+
+function calculateMonthlyFeeFromRegularSnapshot(
+  snapshot: ChouseisanSnapshot,
+  nowMs: number
+):
+  | { ok: true; value: MonthlyFeeCalculationResult }
+  | { ok: false; reason: "rui_not_found" | "rui_ambiguous" | "month_ambiguous" | "date_not_found" } {
+  const year = inferYearFromChouseisan(snapshot, nowMs);
+  const parsedChoices = snapshot.choices
+    .map((choice) => {
+      const ymd = parseChoiceDateToYmd(choice.choice, year);
+      return ymd ? { choice, ymd } : null;
+    })
+    .filter((item): item is { choice: { choice: string }; ymd: string } => item !== null);
+  if (parsedChoices.length === 0) {
+    return { ok: false, reason: "date_not_found" };
+  }
+  const yearMonthSet = new Set(parsedChoices.map((item) => item.ymd.slice(0, 7)));
+  if (yearMonthSet.size !== 1) {
+    return { ok: false, reason: "month_ambiguous" };
+  }
+  const ruiMembers = snapshot.members.filter((member) => isMonthlyFeeTargetRuiName(member.name));
+  if (ruiMembers.length === 0) {
+    return { ok: false, reason: "rui_not_found" };
+  }
+  if (ruiMembers.length > 1) {
+    return { ok: false, reason: "rui_ambiguous" };
+  }
+  const ruiMember = ruiMembers[0];
+  const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
+  let monThuCount = 0;
+  let tueCount = 0;
+  for (let i = 0; i < snapshot.choices.length; i += 1) {
+    const choice = snapshot.choices[i];
+    if (!choice) {
+      continue;
+    }
+    const practiceDate = parseChoiceDateToYmd(choice.choice, year);
+    if (!practiceDate) {
+      continue;
+    }
+    const parsedDate = parseYmdAsUtcDate(practiceDate);
+    if (!parsedDate) {
+      continue;
+    }
+    const weekday = parsedDate.getUTCDay();
+    if (weekday !== 1 && weekday !== 2 && weekday !== 4) {
+      continue;
+    }
+    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
+    if (status !== "circle") {
+      continue;
+    }
+    if (weekday === 2) {
+      tueCount += 1;
+    } else {
+      monThuCount += 1;
+    }
+  }
+  const monThuAmount = monThuCount * REGULAR_FEE_MON_THU_YEN;
+  const tueAmount = tueCount * REGULAR_FEE_TUE_YEN;
+  const totalAmount = monThuAmount + tueAmount + MONTHLY_SUPERVISION_FEE_YEN;
+  return {
+    ok: true,
+    value: {
+      targetMonth: [...yearMonthSet][0] ?? "",
+      monThuCount,
+      tueCount,
+      monThuAmount,
+      tueAmount,
+      supervisionFee: MONTHLY_SUPERVISION_FEE_YEN,
+      totalAmount
+    }
+  };
+}
+
+function formatMonthlyFeeMessage(result: MonthlyFeeCalculationResult): string {
+  return [
+    RUI_MONTHLY_FEE_DISPLAY_NAME,
+    "",
+    `月木　${result.monThuCount}回　${formatYen(result.monThuAmount)}`,
+    `火　　${result.tueCount}回　${formatYen(result.tueAmount)}`,
+    `見守り代　${formatYen(result.supervisionFee)}`,
+    "",
+    `計　${formatYen(result.totalAmount)}`
+  ].join("\n");
+}
+
+async function buildMonthlyFeeReplyText(
+  env: Env,
+  nowMs: number,
+  fetchSnapshot: (url: string) => Promise<ChouseisanSnapshot> = fetchChouseisanSnapshot
+): Promise<string> {
+  const regularUrl = await env.STATE.get(chouseisanUrlKey("regular"));
+  if (!regularUrl) {
+    return "通常練習用の調整さんが登録されていません。\n先に今月の調整さんURLを羽魂メモへ転送してください。";
+  }
+  let snapshot: ChouseisanSnapshot;
+  try {
+    snapshot = await fetchSnapshot(regularUrl);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "unknown";
+    console.error("monthly fee fetch failed", { reason });
+    return "調整さんを読み込めませんでした。\n時間をおいてもう一度「月謝」と送ってください。";
+  }
+  const calculated = calculateMonthlyFeeFromRegularSnapshot(snapshot, nowMs);
+  if (!calculated.ok) {
+    if (calculated.reason === "rui_not_found") {
+      return "渡辺塁の回答が調整さんで見つかりません。\n名前表記を確認してから、もう一度「月謝」と送ってください。";
+    }
+    if (calculated.reason === "rui_ambiguous") {
+      return "渡辺塁の回答候補が複数見つかりました。\n調整さん上の名前表記を整理してから、もう一度「月謝」と送ってください。";
+    }
+    if (calculated.reason === "month_ambiguous") {
+      return "通常練習用の調整さんに複数月の日程が含まれているため、月謝対象月を一意に決められません。\n対象月だけの調整さんURLへ更新してから、もう一度「月謝」と送ってください。";
+    }
+    return "調整さんの日程を読み取れませんでした。\n時間をおいてもう一度「月謝」と送ってください。";
+  }
+  return formatMonthlyFeeMessage(calculated.value);
+}
+
+async function handleMonthlyFeeCommand(event: LineWebhookEvent, env: Env): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const monthlyFeeText = await buildMonthlyFeeReplyText(env, event.timestamp ?? Date.now());
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: monthlyFeeText }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
 }
 
 async function getPracticeByDateAndSource(
@@ -6230,6 +6400,10 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     }
     return;
   }
+  if (isMonthlyFeeCommand(inputText)) {
+    await handleMonthlyFeeCommand(event, env);
+    return;
+  }
 
   if (MENU_TRIGGERS.has(inputText)) {
     console.log({ stage: "line_reply_start" });
@@ -6718,6 +6892,10 @@ export const TEST_HOOKS = {
   applyKnownPracticeFallbackForSparseMessage,
   reconcileDateResolutionUncertainty,
   parseChouseisanSyncCommand,
+  isMonthlyFeeCommand,
+  isMonthlyFeeTargetRuiName,
+  calculateMonthlyFeeFromRegularSnapshot,
+  buildMonthlyFeeReplyText,
   parseRuiContactCommand,
   buildRuiContactMessage,
   resolvePairedImageDataUrlForTextEvent,
