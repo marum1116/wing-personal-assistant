@@ -904,11 +904,7 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
       .map((item) => ({
         name: String(item.name),
         attend: typeof item.attend === "string" ? item.attend : null,
-        kouho: Array.isArray(item.kouho)
-          ? item.kouho
-              .map((v) => (typeof v === "number" ? v : Number.NaN))
-              .filter((v) => Number.isFinite(v))
-          : null
+        kouho: Array.isArray(item.kouho) ? normalizeKouhoValues(item.kouho) : null
       }))
   };
 }
@@ -1100,11 +1096,7 @@ function extractChouseisanMembersFromAssignmentObjectText(
       .map((item) => ({
         name: String(item.name),
         attend: typeof item.attend === "string" ? item.attend : null,
-        kouho: Array.isArray(item.kouho)
-          ? item.kouho
-              .map((v) => (typeof v === "number" ? v : Number.NaN))
-              .filter((v) => Number.isFinite(v))
-          : null
+        kouho: Array.isArray(item.kouho) ? normalizeKouhoValues(item.kouho) : null
       }));
   } catch {
     return [];
@@ -1295,17 +1287,7 @@ function parseAttendMarks(
   choiceCount: number
 ): number[] {
   if (member.kouho && member.kouho.length > 0) {
-    const normalizedKouho = member.kouho
-      .map((value) => {
-        if (typeof value === "number") {
-          return value;
-        }
-        if (typeof value === "string" && /^[0-9]+$/.test(value.trim())) {
-          return Number(value.trim());
-        }
-        return Number.NaN;
-      })
-      .filter((value) => Number.isFinite(value));
+    const normalizedKouho = normalizeKouhoValues(member.kouho);
     if (normalizedKouho.length > 0) {
       return normalizedKouho.slice(0, choiceCount);
     }
@@ -1318,6 +1300,20 @@ function parseAttendMarks(
     .map((value) => Number(value.trim()))
     .filter((value) => Number.isFinite(value))
     .slice(0, choiceCount);
+}
+
+function normalizeKouhoValues(values: unknown[]): number[] {
+  return values
+    .map((value) => {
+      if (typeof value === "number") {
+        return value;
+      }
+      if (typeof value === "string" && /^[0-9]+$/.test(value.trim())) {
+        return Number(value.trim());
+      }
+      return Number.NaN;
+    })
+    .filter((value) => Number.isFinite(value));
 }
 
 function ruiStatusFromAttendMark(mark: number): "circle" | "triangle" | "cross" | "unknown" {
@@ -3513,9 +3509,6 @@ function buildMonthlyFeeMemoText(summary: MonthlyFeeFinalizedSummary): string {
       }
       lines.push(`計　${formatYen(summary.totalAmount)}`);
     }
-  }
-  if (summary.unknownCount > 0) {
-    lines.push("", `確認：調整さんに未回答の日程が${summary.unknownCount}件あります。`);
   }
   return lines.join("\n");
 }
