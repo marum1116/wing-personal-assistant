@@ -5017,6 +5017,22 @@ function isConcreteText(value: string | null): value is string {
   return trimmed.length > 0 && trimmed !== "不明";
 }
 
+function normalizePayeeForComparison(value: string | null): string | null {
+  if (!isConcreteText(value)) {
+    return null;
+  }
+  let normalized = value
+    .trim()
+    .replace(/[ \t\r\n　]+/g, "")
+    .replace(/[()（）]/g, "");
+  normalized = normalized.replace(/(?:さん|様)$/u, "");
+  return normalized.length > 0 ? normalized : null;
+}
+
+function areEquivalentPayee(a: string | null, b: string | null): boolean {
+  return normalizePayeeForComparison(a) === normalizePayeeForComparison(b);
+}
+
 function isConcreteTransportType(value: TransportType): boolean {
   return value !== "不明";
 }
@@ -6390,9 +6406,10 @@ async function upsertMonthlyPaymentToD1(
       )
       .run();
   } else if (existing.status === "unpaid") {
+    const nextPayee = areEquivalentPayee(existing.payee, charge.payee) ? existing.payee : charge.payee;
     const changed =
       existing.amount !== charge.amount ||
-      existing.payee !== charge.payee ||
+      !areEquivalentPayee(existing.payee, charge.payee) ||
       existing.due_date !== charge.due_date ||
       existing.payment_method !== charge.payment_method ||
       existing.breakdown_text !== charge.breakdown_text;
@@ -6413,7 +6430,7 @@ async function upsertMonthlyPaymentToD1(
     )
       .bind(
         charge.amount,
-        charge.payee,
+        nextPayee,
         charge.due_date,
         charge.payment_method,
         charge.breakdown_text,
@@ -6426,7 +6443,7 @@ async function upsertMonthlyPaymentToD1(
   } else {
     const changed =
       existing.amount !== charge.amount ||
-      existing.payee !== charge.payee ||
+      !areEquivalentPayee(existing.payee, charge.payee) ||
       existing.due_date !== charge.due_date ||
       existing.payment_method !== charge.payment_method ||
       existing.breakdown_text !== charge.breakdown_text;

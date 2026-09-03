@@ -573,6 +573,57 @@ async function main() {
   assert.equal(paidAfterRevision.amount, 8100);
   assert.equal(paidAfterRevision.needs_review, 1);
 
+  // 表記ゆれ回帰: 支払先が吉村さん→（吉村）に揺れてもpaid後needs_reviewにしない
+  const { raw: monthlyRawVariant, env: monthlyEnvVariant } = createTestEnv();
+  await monthlyEnvVariant.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular");
+  const variantBaseRule = {
+    ...monthlyRule,
+    payee: "吉村さん"
+  };
+  globalThis.fetch = async () =>
+    new Response(`<!DOCTYPE html><html><head></head><body><script>window.Chouseisan = ${JSON.stringify({
+      event: {
+        ...monthlyFeeSnapshot.event,
+        members: monthlyFeeSnapshot.members
+      },
+      choices: monthlyFeeSnapshot.choices
+    })};</script></body></html>`, {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" }
+    });
+  const variantBase = await hooks.finalizeMonthlyFeeFromNotice(
+    monthlyEnvVariant as any,
+    "羽魂練習会",
+    new Date(fixedNow).toISOString(),
+    variantBaseRule as any,
+    fixedNow
+  );
+  assert.equal(variantBase.ok, true);
+  const variantPayment = monthlyRawVariant
+    .prepare(
+      "SELECT id, amount FROM monthly_payments WHERE billing_month='2026-09' AND monthly_type='regular_training_total' LIMIT 1"
+    )
+    .get() as { id: number; amount: number };
+  monthlyRawVariant.prepare("UPDATE monthly_payments SET status='paid' WHERE id=?1").run(variantPayment.id);
+  const variantRuleResent = {
+    ...monthlyRule,
+    payee: "（吉村）"
+  };
+  const variantResent = await hooks.finalizeMonthlyFeeFromNotice(
+    monthlyEnvVariant as any,
+    "羽魂練習会",
+    new Date(fixedNow + 3000).toISOString(),
+    variantRuleResent as any,
+    fixedNow
+  );
+  globalThis.fetch = originalFetch;
+  assert.equal(variantResent.ok, true);
+  const variantPaymentAfter = monthlyRawVariant
+    .prepare("SELECT status, needs_review FROM monthly_payments WHERE id=?1")
+    .get(variantPayment.id) as { status: string; needs_review: number };
+  assert.equal(variantPaymentAfter.status, "paid");
+  assert.equal(variantPaymentAfter.needs_review, 0);
+
   // ○が0件ならノート記入不要
   const zeroCircleRule = {
     ...monthlyRule,
