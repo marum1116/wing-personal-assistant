@@ -6459,6 +6459,18 @@ async function upsertMonthlyPaymentToD1(
       )
         .bind(sourceLabel, now, existing.id)
         .run();
+    } else if (existing.needs_review === 1 && existing.review_reason === "支払済み後に請求内容が変更されています") {
+      // 同等内容に戻った場合は、月次請求差分の確認待ちを自動解除する。
+      await db.prepare(
+        `UPDATE monthly_payments
+         SET needs_review = 0,
+             review_reason = NULL,
+             source = ?1,
+             updated_at = ?2
+         WHERE id = ?3`
+      )
+        .bind(sourceLabel, now, existing.id)
+        .run();
     }
   }
 

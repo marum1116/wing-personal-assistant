@@ -616,13 +616,31 @@ async function main() {
     variantRuleResent as any,
     fixedNow
   );
-  globalThis.fetch = originalFetch;
   assert.equal(variantResent.ok, true);
   const variantPaymentAfter = monthlyRawVariant
     .prepare("SELECT status, needs_review FROM monthly_payments WHERE id=?1")
     .get(variantPayment.id) as { status: string; needs_review: number };
   assert.equal(variantPaymentAfter.status, "paid");
   assert.equal(variantPaymentAfter.needs_review, 0);
+
+  // 表記ゆれ是正: 既に誤ってneeds_review=1になっているpaid行は、同等内容再送で解除
+  monthlyRawVariant
+    .prepare("UPDATE monthly_payments SET needs_review=1, review_reason='支払済み後に請求内容が変更されています' WHERE id=?1")
+    .run(variantPayment.id);
+  const variantResentAgain = await hooks.finalizeMonthlyFeeFromNotice(
+    monthlyEnvVariant as any,
+    "羽魂練習会",
+    new Date(fixedNow + 4000).toISOString(),
+    variantRuleResent as any,
+    fixedNow
+  );
+  globalThis.fetch = originalFetch;
+  assert.equal(variantResentAgain.ok, true);
+  const variantCleared = monthlyRawVariant
+    .prepare("SELECT needs_review, review_reason FROM monthly_payments WHERE id=?1")
+    .get(variantPayment.id) as { needs_review: number; review_reason: string | null };
+  assert.equal(variantCleared.needs_review, 0);
+  assert.equal(variantCleared.review_reason, null);
 
   // ○が0件ならノート記入不要
   const zeroCircleRule = {
