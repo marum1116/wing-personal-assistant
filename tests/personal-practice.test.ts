@@ -161,6 +161,51 @@ function createTestEnv() {
       updated_at TEXT NOT NULL,
       UNIQUE (billing_month, monthly_type)
     );
+
+    CREATE TABLE IF NOT EXISTS monthly_fee_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      year_month TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      payment_date TEXT NOT NULL,
+      payee TEXT,
+      payment_method TEXT,
+      note_guidance TEXT,
+      source TEXT NOT NULL,
+      received_at TEXT NOT NULL,
+      note_reminder_sent_on TEXT,
+      note_recorded_at TEXT,
+      circle_count INTEGER NOT NULL DEFAULT 0,
+      triangle_count INTEGER NOT NULL DEFAULT 0,
+      cross_count INTEGER NOT NULL DEFAULT 0,
+      unknown_count INTEGER NOT NULL DEFAULT 0,
+      total_amount INTEGER NOT NULL DEFAULT 0,
+      note_required INTEGER NOT NULL DEFAULT 0,
+      memo_text TEXT NOT NULL,
+      payment_reminder_text TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS monthly_fee_weekday_rates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id INTEGER NOT NULL,
+      weekday_code TEXT NOT NULL,
+      unit_price INTEGER NOT NULL,
+      group_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS monthly_fee_extra_charges (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id INTEGER NOT NULL,
+      item_name TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      item_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   return {
@@ -179,6 +224,7 @@ function baseResult(overrides: Record<string, unknown>) {
     practice_type_basis: "unknown",
     practice_type_evidence: null,
     monthly_charges: [],
+    monthly_fee_rule: null,
     practice_date: "2026-08-01",
     attendance: "参加",
     outbound_transport: { type: "不明", person: null },
@@ -286,7 +332,7 @@ async function main() {
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺花子"), false);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺瑠衣"), false);
 
-  // 月謝コマンド: 月木5回(4000円)・火3回(3750円)・見守り200円・計7950円
+  // 月謝計算: 日曜通常を含める（9月ルール: 月木日700 / 火1250）
   const monthlyFeeSnapshot = {
     event: {
       id: "regular-2026-09",
@@ -298,7 +344,7 @@ async function main() {
       { choice: "9/7(月) 19:00〜" }, // 月 ○
       { choice: "9/8(火) 19:00〜" }, // 火 ○
       { choice: "9/10(木) 19:00〜" }, // 木 ○
-      { choice: "9/13(日) 18:00〜" }, // 日 ○ (除外)
+      { choice: "9/13(日) 18:00〜" }, // 日 ○ (含める)
       { choice: "9/14(月) 19:00〜" }, // 月 ○
       { choice: "9/15(火) 19:00〜" }, // 火 ○
       { choice: "9/17(木) 19:00〜" }, // 木 △ (除外)
@@ -307,111 +353,235 @@ async function main() {
       { choice: "9/22(火) 19:00〜" }, // 火 ○
       { choice: "9/24(木) 19:00〜" }, // 木 ○
       { choice: "9/25(金) 19:00〜" }, // 金 ○ (除外)
-      { choice: "9/29(火) 19:00〜" } // 火 × (除外)
+      { choice: "9/29(火) 19:00〜" }, // 火 × (除外)
+      { choice: "9/30(水) 19:00〜" } // 水 未回答 (除外)
     ],
     members: [
       {
         name: "1年 渡辺　塁",
-        attend: "1,1,1,1,1,1,2,1,1,1,1,1,3",
+        attend: "1,1,1,1,1,1,2,3,1,1,1,3,3",
         kouho: null
       },
       {
         name: "1年 中村詠太",
-        attend: "1,1,1,1,1,1,1,1,1,1,1,1,1",
+        attend: "1,1,1,1,1,1,1,1,1,1,1,1,1,1",
         kouho: null
       }
     ]
   };
-  const monthlyFeeCalculated = hooks.calculateMonthlyFeeFromRegularSnapshot(monthlyFeeSnapshot as any, fixedNow);
+  const monthlyRule = {
+    is_monthly_fee_notice: true,
+    target_month: "2026-09",
+    weekday_rate_groups: [
+      { unit_price: 700, weekdays: ["mon", "thu", "sun"] },
+      { unit_price: 1250, weekdays: ["tue"] }
+    ],
+    extra_charges: [],
+    payment_date: "2026-09-05",
+    payment_method: "PayPay",
+    payee: "吉村さん",
+    note_guidance: null
+  };
+  const monthlyFeeCalculated = hooks.calculateMonthlyFeeFromRegularSnapshot(
+    monthlyFeeSnapshot as any,
+    "2026-09",
+    monthlyRule as any,
+    fixedNow
+  );
   assert.equal(monthlyFeeCalculated.ok, true);
   if (!monthlyFeeCalculated.ok) {
     throw new Error("monthly fee calculation must be successful");
   }
-  assert.equal(monthlyFeeCalculated.value.monThuCount, 5);
-  assert.equal(monthlyFeeCalculated.value.tueCount, 3);
-  assert.equal(monthlyFeeCalculated.value.monThuAmount, 4000);
-  assert.equal(monthlyFeeCalculated.value.tueAmount, 3750);
-  assert.equal(monthlyFeeCalculated.value.supervisionFee, 200);
+  assert.equal(monthlyFeeCalculated.value.circleCount, 9);
+  assert.equal(monthlyFeeCalculated.value.triangleCount, 1);
+  assert.equal(monthlyFeeCalculated.value.crossCount, 3);
+  assert.equal(monthlyFeeCalculated.value.unknownCount, 1);
   assert.equal(monthlyFeeCalculated.value.totalAmount, 7950);
+  assert.equal(monthlyFeeCalculated.value.noteRequired, true);
+  assert.match(monthlyFeeCalculated.value.memoText, /月木日　6回　4,200円/);
+  assert.match(monthlyFeeCalculated.value.memoText, /火曜　3回　3,750円/);
+  assert.equal(monthlyFeeCalculated.value.memoText.includes("火曜以外"), false);
 
   const { raw: monthlyRaw, env: monthlyEnv } = createTestEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(`<!DOCTYPE html><html><head></head><body><script>window.Chouseisan = ${JSON.stringify({
+      event: {
+        ...monthlyFeeSnapshot.event,
+        members: monthlyFeeSnapshot.members
+      },
+      choices: monthlyFeeSnapshot.choices
+    })};</script></body></html>`, {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" }
+    });
   await monthlyEnv.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular");
-  await monthlyEnv.STATE.put("chouseisan_url:personal", "https://chouseisan.com/s?h=personal");
-  const monthlyFeeText = await hooks.buildMonthlyFeeReplyText(
+  const finalizeResult = await hooks.finalizeMonthlyFeeFromNotice(
     monthlyEnv as any,
-    fixedNow,
-    async (url: string) => {
-      assert.equal(url, "https://chouseisan.com/s?h=regular");
-      return monthlyFeeSnapshot as any;
-    }
+    "羽魂練習会",
+    new Date(fixedNow).toISOString(),
+    monthlyRule as any,
+    fixedNow
   );
+  globalThis.fetch = originalFetch;
+  assert.equal(finalizeResult.ok, true);
+  if (!finalizeResult.ok) {
+    throw new Error(finalizeResult.replyText);
+  }
+  assert.match(finalizeResult.replyText, /9月の月謝案内を登録しました/);
+  assert.match(finalizeResult.replyText, /月木日　6回　4,200円/);
+  assert.match(finalizeResult.replyText, /火曜　3回　3,750円/);
+  assert.ok(!finalizeResult.replyText.includes("見守り代　0円"));
+
+  const sepNow = Date.UTC(2026, 8, 3, 3, 0, 0);
+  const monthlyFeeText = await hooks.buildMonthlyFeeReplyText(monthlyEnv as any, sepNow);
   assert.match(monthlyFeeText, /^わたなべ るい/m);
-  assert.match(monthlyFeeText, /月木　5回　4,000円/);
-  assert.match(monthlyFeeText, /火　　3回　3,750円/);
-  assert.match(monthlyFeeText, /見守り代　200円/);
+  assert.match(monthlyFeeText, /月木日　6回　4,200円/);
+  assert.match(monthlyFeeText, /火曜　3回　3,750円/);
   assert.match(monthlyFeeText, /計　7,950円/);
 
-  // 月謝コマンド: URL未登録時は0円計算しない
+  // 月謝コマンド: 当月案内未登録時は0円推測しない
   const { env: monthlyNoUrlEnv } = createTestEnv();
-  const monthlyNoUrlText = await hooks.buildMonthlyFeeReplyText(monthlyNoUrlEnv as any, fixedNow, async () => {
-    throw new Error("must not fetch without url");
-  });
-  assert.match(monthlyNoUrlText, /通常練習用の調整さんが登録されていません/);
+  const monthlyNoRuleText = await hooks.buildMonthlyFeeReplyText(monthlyNoUrlEnv as any, fixedNow);
+  assert.match(monthlyNoRuleText, /今月の月謝案内がまだ登録されていません/);
 
-  // 月謝コマンド: fetch失敗時は0円計算しない
-  const { env: monthlyFetchFailEnv } = createTestEnv();
-  await monthlyFetchFailEnv.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular");
-  const monthlyFetchFailText = await hooks.buildMonthlyFeeReplyText(monthlyFetchFailEnv as any, fixedNow, async () => {
-    throw new Error("network failed");
-  });
-  assert.match(monthlyFetchFailText, /調整さんを読み込めませんでした/);
+  // 月謝案内: 追加費用なしで見守り代0円を出さない
+  const noExtraRule = monthlyRaw
+    .prepare("SELECT memo_text FROM monthly_fee_rules WHERE year_month='2026-09' AND is_active=1 LIMIT 1")
+    .get() as { memo_text: string };
+  assert.ok(!noExtraRule.memo_text.includes("見守り代　0円"));
 
-  // 月謝コマンド: 渡辺塁の回答行がない場合は0円計算しない
-  const monthlyNoRuiText = await hooks.buildMonthlyFeeReplyText(
-    monthlyFetchFailEnv as any,
-    fixedNow,
-    async () =>
-      ({
-        event: { id: "x", name: "x", detail: null, upd_datetime: "2026-08-30T10:00:00.000Z" },
-        choices: [{ choice: "9/7(月) 19:00〜" }],
-        members: [{ name: "中村詠太", attend: "1", kouho: null }]
-      }) as any
-  );
-  assert.match(monthlyNoRuiText, /渡辺塁の回答が調整さんで見つかりません/);
-
-  // 月謝コマンド: 複数月混在時は合算しない
-  const monthlyMultiMonthText = await hooks.buildMonthlyFeeReplyText(
-    monthlyFetchFailEnv as any,
-    fixedNow,
-    async () =>
-      ({
-        event: { id: "x", name: "x", detail: null, upd_datetime: "2026-08-30T10:00:00.000Z" },
-        choices: [{ choice: "9/7(月) 19:00〜" }, { choice: "10/1(木) 19:00〜" }],
-        members: [{ name: "渡辺塁", attend: "1,1", kouho: null }]
-      }) as any
-  );
-  assert.match(monthlyMultiMonthText, /複数月の日程が含まれているため、月謝対象月を一意に決められません/);
-
-  // 月謝コマンド: DB副作用なし（payments/monthly_paymentsを作成しない）
-  const beforePaymentCount = monthlyRaw
-    .prepare("SELECT COUNT(*) AS count FROM payments")
-    .get() as { count: number };
-  const beforeMonthlyCount = monthlyRaw
-    .prepare("SELECT COUNT(*) AS count FROM monthly_payments")
-    .get() as { count: number };
-  await hooks.buildMonthlyFeeReplyText(
+  // 月謝案内: 8月案内で見守り代200を追加費用として保存
+  const augustRule = {
+    is_monthly_fee_notice: true,
+    target_month: "2026-08",
+    weekday_rate_groups: [
+      { unit_price: 800, weekdays: ["mon", "thu", "sun"] },
+      { unit_price: 1250, weekdays: ["tue"] }
+    ],
+    extra_charges: [{ name: "見守り代", amount: 200 }],
+    payment_date: "2026-08-05",
+    payment_method: "PayPay",
+    payee: "会計",
+    note_guidance: null
+  };
+  globalThis.fetch = async () =>
+    new Response(`<!DOCTYPE html><html><head></head><body><script>window.Chouseisan = ${JSON.stringify({
+      event: {
+        id: "regular-2026-08",
+        name: "8月通常練習",
+        upd_datetime: "2026-07-31T00:00:00.000Z",
+        members: [{ name: "渡辺塁", attend: "1,1,1,1", kouho: null }]
+      },
+      choices: [
+        { choice: "8/3(月) 19:00〜" },
+        { choice: "8/4(火) 19:00〜" },
+        { choice: "8/6(木) 19:00〜" },
+        { choice: "8/9(日) 18:00〜" }
+      ]
+    })};</script></body></html>`, {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" }
+    });
+  await monthlyEnv.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular-8");
+  const augustResult = await hooks.finalizeMonthlyFeeFromNotice(
     monthlyEnv as any,
-    fixedNow,
-    async () => monthlyFeeSnapshot as any
+    "羽魂練習会",
+    new Date(fixedNow).toISOString(),
+    augustRule as any,
+    fixedNow
   );
-  const afterPaymentCount = monthlyRaw
-    .prepare("SELECT COUNT(*) AS count FROM payments")
-    .get() as { count: number };
-  const afterMonthlyCount = monthlyRaw
-    .prepare("SELECT COUNT(*) AS count FROM monthly_payments")
-    .get() as { count: number };
-  assert.equal(beforePaymentCount.count, afterPaymentCount.count);
-  assert.equal(beforeMonthlyCount.count, afterMonthlyCount.count);
+  globalThis.fetch = originalFetch;
+  assert.equal(augustResult.ok, true, augustResult.replyText);
+  const augustMemo = monthlyRaw
+    .prepare("SELECT memo_text FROM monthly_fee_rules WHERE year_month='2026-08' AND is_active=1 LIMIT 1")
+    .get() as { memo_text: string };
+  assert.match(augustMemo.memo_text, /見守り代　200円/);
+
+  // 月謝案内再送: 同月payment重複なし、未払いなら再確定、paid後訂正はneeds_review
+  const firstSeptPayment = monthlyRaw
+    .prepare(
+      "SELECT id, amount, status FROM monthly_payments WHERE billing_month='2026-09' AND monthly_type='regular_training_total' LIMIT 1"
+    )
+    .get() as { id: number; amount: number; status: string };
+  assert.equal(firstSeptPayment.status, "unpaid");
+  const revisedSeptRule = {
+    ...monthlyRule,
+    weekday_rate_groups: [
+      { unit_price: 700, weekdays: ["mon", "thu", "sun"] },
+      { unit_price: 1300, weekdays: ["tue"] }
+    ]
+  };
+  globalThis.fetch = async () =>
+    new Response(`<!DOCTYPE html><html><head></head><body><script>window.Chouseisan = ${JSON.stringify({
+      event: {
+        ...monthlyFeeSnapshot.event,
+        members: monthlyFeeSnapshot.members
+      },
+      choices: monthlyFeeSnapshot.choices
+    })};</script></body></html>`, {
+      status: 200,
+      headers: { "content-type": "text/html; charset=utf-8" }
+    });
+  const revisedUnpaid = await hooks.finalizeMonthlyFeeFromNotice(
+    monthlyEnv as any,
+    "羽魂練習会",
+    new Date(fixedNow + 1000).toISOString(),
+    revisedSeptRule as any,
+    fixedNow
+  );
+  assert.equal(revisedUnpaid.ok, true);
+  const revisedSeptPayment = monthlyRaw
+    .prepare(
+      "SELECT id, amount, status FROM monthly_payments WHERE billing_month='2026-09' AND monthly_type='regular_training_total' LIMIT 1"
+    )
+    .get() as { id: number; amount: number; status: string };
+  assert.equal(revisedSeptPayment.id, firstSeptPayment.id);
+  assert.equal(revisedSeptPayment.amount, 8100);
+
+  monthlyRaw.prepare("UPDATE monthly_payments SET status='paid' WHERE id=?1").run(revisedSeptPayment.id);
+  const revisedPaid = await hooks.finalizeMonthlyFeeFromNotice(
+    monthlyEnv as any,
+    "羽魂練習会",
+    new Date(fixedNow + 2000).toISOString(),
+    monthlyRule as any,
+    fixedNow
+  );
+  globalThis.fetch = originalFetch;
+  assert.equal(revisedPaid.ok, true);
+  const paidAfterRevision = monthlyRaw
+    .prepare("SELECT amount, status, needs_review FROM monthly_payments WHERE id=?1")
+    .get(revisedSeptPayment.id) as { amount: number; status: string; needs_review: number };
+  assert.equal(paidAfterRevision.status, "paid");
+  assert.equal(paidAfterRevision.amount, 8100);
+  assert.equal(paidAfterRevision.needs_review, 1);
+
+  // ○が0件ならノート記入不要
+  const zeroCircleRule = {
+    ...monthlyRule,
+    target_month: "2026-10",
+    payment_date: "2026-10-05"
+  };
+  const zeroCircleSnapshot = {
+    event: {
+      id: "reg-2026-10",
+      name: "10月通常練習",
+      detail: null,
+      upd_datetime: "2026-09-30T00:00:00.000Z"
+    },
+    choices: [{ choice: "10/1(木) 19:00〜" }, { choice: "10/4(日) 18:00〜" }],
+    members: [{ name: "渡辺塁", attend: "2,3", kouho: null }]
+  };
+  const zeroCalc = hooks.calculateMonthlyFeeFromRegularSnapshot(
+    zeroCircleSnapshot as any,
+    "2026-10",
+    zeroCircleRule as any,
+    fixedNow
+  );
+  assert.equal(zeroCalc.ok, true);
+  if (!zeroCalc.ok) throw new Error("zero circle calc failed");
+  assert.equal(zeroCalc.value.noteRequired, false);
+  assert.match(zeroCalc.value.memoText, /LINEノートへの記入は不要です/);
 
   // 読み取り結果表示: notes(補足)は表示せず、確認が必要は維持
   const formattedWithoutNotes = hooks.formatStructuredResultForLine(
@@ -2609,6 +2779,50 @@ async function main() {
   assert.ok(reminderEvents.some((row: any) => row.practice_date === "2026-09-04"));
   assert.ok(reminderEvents.some((row: any) => row.due_date === "2026-09-05"));
   assert.equal(reminderMonthly.length, 1);
+
+  // 月謝系: 2日前8:00ノートリマインド抽出（○ありのみ）
+  raw.prepare(
+    `INSERT INTO monthly_fee_rules (
+      year_month, version, is_active, payment_date, payee, payment_method, note_guidance, source, received_at,
+      note_reminder_sent_on, note_recorded_at, circle_count, triangle_count, cross_count, unknown_count,
+      total_amount, note_required, memo_text, payment_reminder_text, created_at, updated_at
+    ) VALUES (
+      '2026-09', 1, 1, '2026-09-05', '吉村さん', 'PayPay', NULL, '羽魂練習会', datetime('now'),
+      NULL, NULL, 3, 1, 0, 0, 4500, 1, 'わたなべ るい\n\n月木日　3回　2,100円\n火曜　1回　1,250円\n\n計　3,350円',
+      '9月の月謝　3,350円\nPayPay → 吉村さん', datetime('now'), datetime('now')
+    )`
+  ).run();
+  raw.prepare(
+    `INSERT INTO monthly_fee_rules (
+      year_month, version, is_active, payment_date, payee, payment_method, note_guidance, source, received_at,
+      note_reminder_sent_on, note_recorded_at, circle_count, triangle_count, cross_count, unknown_count,
+      total_amount, note_required, memo_text, payment_reminder_text, created_at, updated_at
+    ) VALUES (
+      '2026-10', 1, 1, '2026-10-05', '吉村さん', 'PayPay', NULL, '羽魂練習会', datetime('now'),
+      NULL, NULL, 0, 2, 1, 0, 0, 0, 'わたなべ るい\n\n今月は月謝対象の参加予定（○）がありません。\nLINEノートへの記入は不要です。',
+      '10月の月謝　0円', datetime('now'), datetime('now')
+    )`
+  ).run();
+  const noteTargets = await hooks.getMonthlyFeeNoteReminderTargets(env.DB as any, "2026-09-03");
+  assert.equal(noteTargets.length, 1);
+  assert.equal(noteTargets[0].year_month, "2026-09");
+
+  // 月謝系: note button冪等
+  const noteMarked = await hooks.markMonthlyFeeNoteRecorded(env.DB as any, "2026-09");
+  assert.equal(noteMarked, "updated");
+  const noteMarkedAgain = await hooks.markMonthlyFeeNoteRecorded(env.DB as any, "2026-09");
+  assert.equal(noteMarkedAgain, "already_recorded");
+
+  // 月謝系: 支払日8:00リマインド抽出、paid後抑止
+  raw.prepare(
+    "INSERT INTO monthly_payments (billing_month,monthly_type,amount,payee,due_date,payment_method,breakdown_text,status,source,created_at,updated_at) VALUES ('2026-09','regular_training_total',3350,'吉村さん','2026-09-05','PayPay','memo', 'unpaid','羽魂練習会',datetime('now'),datetime('now'))"
+  ).run();
+  const monthlyFeePayTargets = await hooks.getMonthlyFeePaymentReminderTargets(env.DB as any, "2026-09-05");
+  assert.equal(monthlyFeePayTargets.length, 1);
+  const paidResult = await hooks.markMonthlyPaymentPaid(env.DB as any, monthlyFeePayTargets[0].payment_id);
+  assert.equal(paidResult.outcome, "updated");
+  const monthlyFeePayTargetsAfterPaid = await hooks.getMonthlyFeePaymentReminderTargets(env.DB as any, "2026-09-05");
+  assert.equal(monthlyFeePayTargetsAfterPaid.length, 0);
 
   console.log("personal-practice test: all cases passed");
 }

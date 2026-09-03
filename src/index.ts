@@ -25,9 +25,8 @@ const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const CONTACT_RUI_COMMAND = "塁に連絡";
 const MONTHLY_FEE_COMMAND = "月謝";
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
-const REGULAR_FEE_MON_THU_YEN = 800;
-const REGULAR_FEE_TUE_YEN = 1250;
-const MONTHLY_SUPERVISION_FEE_YEN = 200;
+const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
+const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
 const SAME_GRADE_BOY_FULL_NAMES = ["村中佑史", "山田健太", "丹下洸", "中村詠太"] as const;
 const SAME_GRADE_BOY_SURNAME_MAP: Record<(typeof SAME_GRADE_BOY_FULL_NAMES)[number], string> = {
   村中佑史: "村中",
@@ -109,6 +108,7 @@ type PracticeTypeExtractionBasis = "explicit" | "inferred" | "unknown";
 type MonthlyType = "regular_training_total" | "shimura_car_fee";
 type PaymentMethod = "PayPay" | "現金" | "楽天Pay" | "その他" | "不明";
 type SameGradeBoyFullName = (typeof SAME_GRADE_BOY_FULL_NAMES)[number];
+type WeekdayCode = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
 
 type ParsedTransport = {
   type: TransportType;
@@ -131,6 +131,49 @@ type MonthlyCharge = {
   due_date: string | null;
   payment_method: PaymentMethod;
   breakdown_text: string | null;
+};
+
+type MonthlyFeeRuleExtraction = {
+  is_monthly_fee_notice: boolean;
+  target_month: string | null;
+  weekday_rate_groups: Array<{
+    unit_price: number;
+    weekdays: WeekdayCode[];
+  }>;
+  extra_charges: Array<{
+    name: string;
+    amount: number;
+  }>;
+  payment_date: string | null;
+  payment_method: PaymentMethod | null;
+  payee: string | null;
+  note_guidance: string | null;
+};
+
+type MonthlyFeeWeekdayLine = {
+  weekdays: WeekdayCode[];
+  count: number;
+  amount: number;
+  unitPrice: number;
+};
+
+type MonthlyFeeFixedExtraLine = {
+  name: string;
+  amount: number;
+};
+
+type MonthlyFeeFinalizedSummary = {
+  targetMonth: string;
+  weekdayLines: MonthlyFeeWeekdayLine[];
+  extraLines: MonthlyFeeFixedExtraLine[];
+  circleCount: number;
+  triangleCount: number;
+  crossCount: number;
+  unknownCount: number;
+  noteRequired: boolean;
+  totalAmount: number;
+  memoText: string;
+  paymentReminderText: string;
 };
 
 type BillingScope = "event" | "monthly" | "other";
@@ -274,16 +317,6 @@ type ChouseisanSnapshot = {
   }>;
 };
 
-type MonthlyFeeCalculationResult = {
-  targetMonth: string;
-  monThuCount: number;
-  tueCount: number;
-  monThuAmount: number;
-  tueAmount: number;
-  supervisionFee: number;
-  totalAmount: number;
-};
-
 type PracticeRow = {
   practice_date: string;
   attendance: Attendance;
@@ -354,6 +387,7 @@ type StructuredLineResult = {
   practice_type_basis: PracticeTypeExtractionBasis;
   practice_type_evidence: string | null;
   monthly_charges: MonthlyCharge[];
+  monthly_fee_rule: MonthlyFeeRuleExtraction | null;
   practice_date: string | null;
   attendance: Attendance;
   outbound_transport: ParsedTransport;
@@ -420,6 +454,55 @@ const STRUCTURED_OUTPUT_SCHEMA = {
         ]
       }
     },
+    monthly_fee_rule: {
+      type: ["object", "null"],
+      additionalProperties: false,
+      properties: {
+        is_monthly_fee_notice: { type: "boolean" },
+        target_month: { type: ["string", "null"] },
+        weekday_rate_groups: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              unit_price: { type: "number" },
+              weekdays: {
+                type: "array",
+                items: { type: "string", enum: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] }
+              }
+            },
+            required: ["unit_price", "weekdays"]
+          }
+        },
+        extra_charges: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              name: { type: "string" },
+              amount: { type: "number" }
+            },
+            required: ["name", "amount"]
+          }
+        },
+        payment_date: { type: ["string", "null"] },
+        payment_method: { type: ["string", "null"], enum: ["PayPay", "現金", "楽天Pay", "その他", "不明", null] },
+        payee: { type: ["string", "null"] },
+        note_guidance: { type: ["string", "null"] }
+      },
+      required: [
+        "is_monthly_fee_notice",
+        "target_month",
+        "weekday_rate_groups",
+        "extra_charges",
+        "payment_date",
+        "payment_method",
+        "payee",
+        "note_guidance"
+      ]
+    },
     practice_date: { type: ["string", "null"] },
     attendance: { type: "string", enum: ["参加", "不参加", "不明"] },
     outbound_transport: {
@@ -481,6 +564,7 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     "practice_type_basis",
     "practice_type_evidence",
     "monthly_charges",
+    "monthly_fee_rule",
     "practice_date",
     "attendance",
     "outbound_transport",
@@ -2847,6 +2931,22 @@ function buildMarkPaidQuickReplyItems(
   }));
 }
 
+function buildMonthlyNoteDoneQuickReply(month: string): LineReplyMessage["quickReply"] {
+  return {
+    items: [
+      {
+        type: "action",
+        action: {
+          type: "postback",
+          label: "LINEノート記入",
+          data: `action=${MONTHLY_FEE_MARK_NOTE_DONE_ACTION}&month=${month}`,
+          displayText: "LINEノート記入"
+        }
+      }
+    ]
+  };
+}
+
 function formatReminderMessage(payments: UnifiedUnpaidItem[]): LineReplyMessage {
   const displayed = payments.slice(0, MAX_REMINDER_DISPLAY_COUNT);
   const lines: string[] = ["お支払いリマインド", "", "今日お支払い予定のものがあります。", ""];
@@ -3260,12 +3360,178 @@ function formatYen(amount: number): string {
   return `${amount.toLocaleString("ja-JP")}円`;
 }
 
+const WEEKDAY_CODES_IN_ORDER: WeekdayCode[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const WEEKDAY_CODE_TO_UTC_DAY: Record<WeekdayCode, number> = {
+  mon: 1,
+  tue: 2,
+  wed: 3,
+  thu: 4,
+  fri: 5,
+  sat: 6,
+  sun: 0
+};
+const UTC_DAY_TO_WEEKDAY_CODE: Record<number, WeekdayCode> = {
+  0: "sun",
+  1: "mon",
+  2: "tue",
+  3: "wed",
+  4: "thu",
+  5: "fri",
+  6: "sat"
+};
+const WEEKDAY_CODE_TO_LABEL: Record<WeekdayCode, string> = {
+  mon: "月",
+  tue: "火",
+  wed: "水",
+  thu: "木",
+  fri: "金",
+  sat: "土",
+  sun: "日"
+};
+
+function formatWeekdayGroupLabel(weekdays: WeekdayCode[]): string {
+  if (weekdays.length === 0) {
+    return "";
+  }
+  const ordered = WEEKDAY_CODES_IN_ORDER.filter((code) => weekdays.includes(code));
+  if (ordered.length === 1) {
+    return `${WEEKDAY_CODE_TO_LABEL[ordered[0]]}曜`;
+  }
+  return ordered.map((code) => WEEKDAY_CODE_TO_LABEL[code]).join("");
+}
+
+function isValidYearMonth(value: string | null): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}$/.test(value);
+}
+
+function isValidYmd(value: string | null): value is string {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && parseYmdAsUtcDate(value) !== null;
+}
+
+function isKnownPaymentMethod(value: string | null): value is PaymentMethod | null {
+  if (value === null) return true;
+  return value === "PayPay" || value === "現金" || value === "楽天Pay" || value === "その他" || value === "不明";
+}
+
+function normalizeMonthlyFeeRuleExtraction(
+  rule: MonthlyFeeRuleExtraction | null
+):
+  | { ok: true; value: MonthlyFeeRuleExtraction }
+  | { ok: false; reason: string } {
+  if (!rule || !rule.is_monthly_fee_notice) {
+    return { ok: false, reason: "月謝案内として認識できませんでした。" };
+  }
+  if (!isValidYearMonth(rule.target_month)) {
+    return { ok: false, reason: "対象年月を特定できませんでした。" };
+  }
+  if (!isValidYmd(rule.payment_date)) {
+    return { ok: false, reason: "支払日を特定できませんでした。" };
+  }
+  if (!isKnownPaymentMethod(rule.payment_method)) {
+    return { ok: false, reason: "支払方法の抽出結果が不正です。" };
+  }
+  if (!Array.isArray(rule.weekday_rate_groups) || rule.weekday_rate_groups.length === 0) {
+    return { ok: false, reason: "曜日ごとの参加費を特定できませんでした。" };
+  }
+
+  const seenWeekdays = new Map<WeekdayCode, number>();
+  for (const group of rule.weekday_rate_groups) {
+    if (!Number.isFinite(group.unit_price) || group.unit_price <= 0) {
+      return { ok: false, reason: "曜日単価の抽出に失敗しました。" };
+    }
+    if (!Array.isArray(group.weekdays) || group.weekdays.length === 0) {
+      return { ok: false, reason: "曜日グループが空です。" };
+    }
+    for (const weekday of group.weekdays) {
+      if (!WEEKDAY_CODES_IN_ORDER.includes(weekday)) {
+        return { ok: false, reason: "曜日コードが不正です。" };
+      }
+      const existing = seenWeekdays.get(weekday);
+      if (typeof existing === "number" && existing !== group.unit_price) {
+        return { ok: false, reason: `同じ曜日に矛盾する料金があります（${WEEKDAY_CODE_TO_LABEL[weekday]}）。` };
+      }
+      seenWeekdays.set(weekday, group.unit_price);
+    }
+  }
+  if (seenWeekdays.size === 0) {
+    return { ok: false, reason: "曜日単価が空です。" };
+  }
+
+  for (const extra of rule.extra_charges) {
+    if (!isConcreteText(extra.name)) {
+      return { ok: false, reason: "追加費用の項目名が不正です。" };
+    }
+    if (!Number.isFinite(extra.amount) || extra.amount <= 0) {
+      return { ok: false, reason: `追加費用「${extra.name}」の金額が不正です。` };
+    }
+  }
+
+  return { ok: true, value: rule };
+}
+
+function normalizeRuleWeekdayOrder(weekdays: WeekdayCode[]): WeekdayCode[] {
+  return WEEKDAY_CODES_IN_ORDER.filter((code) => weekdays.includes(code));
+}
+
+function parseAttendStatusForMonthlyFee(mark: number): "circle" | "triangle" | "cross" | "unknown" {
+  return ruiStatusFromAttendMark(mark);
+}
+
+function buildMonthlyFeeMemoText(summary: MonthlyFeeFinalizedSummary): string {
+  const lines: string[] = [RUI_MONTHLY_FEE_DISPLAY_NAME, ""];
+  if (summary.circleCount > 0) {
+    for (const row of summary.weekdayLines) {
+      const weekdayLabel = formatWeekdayGroupLabel(row.weekdays);
+      lines.push(`${weekdayLabel}　${row.count}回　${formatYen(row.amount)}`);
+    }
+    for (const extra of summary.extraLines) {
+      lines.push(`${extra.name}　${formatYen(extra.amount)}`);
+    }
+    lines.push("", `計　${formatYen(summary.totalAmount)}`);
+  } else {
+    lines.push("今月は月謝対象の参加予定（○）がありません。", "LINEノートへの記入は不要です。");
+    if (summary.extraLines.length > 0) {
+      lines.push("");
+      for (const extra of summary.extraLines) {
+        lines.push(`${extra.name}　${formatYen(extra.amount)}`);
+      }
+      lines.push(`計　${formatYen(summary.totalAmount)}`);
+    }
+  }
+  if (summary.unknownCount > 0) {
+    lines.push("", `確認：調整さんに未回答の日程が${summary.unknownCount}件あります。`);
+  }
+  return lines.join("\n");
+}
+
+function buildMonthlyFeePaymentReminderText(
+  targetMonth: string,
+  totalAmount: number,
+  paymentMethod: PaymentMethod | null,
+  payee: string | null
+): string {
+  const monthLabel = formatBillingMonthForLine(targetMonth).replace("年", "年");
+  const lines: string[] = [`${monthLabel}の月謝　${formatYen(totalAmount)}`];
+  const payeeLabel = isConcreteText(payee) ? payee : null;
+  const methodLabel = paymentMethod && paymentMethod !== "不明" ? paymentMethod : null;
+  if (methodLabel && payeeLabel) {
+    lines.push(`${methodLabel} → ${payeeLabel}`);
+  } else if (payeeLabel) {
+    lines.push(`支払先：${payeeLabel}`);
+  } else if (methodLabel) {
+    lines.push(`支払方法：${methodLabel}`);
+  }
+  return lines.join("\n");
+}
+
 function calculateMonthlyFeeFromRegularSnapshot(
   snapshot: ChouseisanSnapshot,
+  targetMonth: string,
+  rule: MonthlyFeeRuleExtraction,
   nowMs: number
 ):
-  | { ok: true; value: MonthlyFeeCalculationResult }
-  | { ok: false; reason: "rui_not_found" | "rui_ambiguous" | "month_ambiguous" | "date_not_found" } {
+  | { ok: true; value: MonthlyFeeFinalizedSummary }
+  | { ok: false; reason: "rui_not_found" | "rui_ambiguous" | "month_ambiguous" | "date_not_found" | "weekday_rate_missing" } {
   const year = inferYearFromChouseisan(snapshot, nowMs);
   const parsedChoices = snapshot.choices
     .map((choice) => {
@@ -3276,10 +3542,18 @@ function calculateMonthlyFeeFromRegularSnapshot(
   if (parsedChoices.length === 0) {
     return { ok: false, reason: "date_not_found" };
   }
-  const yearMonthSet = new Set(parsedChoices.map((item) => item.ymd.slice(0, 7)));
-  if (yearMonthSet.size !== 1) {
+  const yearMonthSet = new Set(parsedChoices.map((item) => item.ymd.slice(0, 7)).filter((value) => value === targetMonth));
+  if (!yearMonthSet.has(targetMonth)) {
     return { ok: false, reason: "month_ambiguous" };
   }
+
+  const unitPriceByWeekday = new Map<WeekdayCode, number>();
+  rule.weekday_rate_groups.forEach((group) => {
+    for (const weekday of group.weekdays) {
+      unitPriceByWeekday.set(weekday, group.unit_price);
+    }
+  });
+
   const ruiMembers = snapshot.members.filter((member) => isMonthlyFeeTargetRuiName(member.name));
   if (ruiMembers.length === 0) {
     return { ok: false, reason: "rui_not_found" };
@@ -3289,8 +3563,13 @@ function calculateMonthlyFeeFromRegularSnapshot(
   }
   const ruiMember = ruiMembers[0];
   const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
-  let monThuCount = 0;
-  let tueCount = 0;
+
+  let circleCount = 0;
+  let triangleCount = 0;
+  let crossCount = 0;
+  let unknownCount = 0;
+  const perWeekdayCircleCount = new Map<WeekdayCode, number>();
+
   for (let i = 0; i < snapshot.choices.length; i += 1) {
     const choice = snapshot.choices[i];
     if (!choice) {
@@ -3304,80 +3583,390 @@ function calculateMonthlyFeeFromRegularSnapshot(
     if (!parsedDate) {
       continue;
     }
-    const weekday = parsedDate.getUTCDay();
-    if (weekday !== 1 && weekday !== 2 && weekday !== 4) {
+    if (practiceDate.slice(0, 7) !== targetMonth) {
       continue;
     }
-    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
-    if (status !== "circle") {
+    const weekdayCode = UTC_DAY_TO_WEEKDAY_CODE[parsedDate.getUTCDay()];
+    if (!weekdayCode) {
       continue;
     }
-    if (weekday === 2) {
-      tueCount += 1;
+    const status = parseAttendStatusForMonthlyFee(marks[i] ?? Number.NaN);
+    if (status === "circle") {
+      circleCount += 1;
+      perWeekdayCircleCount.set(weekdayCode, (perWeekdayCircleCount.get(weekdayCode) ?? 0) + 1);
+    } else if (status === "triangle") {
+      triangleCount += 1;
+    } else if (status === "cross") {
+      crossCount += 1;
     } else {
-      monThuCount += 1;
+      unknownCount += 1;
     }
   }
-  const monThuAmount = monThuCount * REGULAR_FEE_MON_THU_YEN;
-  const tueAmount = tueCount * REGULAR_FEE_TUE_YEN;
-  const totalAmount = monThuAmount + tueAmount + MONTHLY_SUPERVISION_FEE_YEN;
+
+  const weekdayLines: MonthlyFeeWeekdayLine[] = [];
+  let participationTotal = 0;
+  rule.weekday_rate_groups.forEach((group) => {
+    const weekdaysWithCircle = normalizeRuleWeekdayOrder(group.weekdays).filter((weekday) => (perWeekdayCircleCount.get(weekday) ?? 0) > 0);
+    if (weekdaysWithCircle.length === 0) {
+      return;
+    }
+    const count = weekdaysWithCircle.reduce((sum, weekday) => sum + (perWeekdayCircleCount.get(weekday) ?? 0), 0);
+    if (count <= 0) {
+      return;
+    }
+    const unitPrice = group.unit_price;
+    const amount = count * unitPrice;
+    participationTotal += amount;
+    weekdayLines.push({ weekdays: weekdaysWithCircle, count, amount, unitPrice });
+  });
+
+  // 料金が設定されていない曜日の○は安全側で確定停止する
+  for (const [weekdayCode, count] of perWeekdayCircleCount.entries()) {
+    if (count <= 0) {
+      continue;
+    }
+    if (!unitPriceByWeekday.has(weekdayCode)) {
+      return { ok: false, reason: "weekday_rate_missing" };
+    }
+  }
+
+  const extraLines = rule.extra_charges
+    .filter((extra) => Number.isFinite(extra.amount) && extra.amount > 0)
+    .map((extra) => ({ name: extra.name.trim(), amount: extra.amount }));
+  const extraTotal = extraLines.reduce((sum, row) => sum + row.amount, 0);
+  const totalAmount = participationTotal + extraTotal;
+  const noteRequired = circleCount > 0;
+  const summary: MonthlyFeeFinalizedSummary = {
+    targetMonth,
+    weekdayLines,
+    extraLines,
+    circleCount,
+    triangleCount,
+    crossCount,
+    unknownCount,
+    noteRequired,
+    totalAmount,
+    memoText: "",
+    paymentReminderText: ""
+  };
+  summary.memoText = buildMonthlyFeeMemoText(summary);
+  summary.paymentReminderText = buildMonthlyFeePaymentReminderText(targetMonth, totalAmount, rule.payment_method, rule.payee);
+
   return {
     ok: true,
-    value: {
-      targetMonth: [...yearMonthSet][0] ?? "",
-      monThuCount,
-      tueCount,
-      monThuAmount,
-      tueAmount,
-      supervisionFee: MONTHLY_SUPERVISION_FEE_YEN,
-      totalAmount
-    }
+    value: summary
   };
 }
 
-function formatMonthlyFeeMessage(result: MonthlyFeeCalculationResult): string {
-  return [
-    RUI_MONTHLY_FEE_DISPLAY_NAME,
-    "",
-    `月木　${result.monThuCount}回　${formatYen(result.monThuAmount)}`,
-    `火　　${result.tueCount}回　${formatYen(result.tueAmount)}`,
-    `見守り代　${formatYen(result.supervisionFee)}`,
-    "",
-    `計　${formatYen(result.totalAmount)}`
-  ].join("\n");
+function getJstYearMonth(epochMs: number): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit"
+  });
+  const [year, month] = formatter.format(new Date(epochMs)).split("-");
+  return `${year}-${month}`;
 }
 
-async function buildMonthlyFeeReplyText(
+async function getActiveMonthlyFeeRule(
+  db: D1Database,
+  yearMonth: string
+): Promise<
+  | null
+  | {
+      id: number;
+      year_month: string;
+      payment_date: string;
+      payee: string | null;
+      payment_method: PaymentMethod | null;
+      note_required: number;
+      memo_text: string;
+      payment_reminder_text: string;
+      total_amount: number;
+      note_recorded_at: string | null;
+      note_reminder_sent_on: string | null;
+      version: number;
+    }
+> {
+  return await db
+    .prepare(
+      `SELECT id, year_month, payment_date, payee, payment_method, note_required, memo_text, payment_reminder_text, total_amount,
+              note_recorded_at, note_reminder_sent_on, version
+       FROM monthly_fee_rules
+       WHERE year_month = ?1
+         AND is_active = 1
+       ORDER BY version DESC
+       LIMIT 1`
+    )
+    .bind(yearMonth)
+    .first<{
+      id: number;
+      year_month: string;
+      payment_date: string;
+      payee: string | null;
+      payment_method: PaymentMethod | null;
+      note_required: number;
+      memo_text: string;
+      payment_reminder_text: string;
+      total_amount: number;
+      note_recorded_at: string | null;
+      note_reminder_sent_on: string | null;
+      version: number;
+    }>();
+}
+
+async function buildMonthlyFeeReplyText(env: Env, nowMs: number): Promise<string> {
+  const yearMonth = getJstYearMonth(nowMs);
+  const active = await getActiveMonthlyFeeRule(env.DB, yearMonth);
+  if (!active) {
+    return "今月の月謝案内がまだ登録されていません。\n月謝案内を羽魂メモへ転送してください。";
+  }
+  return active.memo_text;
+}
+
+async function getLatestMonthlyPaymentSnapshot(
+  db: D1Database,
+  billingMonth: string
+): Promise<{
+  id: number;
+  amount: number;
+  due_date: string | null;
+  payee: string | null;
+  payment_method: PaymentMethod | null;
+  status: PaymentStatus;
+} | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, amount, due_date, payee, payment_method, status
+       FROM monthly_payments
+       WHERE billing_month = ?1
+         AND monthly_type = ?2
+       ORDER BY id DESC
+       LIMIT 1`
+    )
+    .bind(billingMonth, MONTHLY_FEE_PAYMENT_TYPE)
+    .first<{
+      id: number;
+      amount: number;
+      due_date: string | null;
+      payee: string | null;
+      payment_method: PaymentMethod | null;
+      status: PaymentStatus;
+    }>();
+  return row ?? null;
+}
+
+async function saveMonthlyFeeRule(
+  db: D1Database,
+  sourceLabel: string,
+  receivedAtIso: string,
+  rule: MonthlyFeeRuleExtraction,
+  summary: MonthlyFeeFinalizedSummary
+): Promise<{ id: number; version: number }> {
+  const now = new Date().toISOString();
+  const versionRow = await db
+    .prepare("SELECT COALESCE(MAX(version), 0) AS max_version FROM monthly_fee_rules WHERE year_month = ?1")
+    .bind(rule.target_month)
+    .first<{ max_version: number }>();
+  const nextVersion = Number(versionRow?.max_version ?? 0) + 1;
+
+  await db
+    .prepare("UPDATE monthly_fee_rules SET is_active = 0, updated_at = ?2 WHERE year_month = ?1 AND is_active = 1")
+    .bind(rule.target_month, now)
+    .run();
+
+  const inserted = await db
+    .prepare(
+      `INSERT INTO monthly_fee_rules (
+         year_month, version, is_active, payment_date, payee, payment_method, note_guidance,
+         source, received_at, note_reminder_sent_on, note_recorded_at,
+         circle_count, triangle_count, cross_count, unknown_count, total_amount, note_required,
+         memo_text, payment_reminder_text, created_at, updated_at
+       ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?17)`
+    )
+    .bind(
+      rule.target_month,
+      nextVersion,
+      rule.payment_date,
+      isConcreteText(rule.payee) ? rule.payee.trim() : null,
+      rule.payment_method ?? null,
+      isConcreteText(rule.note_guidance) ? rule.note_guidance.trim() : null,
+      sourceLabel,
+      receivedAtIso,
+      summary.circleCount,
+      summary.triangleCount,
+      summary.crossCount,
+      summary.unknownCount,
+      summary.totalAmount,
+      summary.noteRequired ? 1 : 0,
+      summary.memoText,
+      summary.paymentReminderText,
+      now
+    )
+    .run();
+  const ruleId = Number(inserted.meta.last_row_id ?? 0);
+  if (!Number.isInteger(ruleId) || ruleId <= 0) {
+    throw new Error("monthly_fee_rule_insert_failed");
+  }
+
+  for (let groupOrder = 0; groupOrder < rule.weekday_rate_groups.length; groupOrder += 1) {
+    const group = rule.weekday_rate_groups[groupOrder];
+    for (const weekday of normalizeRuleWeekdayOrder(group.weekdays)) {
+      await db
+        .prepare(
+          `INSERT INTO monthly_fee_weekday_rates (
+             rule_id, weekday_code, unit_price, group_order, created_at, updated_at
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)`
+        )
+        .bind(ruleId, weekday, group.unit_price, groupOrder, now)
+        .run();
+    }
+  }
+
+  for (let itemOrder = 0; itemOrder < rule.extra_charges.length; itemOrder += 1) {
+    const extra = rule.extra_charges[itemOrder];
+    await db
+      .prepare(
+        `INSERT INTO monthly_fee_extra_charges (
+           rule_id, item_name, amount, item_order, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)`
+      )
+      .bind(ruleId, extra.name.trim(), extra.amount, itemOrder, now)
+      .run();
+  }
+
+  return { id: ruleId, version: nextVersion };
+}
+
+async function finalizeMonthlyFeeFromNotice(
   env: Env,
-  nowMs: number,
-  fetchSnapshot: (url: string) => Promise<ChouseisanSnapshot> = fetchChouseisanSnapshot
-): Promise<string> {
+  sourceLabel: string,
+  receivedAtIso: string,
+  rule: MonthlyFeeRuleExtraction,
+  nowMs: number
+):
+  Promise<
+    | { ok: true; replyText: string; summary: MonthlyFeeFinalizedSummary }
+    | { ok: false; replyText: string }
+  > {
+  const normalized = normalizeMonthlyFeeRuleExtraction(rule);
+  if (!normalized.ok) {
+    return { ok: false, replyText: `月謝案内の登録を止めました。\n理由: ${normalized.reason}` };
+  }
+  const targetRule = normalized.value;
+  if (!targetRule.target_month || !targetRule.payment_date) {
+    return { ok: false, replyText: "月謝案内の登録を止めました。\n理由: 対象月または支払日の抽出結果が不足しています。" };
+  }
+  if (targetRule.payment_date.slice(0, 7) !== targetRule.target_month) {
+    return { ok: false, replyText: "月謝案内の登録を止めました。\n理由: 対象月と支払日の月が一致していません。" };
+  }
+
   const regularUrl = await env.STATE.get(chouseisanUrlKey("regular"));
   if (!regularUrl) {
-    return "通常練習用の調整さんが登録されていません。\n先に今月の調整さんURLを羽魂メモへ転送してください。";
+    return {
+      ok: false,
+      replyText:
+        "月謝案内の登録を止めました。\n理由: 通常練習用の調整さんURLが未登録です。\n先に通常練習の調整さんURLを送ってください。"
+    };
   }
+
   let snapshot: ChouseisanSnapshot;
   try {
-    snapshot = await fetchSnapshot(regularUrl);
+    snapshot = await fetchChouseisanSnapshot(regularUrl);
   } catch (error) {
     const reason = error instanceof Error ? error.message : "unknown";
-    console.error("monthly fee fetch failed", { reason });
-    return "調整さんを読み込めませんでした。\n時間をおいてもう一度「月謝」と送ってください。";
+    console.error("monthly fee notice snapshot fetch failed", { reason });
+    return {
+      ok: false,
+      replyText: "月謝案内の登録を止めました。\n理由: 通常練習調整さんの取得に失敗しました。"
+    };
   }
-  const calculated = calculateMonthlyFeeFromRegularSnapshot(snapshot, nowMs);
+
+  const calculated = calculateMonthlyFeeFromRegularSnapshot(snapshot, targetRule.target_month, targetRule, nowMs);
   if (!calculated.ok) {
-    if (calculated.reason === "rui_not_found") {
-      return "渡辺塁の回答が調整さんで見つかりません。\n名前表記を確認してから、もう一度「月謝」と送ってください。";
-    }
-    if (calculated.reason === "rui_ambiguous") {
-      return "渡辺塁の回答候補が複数見つかりました。\n調整さん上の名前表記を整理してから、もう一度「月謝」と送ってください。";
-    }
-    if (calculated.reason === "month_ambiguous") {
-      return "通常練習用の調整さんに複数月の日程が含まれているため、月謝対象月を一意に決められません。\n対象月だけの調整さんURLへ更新してから、もう一度「月謝」と送ってください。";
-    }
-    return "調整さんの日程を読み取れませんでした。\n時間をおいてもう一度「月謝」と送ってください。";
+    const reasonMap: Record<string, string> = {
+      rui_not_found: "渡辺塁の回答行を調整さんで特定できません。",
+      rui_ambiguous: "渡辺塁の回答候補が複数あります。",
+      month_ambiguous: "対象月の日程が調整さん側で特定できません。",
+      date_not_found: "調整さんの日程を読み取れませんでした。",
+      weekday_rate_missing: "○がある曜日に月謝案内の単価がありません。"
+    };
+    return {
+      ok: false,
+      replyText: `月謝案内の登録を止めました。\n理由: ${reasonMap[calculated.reason] ?? "計算条件の確認が必要です。"}`
+    };
   }
-  return formatMonthlyFeeMessage(calculated.value);
+  const summary = calculated.value;
+
+  const existingPayment = await getLatestMonthlyPaymentSnapshot(env.DB, targetRule.target_month);
+  const effectivePayee = isConcreteText(targetRule.payee) ? targetRule.payee.trim() : existingPayment?.payee ?? null;
+  const effectiveMethod =
+    targetRule.payment_method && targetRule.payment_method !== "不明"
+      ? targetRule.payment_method
+      : existingPayment?.payment_method ?? null;
+
+  await saveMonthlyFeeRule(env.DB, sourceLabel, receivedAtIso, targetRule, summary);
+
+  const monthlySave = await upsertMonthlyPaymentToD1(env.DB, sourceLabel, {
+    billing_month: targetRule.target_month,
+    monthly_type: MONTHLY_FEE_PAYMENT_TYPE,
+    amount: summary.totalAmount,
+    payee: effectivePayee,
+    due_date: targetRule.payment_date,
+    payment_method: effectiveMethod ?? "不明",
+    breakdown_text: summary.memoText
+  });
+
+  const lines: string[] = [`${formatBillingMonthForLine(targetRule.target_month)}の月謝案内を登録しました。`, "", summary.memoText];
+  if (summary.noteRequired) {
+    lines.push("", "［LINEノート記入］");
+  }
+  if (monthlySave.reviewWarning) {
+    lines.push("", monthlySave.reviewWarning);
+  }
+  return {
+    ok: true,
+    replyText: lines.join("\n"),
+    summary
+  };
+}
+
+function isMonthlyFeeNotice(result: StructuredLineResult): boolean {
+  return result.message_kind === "accounting_notice" && !!result.monthly_fee_rule?.is_monthly_fee_notice;
+}
+
+async function tryHandleMonthlyFeeNotice(
+  event: LineWebhookEvent,
+  env: Env,
+  sourceLabel: string,
+  parsed: StructuredLineResult,
+  receivedAtIso: string,
+  receivedAtMs: number
+): Promise<boolean> {
+  if (!event.replyToken) {
+    return false;
+  }
+  if (!isMonthlyFeeNotice(parsed)) {
+    return false;
+  }
+  const finalized = await finalizeMonthlyFeeFromNotice(
+    env,
+    sourceLabel,
+    receivedAtIso,
+    parsed.monthly_fee_rule as MonthlyFeeRuleExtraction,
+    receivedAtMs
+  );
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: finalized.replyText }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
+  return true;
 }
 
 async function handleMonthlyFeeCommand(event: LineWebhookEvent, env: Env): Promise<void> {
@@ -3992,6 +4581,164 @@ async function getMonthlyReminderTargets(
   return result.results ?? [];
 }
 
+async function getMonthlyFeeNoteReminderTargets(
+  db: D1Database,
+  todayJst: string
+): Promise<
+  Array<{
+    id: number;
+    year_month: string;
+    payment_date: string;
+    memo_text: string;
+    note_required: number;
+    note_recorded_at: string | null;
+  }>
+> {
+  const dueDate = shiftYmdByDays(todayJst, 2);
+  const rows = await db
+    .prepare(
+      `SELECT id, year_month, payment_date, memo_text, note_required, note_recorded_at
+       FROM monthly_fee_rules
+       WHERE is_active = 1
+         AND payment_date = ?1
+         AND note_required = 1
+         AND note_recorded_at IS NULL
+         AND (note_reminder_sent_on IS NULL OR note_reminder_sent_on <> ?2)
+       ORDER BY year_month ASC, id ASC`
+    )
+    .bind(dueDate, todayJst)
+    .all<{
+      id: number;
+      year_month: string;
+      payment_date: string;
+      memo_text: string;
+      note_required: number;
+      note_recorded_at: string | null;
+    }>();
+  return rows.results ?? [];
+}
+
+async function markMonthlyFeeNoteReminderSentOn(
+  db: D1Database,
+  ruleId: number,
+  todayJst: string
+): Promise<boolean> {
+  const now = new Date().toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE monthly_fee_rules
+       SET note_reminder_sent_on = ?1,
+           updated_at = ?2
+       WHERE id = ?3
+         AND is_active = 1
+         AND (note_reminder_sent_on IS NULL OR note_reminder_sent_on <> ?1)`
+    )
+    .bind(todayJst, now, ruleId)
+    .run();
+  return Number(result.meta.changes ?? 0) > 0;
+}
+
+async function markMonthlyFeeNoteRecorded(
+  db: D1Database,
+  yearMonth: string
+): Promise<"updated" | "already_recorded" | "not_found"> {
+  const active = await getActiveMonthlyFeeRule(db, yearMonth);
+  if (!active) {
+    return "not_found";
+  }
+  if (active.note_recorded_at) {
+    return "already_recorded";
+  }
+  const now = new Date().toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE monthly_fee_rules
+       SET note_recorded_at = ?1,
+           updated_at = ?1
+       WHERE id = ?2
+         AND is_active = 1
+         AND note_recorded_at IS NULL`
+    )
+    .bind(now, active.id)
+    .run();
+  return Number(result.meta.changes ?? 0) > 0 ? "updated" : "already_recorded";
+}
+
+async function getMonthlyFeePaymentReminderTargets(
+  db: D1Database,
+  todayJst: string
+): Promise<
+  Array<{
+    payment_id: number;
+    billing_month: string;
+    amount: number;
+    payee: string | null;
+    payment_method: PaymentMethod | null;
+  }>
+> {
+  const rows = await db
+    .prepare(
+      `SELECT m.id AS payment_id, m.billing_month, m.amount, m.payee, m.payment_method
+       FROM monthly_payments m
+       INNER JOIN monthly_fee_rules r
+         ON r.year_month = m.billing_month
+        AND r.is_active = 1
+       WHERE m.monthly_type = ?1
+         AND m.status = 'unpaid'
+         AND m.due_date = ?2
+         AND (m.reminder_sent_on IS NULL OR m.reminder_sent_on <> ?2)
+       ORDER BY m.billing_month ASC, m.id ASC`
+    )
+    .bind(MONTHLY_FEE_PAYMENT_TYPE, todayJst)
+    .all<{
+      payment_id: number;
+      billing_month: string;
+      amount: number;
+      payee: string | null;
+      payment_method: PaymentMethod | null;
+    }>();
+  return rows.results ?? [];
+}
+
+function formatMonthlyFeeNoteReminderMessage(rule: {
+  year_month: string;
+  memo_text: string;
+}): LineReplyMessage {
+  return {
+    type: "text",
+    text: `${Number(rule.year_month.slice(5, 7))}月の月謝\n\n${rule.memo_text}\n\n［LINEノート記入］`,
+    quickReply: buildMonthlyNoteDoneQuickReply(rule.year_month)
+  };
+}
+
+function formatMonthlyFeePaymentReminderMessage(target: {
+  payment_id: number;
+  billing_month: string;
+  amount: number;
+  payee: string | null;
+  payment_method: PaymentMethod | null;
+}): LineReplyMessage {
+  const monthLabel = `${Number(target.billing_month.slice(5, 7))}月`;
+  const lines: string[] = [`${monthLabel}の月謝　${formatYen(target.amount)}`];
+  const payee = isConcreteText(target.payee) ? target.payee : null;
+  const method = target.payment_method && target.payment_method !== "不明" ? target.payment_method : null;
+  if (method && payee) {
+    lines.push(`${method} → ${payee}`);
+  } else if (payee) {
+    lines.push(`支払先：${payee}`);
+  } else if (method) {
+    lines.push(`支払方法：${method}`);
+  }
+  lines.push("", "［支払済み］");
+  return {
+    type: "text",
+    text: lines.join("\n"),
+    quickReply: {
+      items: buildMarkPaidQuickReplyItems([{ id: target.payment_id, payment_kind: "monthly" }], 1)
+    }
+  };
+}
+
 async function markReminderSentOn(
   db: D1Database,
   paymentIds: number[],
@@ -4165,6 +4912,54 @@ async function handlePaymentReminderScheduled(
   console.log({ stage: "payment_reminder_marked_sent", updatedCount: updatedCount + monthlyUpdatedCount });
 }
 
+async function handleMonthlyFeeReminderScheduled(
+  controller: ScheduledController,
+  env: Env
+): Promise<void> {
+  console.log({ stage: "monthly_fee_reminder_start" });
+  const ownerLineUserId = await env.STATE.get("owner_line_user_id");
+  if (!ownerLineUserId) {
+    console.log({ stage: "monthly_fee_reminder_no_owner" });
+    return;
+  }
+
+  const todayJst = getJstDateString(controller.scheduledTime ?? Date.now());
+  const noteTargets = await getMonthlyFeeNoteReminderTargets(env.DB, todayJst);
+  for (const target of noteTargets) {
+    const pushStatus = await pushLineMessages(
+      ownerLineUserId,
+      [formatMonthlyFeeNoteReminderMessage(target)],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof pushStatus !== "number") {
+      continue;
+    }
+    await markMonthlyFeeNoteReminderSentOn(env.DB, target.id, todayJst);
+  }
+
+  const paymentTargets = await getMonthlyFeePaymentReminderTargets(env.DB, todayJst);
+  if (paymentTargets.length === 0) {
+    console.log({ stage: "monthly_fee_reminder_no_payment_targets", noteTargetCount: noteTargets.length });
+    return;
+  }
+  for (const target of paymentTargets) {
+    const pushStatus = await pushLineMessages(
+      ownerLineUserId,
+      [formatMonthlyFeePaymentReminderMessage(target)],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof pushStatus !== "number") {
+      continue;
+    }
+    await markMonthlyReminderSentOn(env.DB, [target.payment_id], todayJst);
+  }
+  console.log({
+    stage: "monthly_fee_reminder_done",
+    noteTargetCount: noteTargets.length,
+    paymentTargetCount: paymentTargets.length
+  });
+}
+
 function isConcreteText(value: string | null): value is string {
   if (value === null) {
     return false;
@@ -4201,6 +4996,7 @@ function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResul
     practice_type_basis: extractionBasis,
     practice_type_evidence: null,
     monthly_charges: [],
+    monthly_fee_rule: null,
     practice_date: practice.practice_date,
     attendance: practice.attendance,
     outbound_transport: {
@@ -5971,6 +6767,11 @@ async function callOpenAIForStructuredResult(
     "regular_training_totalは『計○○円』等の実支払合計が明示される場合のみ作成してください。" +
     "shimura_car_feeは対象月が特定された具体請求の場合のみ作成してください。" +
     "monthly_chargesへ入れた請求をpaymentsへ重複して入れないでください。" +
+    "monthly_fee_ruleは必須で、月謝案内（例:『○月のお月謝について』）のときだけis_monthly_fee_notice=trueにしてください。" +
+    "monthly_fee_rule.is_monthly_fee_notice=trueの場合、target_month(YYYY-MM)、weekday_rate_groups（unit_priceとweekdays配列）、extra_charges、payment_date(YYYY-MM-DD)、payment_method、payeeをできるだけ抽出してください。" +
+    "weekday_rate_groupsは同額曜日ごとにまとめ、weekdaysはmon/tue/wed/thu/fri/sat/sunを使ってください。" +
+    "『別途見守り代なし』等はextra_chargesを空配列にしてください。0円項目は作らないでください。" +
+    "月謝案内でない場合はis_monthly_fee_notice=false、target_month=null、weekday_rate_groups=[]、extra_charges=[]、payment_date=null、payment_method=null、payee=null、note_guidance=nullを返してください。" +
     "payments.amountは『このメッセージの受け手本人が実際に支払うよう指示されている金額』だけを入れてください。" +
     "全参加者分の合計、グループ全体総額、計算途中の小計、施設費/高速代/引率代などの内訳、他者へ最終的に渡る総額はpayments.amountにしないでください。" +
     "『1人あたり○円』『あなたの分は○円』『○円お願いします』『○円支払ってください』のような表現がある場合は、その金額を本人の支払額として最優先してください。" +
@@ -6348,6 +7149,40 @@ async function handleMarkPaidPostback(
   }
 }
 
+async function handleMarkMonthlyNoteDonePostback(
+  event: LineWebhookEvent,
+  env: Env,
+  monthRaw: string | null
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const yearMonth = isValidYearMonth(monthRaw) ? monthRaw : null;
+  if (!yearMonth) {
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "対象月の指定が不正です。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
+  const result = await markMonthlyFeeNoteRecorded(env.DB, yearMonth);
+  let text = "LINEノート記入済みにしました。";
+  if (result === "not_found") {
+    text = "対象月の月謝案内が見つかりませんでした。";
+  }
+  const lineStatus = await replyMessages(event.replyToken, [{ type: "text", text }], env.LINE_CHANNEL_ACCESS_TOKEN);
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
+}
+
 async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<void> {
   if (!event.replyToken) {
     return;
@@ -6358,6 +7193,10 @@ async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<v
   const action = params.get("action");
   if (action === "mark_paid") {
     await handleMarkPaidPostback(event, env, params.get("payment_id"), params.get("payment_kind"));
+    return;
+  }
+  if (action === MONTHLY_FEE_MARK_NOTE_DONE_ACTION) {
+    await handleMarkMonthlyNoteDonePostback(event, env, params.get("month"));
     return;
   }
 
@@ -6561,6 +7400,17 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
         payment_method: payment.payment_method
       }))
     });
+    const monthlyHandled = await tryHandleMonthlyFeeNotice(
+      event,
+      env,
+      sourceLabel,
+      parsed,
+      receivedAtIso,
+      receivedAtMs
+    );
+    if (monthlyHandled) {
+      return;
+    }
     const resolved = await resolvePracticeContext(env, selectedSourceId, userId, parsed, receivedAtMs);
     console.log({
       stage: "context_resolved",
@@ -6855,6 +7705,22 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    const jstHour = Number(
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: "Asia/Tokyo",
+        hour: "2-digit",
+        hour12: false
+      }).format(new Date(controller.scheduledTime ?? Date.now()))
+    );
+    if (jstHour === 8) {
+      ctx.waitUntil(
+        handleMonthlyFeeReminderScheduled(controller, env).catch((error) => {
+          const errorType = error instanceof Error ? error.name : "unknown";
+          console.error("Monthly fee reminder scheduled failed", { errorType });
+        })
+      );
+      return;
+    }
     ctx.waitUntil(
       handlePaymentReminderScheduled(controller, env).catch((error) => {
         const errorType = error instanceof Error ? error.name : "unknown";
@@ -6928,6 +7794,7 @@ export const TEST_HOOKS = {
   isMonthlyFeeCommand,
   isMonthlyFeeTargetRuiName,
   calculateMonthlyFeeFromRegularSnapshot,
+  finalizeMonthlyFeeFromNotice,
   buildMonthlyFeeReplyText,
   parseRuiContactCommand,
   buildRuiContactMessage,
@@ -6944,6 +7811,11 @@ export const TEST_HOOKS = {
   markMonthlyPaymentPaid,
   getReminderTargets,
   getMonthlyReminderTargets,
+  getMonthlyFeeNoteReminderTargets,
+  getMonthlyFeePaymentReminderTargets,
+  markMonthlyFeeNoteRecorded,
   handleMarkPaidPostback,
-  handlePaymentReminderScheduled
+  handlePaymentReminderScheduled,
+  handleMonthlyFeeReminderScheduled,
+  getActiveMonthlyFeeRule
 };
