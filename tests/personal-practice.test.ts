@@ -402,6 +402,22 @@ async function main() {
   assert.match(monthlyFeeCalculated.value.memoText, /火曜　3回　3,750円/);
   assert.equal(monthlyFeeCalculated.value.memoText.includes("火曜以外"), false);
 
+  // 回帰: kouhoが文字列配列でも未回答扱いにならない
+  const monthlyFeeSnapshotStringKouho = {
+    ...monthlyFeeSnapshot,
+    members: [{ name: "1年渡辺塁", attend: null, kouho: ["1", "1", "1", "1", "1", "1", "2", "3", "1", "1", "1", "3"] }]
+  };
+  const monthlyFromStringKouho = hooks.calculateMonthlyFeeFromRegularSnapshot(
+    monthlyFeeSnapshotStringKouho as any,
+    "2026-09",
+    monthlyRule as any,
+    fixedNow
+  );
+  assert.equal(monthlyFromStringKouho.ok, true);
+  if (!monthlyFromStringKouho.ok) throw new Error("string kouho calc failed");
+  assert.equal(monthlyFromStringKouho.value.unknownCount, 2);
+  assert.equal(monthlyFromStringKouho.value.circleCount > 0, true);
+
   const { raw: monthlyRaw, env: monthlyEnv } = createTestEnv();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
@@ -428,7 +444,8 @@ async function main() {
   if (!finalizeResult.ok) {
     throw new Error(finalizeResult.replyText);
   }
-  assert.match(finalizeResult.replyText, /9月の月謝案内を登録しました/);
+  assert.equal(finalizeResult.yearMonth, "2026-09");
+  assert.equal(finalizeResult.reviewWarning, null);
   assert.match(finalizeResult.replyText, /月木日　6回　4,200円/);
   assert.match(finalizeResult.replyText, /火曜　3回　3,750円/);
   assert.ok(!finalizeResult.replyText.includes("見守り代　0円"));

@@ -1290,9 +1290,25 @@ function isRuiParticipantName(name: string): boolean {
   return normalized.includes("渡辺塁") || normalized === "塁" || normalized.includes("塁くん") || normalized.includes("ルイ");
 }
 
-function parseAttendMarks(member: { attend: string | null; kouho: number[] | null }, choiceCount: number): number[] {
+function parseAttendMarks(
+  member: { attend: string | null; kouho: Array<number | string> | null },
+  choiceCount: number
+): number[] {
   if (member.kouho && member.kouho.length > 0) {
-    return member.kouho.slice(0, choiceCount);
+    const normalizedKouho = member.kouho
+      .map((value) => {
+        if (typeof value === "number") {
+          return value;
+        }
+        if (typeof value === "string" && /^[0-9]+$/.test(value.trim())) {
+          return Number(value.trim());
+        }
+        return Number.NaN;
+      })
+      .filter((value) => Number.isFinite(value));
+    if (normalizedKouho.length > 0) {
+      return normalizedKouho.slice(0, choiceCount);
+    }
   }
   if (!member.attend) {
     return [];
@@ -3846,7 +3862,13 @@ async function finalizeMonthlyFeeFromNotice(
   nowMs: number
 ):
   Promise<
-    | { ok: true; replyText: string; summary: MonthlyFeeFinalizedSummary }
+    | {
+        ok: true;
+        replyText: string;
+        summary: MonthlyFeeFinalizedSummary;
+        yearMonth: string;
+        reviewWarning: string | null;
+      }
     | { ok: false; replyText: string }
   > {
   const normalized = normalizeMonthlyFeeRuleExtraction(rule);
@@ -3917,17 +3939,12 @@ async function finalizeMonthlyFeeFromNotice(
     breakdown_text: summary.memoText
   });
 
-  const lines: string[] = [`${formatBillingMonthForLine(targetRule.target_month)}の月謝案内を登録しました。`, "", summary.memoText];
-  if (summary.noteRequired) {
-    lines.push("", "［LINEノート記入］");
-  }
-  if (monthlySave.reviewWarning) {
-    lines.push("", monthlySave.reviewWarning);
-  }
   return {
     ok: true,
-    replyText: lines.join("\n"),
-    summary
+    replyText: summary.memoText,
+    summary,
+    yearMonth: targetRule.target_month,
+    reviewWarning: monthlySave.reviewWarning ?? null
   };
 }
 
@@ -3956,10 +3973,44 @@ async function tryHandleMonthlyFeeNotice(
     parsed.monthly_fee_rule as MonthlyFeeRuleExtraction,
     receivedAtMs
   );
+  if (!finalized.ok) {
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: finalized.replyText }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return true;
+  }
+
+  const followupLines: string[] = [`${formatBillingMonthForLine(finalized.yearMonth)}の月謝案内を登録しました。`];
+  if (finalized.summary.unknownCount > 0) {
+    followupLines.push(`確認：調整さんに未回答の日程が${finalized.summary.unknownCount}件あります。`);
+  }
+  if (finalized.summary.noteRequired) {
+    followupLines.push("LINEノートを記入したら下のボタンを押してください。");
+  } else {
+    followupLines.push("月謝対象の○がないため、LINEノート記入は不要です。");
+  }
+  const followupMessage: LineReplyMessage = {
+    type: "text",
+    text: followupLines.join("\n")
+  };
+  if (finalized.summary.noteRequired) {
+    followupMessage.quickReply = buildMonthlyNoteDoneQuickReply(finalized.yearMonth);
+  }
+  const messages: LineReplyMessage[] = [{ type: "text", text: finalized.summary.memoText }, followupMessage];
+  if (finalized.reviewWarning) {
+    messages.push({ type: "text", text: finalized.reviewWarning });
+  }
   console.log({ stage: "line_reply_start" });
   const lineStatus = await replyMessages(
     event.replyToken,
-    [{ type: "text", text: finalized.replyText }],
+    messages,
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
   if (typeof lineStatus === "number") {
@@ -4706,7 +4757,7 @@ function formatMonthlyFeeNoteReminderMessage(rule: {
 }): LineReplyMessage {
   return {
     type: "text",
-    text: `${Number(rule.year_month.slice(5, 7))}月の月謝\n\n${rule.memo_text}\n\n［LINEノート記入］`,
+    text: `${Number(rule.year_month.slice(5, 7))}月の月謝\n\n${rule.memo_text}\n\nLINEノートを記入したら下のボタンを押してください。`,
     quickReply: buildMonthlyNoteDoneQuickReply(rule.year_month)
   };
 }
