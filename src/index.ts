@@ -3599,7 +3599,12 @@ function calculateMonthlyFeeFromRegularSnapshot(
     if (!weekdayCode) {
       continue;
     }
-    const status = parseAttendStatusForMonthlyFee(marks[i] ?? Number.NaN);
+    const rawMark = marks[i];
+    if (!Number.isFinite(rawMark)) {
+      // 選択肢数と回答配列長のズレがある場合は未回答確定とは見なさず、安全側でカウントしない。
+      continue;
+    }
+    const status = parseAttendStatusForMonthlyFee(rawMark);
     if (status === "circle") {
       circleCount += 1;
       perWeekdayCircleCount.set(weekdayCode, (perWeekdayCircleCount.get(weekdayCode) ?? 0) + 1);

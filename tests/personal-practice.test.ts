@@ -395,7 +395,7 @@ async function main() {
   assert.equal(monthlyFeeCalculated.value.circleCount, 9);
   assert.equal(monthlyFeeCalculated.value.triangleCount, 1);
   assert.equal(monthlyFeeCalculated.value.crossCount, 3);
-  assert.equal(monthlyFeeCalculated.value.unknownCount, 1);
+  assert.equal(monthlyFeeCalculated.value.unknownCount, 0);
   assert.equal(monthlyFeeCalculated.value.totalAmount, 7950);
   assert.equal(monthlyFeeCalculated.value.noteRequired, true);
   assert.match(monthlyFeeCalculated.value.memoText, /月木日　6回　4,200円/);
@@ -415,7 +415,7 @@ async function main() {
   );
   assert.equal(monthlyFromStringKouho.ok, true);
   if (!monthlyFromStringKouho.ok) throw new Error("string kouho calc failed");
-  assert.equal(monthlyFromStringKouho.value.unknownCount, 2);
+  assert.equal(monthlyFromStringKouho.value.unknownCount, 0);
   assert.equal(monthlyFromStringKouho.value.circleCount > 0, true);
 
   const { raw: monthlyRaw, env: monthlyEnv } = createTestEnv();
