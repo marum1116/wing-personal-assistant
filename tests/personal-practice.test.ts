@@ -607,6 +607,98 @@ async function main() {
   assert.equal(leadRunUpdate.unmarkedCount, 1);
   assert.deepEqual(patchedSummaries, ["◯wing練習", "wing練習"]);
 
+  // 不可判定は marumnx / プライベート側の予定を見る（Wingカレンダー単体では見ない）
+  const { env: leadEnvMultiCal } = createTestEnv();
+  (leadEnvMultiCal as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvMultiCal as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await leadEnvMultiCal.STATE.put("rui_calendar_event:regular:2026-09-28", JSON.stringify({ eventId: "event-28", status: "circle" }));
+  await leadEnvMultiCal.STATE.put("rui_calendar_event:regular:2026-09-29", JSON.stringify({ eventId: "event-29", status: "circle" }));
+  const multiPatched: string[] = [];
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      if (url.includes("marumnx") && url.includes("2026-09-28")) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: "seminar-28",
+                summary: "管理職セミナー⑧-1",
+                start: { dateTime: "2026-09-28T21:30:00+09:00" },
+                end: { dateTime: "2026-09-28T22:30:00+09:00" }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (url.includes("jdq62uticpi33e2h7ahjh6nceo") && url.includes("2026-09-29")) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: "drink-29",
+                summary: "飲み会",
+                start: { dateTime: "2026-09-29T17:00:00+09:00" },
+                end: { dateTime: "2026-09-29T21:00:00+09:00" }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.includes("/events/event-28?fields=id,summary,start,end")) {
+      return new Response(
+        JSON.stringify({
+          id: "event-28",
+          summary: "◯wing練習",
+          start: { dateTime: "2026-09-28T19:00:00+09:00" },
+          end: { dateTime: "2026-09-28T21:00:00+09:00" }
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/event-29?fields=id,summary,start,end")) {
+      return new Response(
+        JSON.stringify({
+          id: "event-29",
+          summary: "◯wing練習",
+          start: { dateTime: "2026-09-29T19:00:00+09:00" },
+          end: { dateTime: "2026-09-29T21:00:00+09:00" }
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/event-28") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      multiPatched.push(`28:${body.summary ?? ""}`);
+      return new Response(JSON.stringify({ id: "event-28" }), { status: 200 });
+    }
+    if (url.includes("/events/event-29") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      multiPatched.push(`29:${body.summary ?? ""}`);
+      return new Response(JSON.stringify({ id: "event-29" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadRunMultiCal = await hooks.runLeadCheckForDates(leadEnvMultiCal as any, ["2026-09-28", "2026-09-29"]);
+  assert.deepEqual(leadRunMultiCal.availableDates, []);
+  assert.deepEqual(leadRunMultiCal.unavailableDates, [
+    { date: "2026-09-28", reason: "セミナー" },
+    { date: "2026-09-29", reason: "飲み会" }
+  ]);
+  assert.equal(leadRunMultiCal.unmarkedCount, 2);
+  assert.deepEqual(multiPatched, ["28:wing練習", "29:wing練習"]);
+  assert.deepEqual(hooks.resolveLeadCheckCalendarIds({} as any), [
+    "marumnx@gmail.com",
+    "jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com"
+  ]);
+
   // 調整さん再同期: 既に◯wing練習ならmarker維持（通常練習○で上書きしない）
   const { env: syncEnv } = createTestEnv();
   (syncEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;

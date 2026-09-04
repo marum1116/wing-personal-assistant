@@ -6,6 +6,7 @@ interface Env {
   GOOGLE_SERVICE_ACCOUNT_EMAIL?: string;
   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
   GOOGLE_CALENDAR_ID?: string;
+  GOOGLE_LEAD_CHECK_CALENDAR_IDS?: string;
   GOOGLE_CALENDAR_TIMEZONE?: string;
   DB: D1Database;
   STATE: KVNamespace;
@@ -33,6 +34,10 @@ const WING_EVENT_TITLE = "wing練習";
 const WING_EVENT_MARKED_TITLE = "◯wing練習";
 const WING_EVENT_TENTATIVE_TITLE = "仮）wing練習";
 const DEFAULT_GOOGLE_CALENDAR_ID = "pachira803.2nd@gmail.com";
+const DEFAULT_LEAD_CHECK_CALENDAR_IDS = [
+  "marumnx@gmail.com",
+  "jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com"
+] as const;
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
 const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
 const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
@@ -1566,6 +1571,17 @@ function encodedGoogleCalendarId(env: Env): string {
   return encodeURIComponent(resolveGoogleCalendarId(env));
 }
 
+function resolveLeadCheckCalendarIds(env: Env): string[] {
+  const raw = (env.GOOGLE_LEAD_CHECK_CALENDAR_IDS ?? "").trim();
+  if (raw.length > 0) {
+    return raw
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+  }
+  return [...DEFAULT_LEAD_CHECK_CALENDAR_IDS];
+}
+
 function isSafeWingEventSummary(summary: string): boolean {
   return summary === WING_EVENT_TITLE || summary === WING_EVENT_MARKED_TITLE;
 }
@@ -1667,7 +1683,8 @@ async function fetchGoogleCalendarEventById(
 
 async function listGoogleCalendarEventsOnDate(
   env: Env,
-  ymd: string
+  ymd: string,
+  calendarIdRaw?: string
 ): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }> {
   const range = toTimedRangeForJstDay(ymd);
   if (!range) {
@@ -1678,7 +1695,7 @@ async function listGoogleCalendarEventsOnDate(
     console.log({ stage: "google_calendar_auth_missing" });
     return { ok: false, reason: "auth_missing" };
   }
-  const calendarId = encodedGoogleCalendarId(env);
+  const calendarId = encodeURIComponent((calendarIdRaw ?? resolveGoogleCalendarId(env)).trim());
   const query = new URLSearchParams({
     timeMin: range.timeMin,
     timeMax: range.timeMax,
@@ -1696,11 +1713,38 @@ async function listGoogleCalendarEventsOnDate(
     }
   );
   if (!response.ok) {
-    console.log({ stage: "google_calendar_list_failed", status: response.status });
+    console.log({
+      stage: "google_calendar_list_failed",
+      status: response.status,
+      calendar: calendarIdRaw ?? resolveGoogleCalendarId(env)
+    });
     return { ok: false, reason: "fetch_failed" };
   }
   const json = (await response.json()) as { items?: CalendarDateEvent[] };
   return { ok: true, events: Array.isArray(json.items) ? json.items : [] };
+}
+
+async function listLeadCheckConflictEventsOnDate(
+  env: Env,
+  ymd: string
+): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }> {
+  const calendarIds = resolveLeadCheckCalendarIds(env);
+  if (calendarIds.length === 0) {
+    return { ok: false, reason: "fetch_failed" };
+  }
+  const merged: CalendarDateEvent[] = [];
+  for (const calendarId of calendarIds) {
+    const listed = await listGoogleCalendarEventsOnDate(env, ymd, calendarId);
+    if (!listed.ok) {
+      return listed;
+    }
+    for (const event of listed.events) {
+      if (typeof event.id === "string" && typeof event.summary === "string") {
+        merged.push(event);
+      }
+    }
+  }
+  return { ok: true, events: merged };
 }
 
 async function patchGoogleCalendarEventSummary(
@@ -4509,13 +4553,18 @@ async function runLeadCheckForDates(
   let unmarkedCount = 0;
 
   for (const date of dates) {
-    const dayEvents = await listGoogleCalendarEventsOnDate(env, date);
-    if (!dayEvents.ok) {
+    const conflictEvents = await listLeadCheckConflictEventsOnDate(env, date);
+    if (!conflictEvents.ok) {
       holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
       continue;
     }
-    const unavailableReason = detectLeadCheckUnavailableReason(dayEvents.events);
-    const resolved = await resolveMappedWingEventId(env, date, dayEvents.events);
+    const unavailableReason = detectLeadCheckUnavailableReason(conflictEvents.events);
+    const wingDayEvents = await listGoogleCalendarEventsOnDate(env, date);
+    const resolved = await resolveMappedWingEventId(
+      env,
+      date,
+      wingDayEvents.ok ? wingDayEvents.events : []
+    );
     if (!resolved) {
       holdDates.push({ date, message: "Wing予定を特定できませんでした" });
       continue;
@@ -8532,6 +8581,7 @@ export const TEST_HOOKS = {
   isMonthlyFeeTargetRuiName,
   isGoogleCalendarConfigured,
   resolveGoogleCalendarId,
+  resolveLeadCheckCalendarIds,
   normalizeGoogleServiceAccountPrivateKeyPem,
   isSafeWingEventSummary,
   detectLeadCheckUnavailableReason,
