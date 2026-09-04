@@ -28,6 +28,8 @@ const CONTACT_RUI_COMMAND = "塁に連絡";
 const MONTHLY_FEE_COMMAND = "月謝";
 const EXCEL_COMMAND = "Excel";
 const LEAD_CHECK_COMMAND = "引率チェック";
+const REGULAR_CHOUSEISAN_URL_COMMAND = "通常調整さん";
+const PERSONAL_CHOUSEISAN_URL_COMMAND = "個人調整さん";
 const DEFAULT_EXCEL_URL =
   "https://1drv.ms/x/c/9bd7af7f5c25ad41/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc?e=sfvpfA";
 const WING_EVENT_TITLE = "wing練習";
@@ -3781,6 +3783,50 @@ function isExcelCommand(inputText: string): boolean {
 
 function isLeadCheckCommand(inputText: string): boolean {
   return inputText.trim() === LEAD_CHECK_COMMAND;
+}
+
+function isRegularChouseisanUrlCommand(inputText: string): boolean {
+  return inputText.trim() === REGULAR_CHOUSEISAN_URL_COMMAND;
+}
+
+function isPersonalChouseisanUrlCommand(inputText: string): boolean {
+  return inputText.trim() === PERSONAL_CHOUSEISAN_URL_COMMAND;
+}
+
+function buildChouseisanUrlReplyText(kind: ChouseisanSyncKind, url: string | null): string {
+  if (kind === "regular") {
+    if (!url) {
+      return "通常練習の調整さんURLがまだ登録されていません。";
+    }
+    return `通常練習の調整さんはこちら\n${url}`;
+  }
+  if (!url) {
+    return "個人練習の調整さんURLがまだ登録されていません。";
+  }
+  return `個人練習の調整さんはこちら\n${url}`;
+}
+
+async function handleChouseisanUrlCommand(
+  event: LineWebhookEvent,
+  env: Env,
+  kind: ChouseisanSyncKind
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const url = await env.STATE.get(chouseisanUrlKey(kind));
+  const normalized = typeof url === "string" && url.trim().length > 0 ? url.trim() : null;
+  console.log({ stage: "chouseisan_url_lookup", kind, hasUrl: Boolean(normalized) });
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: buildChouseisanUrlReplyText(kind, normalized) }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
 }
 
 function normalizeNameWithoutSpaces(name: string): string {
@@ -8172,6 +8218,14 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     await handleLeadCheckCommand(event, env);
     return;
   }
+  if (isRegularChouseisanUrlCommand(inputText)) {
+    await handleChouseisanUrlCommand(event, env, "regular");
+    return;
+  }
+  if (isPersonalChouseisanUrlCommand(inputText)) {
+    await handleChouseisanUrlCommand(event, env, "personal");
+    return;
+  }
 
   if (MENU_TRIGGERS.has(inputText)) {
     console.log({ stage: "line_reply_start" });
@@ -8189,38 +8243,10 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
   const contactCommand = parseRuiContactCommand(inputText, event.timestamp ?? Date.now());
   if (contactCommand) {
-    const userId = event.source?.userId;
-    if (!userId) {
-      console.log({ stage: "line_reply_start" });
-      const lineStatus = await replyMessages(
-        event.replyToken,
-        [buildSourceQuickReply("先に情報源を選んでください。")],
-        env.LINE_CHANNEL_ACCESS_TOKEN
-      );
-      if (typeof lineStatus === "number") {
-        console.log({ stage: "line_reply_success", status: lineStatus });
-        console.log({ stage: "background_processing_complete" });
-      }
-      return;
-    }
-    const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
-    if (!selectedSourceId || !isSourceId(selectedSourceId)) {
-      console.log({ stage: "line_reply_start" });
-      const lineStatus = await replyMessages(
-        event.replyToken,
-        [buildSourceQuickReply("先に情報源を選んでください。")],
-        env.LINE_CHANNEL_ACCESS_TOKEN
-      );
-      if (typeof lineStatus === "number") {
-        console.log({ stage: "line_reply_success", status: lineStatus });
-        console.log({ stage: "background_processing_complete" });
-      }
-      return;
-    }
-    const sourceLabel = sourceIdToLabel(selectedSourceId);
+    // 塁に連絡は情報源選択と無関係。羽魂練習会の確定情報から決定論生成する。
     const contactText = await buildRuiContactMessage(
       env.DB,
-      sourceLabel,
+      sourceIdToLabel("wing"),
       contactCommand.dates,
       contactCommand.labels
     );
@@ -8690,6 +8716,9 @@ export const TEST_HOOKS = {
   isMonthlyFeeCommand,
   isExcelCommand,
   isLeadCheckCommand,
+  isRegularChouseisanUrlCommand,
+  isPersonalChouseisanUrlCommand,
+  buildChouseisanUrlReplyText,
   isMonthlyFeeTargetRuiName,
   isGoogleCalendarConfigured,
   resolveGoogleCalendarId,

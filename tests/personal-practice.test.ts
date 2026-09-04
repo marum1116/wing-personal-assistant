@@ -337,6 +337,36 @@ async function main() {
   assert.equal(hooks.isExcelCommand("Excel一覧"), false);
   assert.equal(hooks.isExcelCommand("excel"), false);
   assert.equal(hooks.isExcelCommand("エクセル"), false);
+  assert.equal(hooks.isRegularChouseisanUrlCommand("通常調整さん"), true);
+  assert.equal(hooks.isRegularChouseisanUrlCommand(" 通常調整さん "), true);
+  assert.equal(hooks.isRegularChouseisanUrlCommand("通常調整さん同期"), false);
+  assert.equal(hooks.isRegularChouseisanUrlCommand("通常練習調整さん同期"), false);
+  assert.equal(hooks.isPersonalChouseisanUrlCommand("個人調整さん"), true);
+  assert.equal(hooks.isPersonalChouseisanUrlCommand(" 個人調整さん "), true);
+  assert.equal(hooks.isPersonalChouseisanUrlCommand("個人調整さん同期"), false);
+  assert.equal(hooks.isPersonalChouseisanUrlCommand("個別調整さん同期"), false);
+  assert.equal(hooks.parseChouseisanSyncCommand("通常調整さん"), null);
+  assert.equal(hooks.parseChouseisanSyncCommand("個人調整さん"), null);
+  assert.ok(hooks.parseChouseisanSyncCommand("通常調整さん同期"));
+  assert.equal(hooks.parseChouseisanSyncCommand("通常調整さん同期")?.target, "regular");
+  assert.ok(hooks.parseChouseisanSyncCommand("個人調整さん同期"));
+  assert.equal(hooks.parseChouseisanSyncCommand("個人調整さん同期")?.target, "personal");
+  assert.equal(
+    hooks.buildChouseisanUrlReplyText("regular", "https://chouseisan.com/s?h=regular-url"),
+    "通常練習の調整さんはこちら\nhttps://chouseisan.com/s?h=regular-url"
+  );
+  assert.equal(
+    hooks.buildChouseisanUrlReplyText("regular", null),
+    "通常練習の調整さんURLがまだ登録されていません。"
+  );
+  assert.equal(
+    hooks.buildChouseisanUrlReplyText("personal", "https://chouseisan.com/s?h=personal-url"),
+    "個人練習の調整さんはこちら\nhttps://chouseisan.com/s?h=personal-url"
+  );
+  assert.equal(
+    hooks.buildChouseisanUrlReplyText("personal", null),
+    "個人練習の調整さんURLがまだ登録されていません。"
+  );
   assert.equal(hooks.isGoogleCalendarConfigured({} as any), false);
   assert.equal(
     hooks.isGoogleCalendarConfigured({
