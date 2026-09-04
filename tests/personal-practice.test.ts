@@ -337,6 +337,20 @@ async function main() {
   assert.equal(hooks.isExcelCommand("Excel一覧"), false);
   assert.equal(hooks.isExcelCommand("excel"), false);
   assert.equal(hooks.isExcelCommand("エクセル"), false);
+  assert.equal(hooks.isGoogleCalendarConfigured({} as any), false);
+  assert.equal(
+    hooks.isGoogleCalendarConfigured({
+      GOOGLE_SERVICE_ACCOUNT_EMAIL: "bot@example.com",
+      GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: "dummy"
+    } as any),
+    true
+  );
+  assert.equal(hooks.resolveGoogleCalendarId({} as any), "pachira803.2nd@gmail.com");
+  assert.equal(hooks.resolveGoogleCalendarId({ GOOGLE_CALENDAR_ID: "pachira803.2nd" } as any), "pachira803.2nd@gmail.com");
+  assert.equal(
+    hooks.resolveGoogleCalendarId({ GOOGLE_CALENDAR_ID: "pachira803.2nd@gmail.com" } as any),
+    "pachira803.2nd@gmail.com"
+  );
   assert.match(
     hooks.buildExcelReplyText({} as any),
     /https:\/\/1drv\.ms\/x\/c\/9bd7af7f5c25ad41\/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc\?e=sfvpfA/

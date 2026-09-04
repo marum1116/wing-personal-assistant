@@ -32,6 +32,7 @@ const DEFAULT_EXCEL_URL =
 const WING_EVENT_TITLE = "wing練習";
 const WING_EVENT_MARKED_TITLE = "◯wing練習";
 const WING_EVENT_TENTATIVE_TITLE = "仮）wing練習";
+const DEFAULT_GOOGLE_CALENDAR_ID = "pachira803.2nd@gmail.com";
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
 const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
 const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
@@ -1496,6 +1497,22 @@ function ruiCalendarEventKey(kind: ChouseisanSyncKind, practiceDate: string): st
   return `rui_calendar_event:${kind}:${practiceDate}`;
 }
 
+function isGoogleCalendarConfigured(env: Env): boolean {
+  return Boolean(env.GOOGLE_SERVICE_ACCOUNT_EMAIL && env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY);
+}
+
+function resolveGoogleCalendarId(env: Env): string {
+  const raw = (env.GOOGLE_CALENDAR_ID ?? DEFAULT_GOOGLE_CALENDAR_ID).trim();
+  if (raw.includes("@")) {
+    return raw;
+  }
+  return `${raw}@gmail.com`;
+}
+
+function encodedGoogleCalendarId(env: Env): string {
+  return encodeURIComponent(resolveGoogleCalendarId(env));
+}
+
 function isSafeWingEventSummary(summary: string): boolean {
   return summary === WING_EVENT_TITLE || summary === WING_EVENT_MARKED_TITLE;
 }
@@ -1533,9 +1550,10 @@ async function fetchGoogleCalendarEventById(
 ): Promise<{ ok: true; event: CalendarDateEvent } | { ok: false; reason: "auth_missing" | "fetch_failed" }> {
   const accessToken = await getGoogleCalendarAccessToken(env);
   if (!accessToken) {
+    console.log({ stage: "google_calendar_auth_missing" });
     return { ok: false, reason: "auth_missing" };
   }
-  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const calendarId = encodedGoogleCalendarId(env);
   const response = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}?fields=id,summary,start,end`,
     {
@@ -1565,15 +1583,16 @@ async function listGoogleCalendarEventsOnDate(
   }
   const accessToken = await getGoogleCalendarAccessToken(env);
   if (!accessToken) {
+    console.log({ stage: "google_calendar_auth_missing" });
     return { ok: false, reason: "auth_missing" };
   }
-  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const calendarId = encodedGoogleCalendarId(env);
   const query = new URLSearchParams({
     timeMin: range.timeMin,
     timeMax: range.timeMax,
     singleEvents: "true",
     orderBy: "startTime",
-    fields: "items(id,summary,start,end)"
+    timeZone: "Asia/Tokyo"
   });
   const response = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?${query.toString()}`,
@@ -1585,6 +1604,7 @@ async function listGoogleCalendarEventsOnDate(
     }
   );
   if (!response.ok) {
+    console.log({ stage: "google_calendar_list_failed", status: response.status });
     return { ok: false, reason: "fetch_failed" };
   }
   const json = (await response.json()) as { items?: CalendarDateEvent[] };
@@ -1600,7 +1620,7 @@ async function patchGoogleCalendarEventSummary(
   if (!accessToken) {
     return "skipped";
   }
-  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const calendarId = encodedGoogleCalendarId(env);
   const response = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}`,
     {
@@ -1626,7 +1646,7 @@ async function upsertGoogleCalendarEvent(
   if (!accessToken) {
     return "skipped";
   }
-  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const calendarId = encodedGoogleCalendarId(env);
   const timeZone = env.GOOGLE_CALENDAR_TIMEZONE ?? "Asia/Tokyo";
   const mappingKey = ruiCalendarEventKey(practiceKind, practiceDate);
   const existingRaw = await env.STATE.get(mappingKey);
@@ -1726,7 +1746,7 @@ async function deleteGoogleCalendarEventIfExists(
   if (!existing.eventId) {
     return "skipped";
   }
-  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const calendarId = encodedGoogleCalendarId(env);
   const deleteRes = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(existing.eventId)}`,
     {
@@ -4428,6 +4448,20 @@ async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promis
     return;
   }
   console.log({ stage: "lead_check_start" });
+  if (!isGoogleCalendarConfigured(env)) {
+    console.log({ stage: "lead_check_calendar_auth_missing" });
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "引率チェックを実行できませんでした。\n理由: Googleカレンダーに接続できません。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
   const nowMs = event.timestamp ?? Date.now();
   const extracted = await extractRegularCircleDatesForLeadCheck(env, nowMs);
   if (!extracted.ok) {
@@ -8344,6 +8378,8 @@ export const TEST_HOOKS = {
   isExcelCommand,
   isLeadCheckCommand,
   isMonthlyFeeTargetRuiName,
+  isGoogleCalendarConfigured,
+  resolveGoogleCalendarId,
   isSafeWingEventSummary,
   detectLeadCheckUnavailableReason,
   extractRegularCircleDatesForLeadCheck,
