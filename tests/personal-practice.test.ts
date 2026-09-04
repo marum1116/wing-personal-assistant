@@ -699,6 +699,87 @@ async function main() {
     "jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com"
   ]);
 
+  // プライベートが読めなくても、marumnxが読めればセミナー判定は継続する
+  const { env: leadEnvPartialCal } = createTestEnv();
+  (leadEnvPartialCal as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvPartialCal as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await leadEnvPartialCal.STATE.put("rui_calendar_event:regular:2026-09-28", JSON.stringify({ eventId: "event-28b", status: "circle" }));
+  await leadEnvPartialCal.STATE.put("rui_calendar_event:regular:2026-09-29", JSON.stringify({ eventId: "event-29b", status: "circle" }));
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      if (url.includes("jdq62uticpi33e2h7ahjh6nceo")) {
+        return new Response("forbidden", { status: 403 });
+      }
+      if (url.includes("marumnx") && url.includes("2026-09-28")) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: "seminar-28b",
+                summary: "管理職セミナー⑧-1",
+                start: { dateTime: "2026-09-28T21:30:00+09:00" },
+                end: { dateTime: "2026-09-28T22:30:00+09:00" }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.includes("/events/event-28b?fields=id,summary,start,end")) {
+      return new Response(
+        JSON.stringify({
+          id: "event-28b",
+          summary: "◯wing練習",
+          start: { dateTime: "2026-09-28T19:00:00+09:00" },
+          end: { dateTime: "2026-09-28T21:00:00+09:00" }
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/event-29b?fields=id,summary,start,end")) {
+      return new Response(
+        JSON.stringify({
+          id: "event-29b",
+          summary: "◯wing練習",
+          start: { dateTime: "2026-09-29T19:00:00+09:00" },
+          end: { dateTime: "2026-09-29T21:00:00+09:00" }
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/event-28b") && init?.method === "PATCH") {
+      return new Response(JSON.stringify({ id: "event-28b" }), { status: 200 });
+    }
+    if (url.includes("/events/event-29b") && init?.method === "PATCH") {
+      return new Response(JSON.stringify({ id: "event-29b" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadRunPartialCal = await hooks.runLeadCheckForDates(leadEnvPartialCal as any, ["2026-09-28", "2026-09-29"]);
+  assert.deepEqual(leadRunPartialCal.unavailableDates, [{ date: "2026-09-28", reason: "セミナー" }]);
+  assert.deepEqual(leadRunPartialCal.availableDates, ["2026-09-29"]);
+  assert.deepEqual(leadRunPartialCal.failedConflictCalendarIds, [
+    "jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com"
+  ]);
+  assert.match(
+    hooks.buildLeadCheckReplyText({
+      dates: ["2026-09-28", "2026-09-29"],
+      availableDates: leadRunPartialCal.availableDates,
+      unavailableDates: leadRunPartialCal.unavailableDates,
+      holdDates: [],
+      markedCount: 0,
+      unmarkedCount: 1,
+      failedConflictCalendarIds: leadRunPartialCal.failedConflictCalendarIds
+    }),
+    /一部カレンダーを確認できませんでした/
+  );
+
   // 調整さん再同期: 既に◯wing練習ならmarker維持（通常練習○で上書きしない）
   const { env: syncEnv } = createTestEnv();
   (syncEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;

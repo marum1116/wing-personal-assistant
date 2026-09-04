@@ -1726,9 +1726,9 @@ async function listGoogleCalendarEventsOnDate(
 
 async function listLeadCheckConflictEventsOnDate(
   env: Env,
-  ymd: string
+  ymd: string,
+  calendarIds: string[]
 ): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }> {
-  const calendarIds = resolveLeadCheckCalendarIds(env);
   if (calendarIds.length === 0) {
     return { ok: false, reason: "fetch_failed" };
   }
@@ -1745,6 +1745,37 @@ async function listLeadCheckConflictEventsOnDate(
     }
   }
   return { ok: true, events: merged };
+}
+
+async function resolveReadableLeadCheckCalendarIds(
+  env: Env,
+  sampleYmd: string
+): Promise<
+  | { ok: true; calendarIds: string[]; failedCalendarIds: string[] }
+  | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }
+> {
+  const configuredIds = resolveLeadCheckCalendarIds(env);
+  if (configuredIds.length === 0) {
+    return { ok: false, reason: "fetch_failed" };
+  }
+  const readableIds: string[] = [];
+  const failedCalendarIds: string[] = [];
+  for (const calendarId of configuredIds) {
+    const listed = await listGoogleCalendarEventsOnDate(env, sampleYmd, calendarId);
+    if (!listed.ok) {
+      if (listed.reason === "auth_missing" || listed.reason === "invalid_date") {
+        return { ok: false, reason: listed.reason };
+      }
+      failedCalendarIds.push(calendarId);
+      console.log({ stage: "lead_check_conflict_calendar_unavailable", calendar: calendarId });
+      continue;
+    }
+    readableIds.push(calendarId);
+  }
+  if (readableIds.length === 0) {
+    return { ok: false, reason: "fetch_failed" };
+  }
+  return { ok: true, calendarIds: readableIds, failedCalendarIds };
 }
 
 async function patchGoogleCalendarEventSummary(
@@ -4505,6 +4536,7 @@ function buildLeadCheckReplyText(params: {
   holdDates: Array<{ date: string; message: string }>;
   markedCount: number;
   unmarkedCount: number;
+  failedConflictCalendarIds?: string[];
 }): string {
   if (params.dates.length === 0) {
     return `${monthHeaderForLeadCheck(params.dates)}\n\n対象の通常練習（○）はありませんでした。`;
@@ -4517,7 +4549,7 @@ function buildLeadCheckReplyText(params: {
   const holdLines = params.holdDates.map(
     (item) => `${formatYmdWithJapaneseWeekday(item.date)} ${item.message}`
   );
-  return [
+  const lines = [
     header,
     "",
     "引率可能",
@@ -4533,7 +4565,15 @@ function buildLeadCheckReplyText(params: {
     `○付与 ${params.markedCount}件`,
     `○解除 ${params.unmarkedCount}件`,
     `保留 ${holdLines.length}件`
-  ].join("\n");
+  ];
+  if ((params.failedConflictCalendarIds?.length ?? 0) > 0) {
+    lines.push(
+      "",
+      "※ 一部カレンダーを確認できませんでした。",
+      "　飲み会など、未共有カレンダー側の不可判定が漏れる可能性があります。"
+    );
+  }
+  return lines.join("\n");
 }
 
 async function runLeadCheckForDates(
@@ -4545,15 +4585,28 @@ async function runLeadCheckForDates(
   holdDates: Array<{ date: string; message: string }>;
   markedCount: number;
   unmarkedCount: number;
+  failedConflictCalendarIds: string[];
 }> {
   const availableDates: string[] = [];
   const unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }> = [];
   const holdDates: Array<{ date: string; message: string }> = [];
   let markedCount = 0;
   let unmarkedCount = 0;
+  let failedConflictCalendarIds: string[] = [];
+  let readableConflictCalendarIds: string[] | null = null;
 
   for (const date of dates) {
-    const conflictEvents = await listLeadCheckConflictEventsOnDate(env, date);
+    if (!readableConflictCalendarIds) {
+      const probed = await resolveReadableLeadCheckCalendarIds(env, date);
+      if (!probed.ok) {
+        holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
+        continue;
+      }
+      readableConflictCalendarIds = probed.calendarIds;
+      failedConflictCalendarIds = probed.failedCalendarIds;
+    }
+
+    const conflictEvents = await listLeadCheckConflictEventsOnDate(env, date, readableConflictCalendarIds);
     if (!conflictEvents.ok) {
       holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
       continue;
@@ -4600,7 +4653,14 @@ async function runLeadCheckForDates(
     }
   }
 
-  return { availableDates, unavailableDates, holdDates, markedCount, unmarkedCount };
+  return {
+    availableDates,
+    unavailableDates,
+    holdDates,
+    markedCount,
+    unmarkedCount,
+    failedConflictCalendarIds
+  };
 }
 
 async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promise<void> {
@@ -4704,7 +4764,8 @@ async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promis
       unavailableDates: leadCheckResult.unavailableDates,
       holdDates: leadCheckResult.holdDates,
       markedCount: leadCheckResult.markedCount,
-      unmarkedCount: leadCheckResult.unmarkedCount
+      unmarkedCount: leadCheckResult.unmarkedCount,
+      failedConflictCalendarIds: leadCheckResult.failedConflictCalendarIds
     });
 
     console.log({ stage: "line_reply_start" });
