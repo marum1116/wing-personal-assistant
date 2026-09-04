@@ -571,14 +571,23 @@ async function main() {
       return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
     }
     if (url.includes("/events?")) {
-      if (url.includes("2026-09-10")) {
-        return new Response(
-          JSON.stringify({ items: [{ id: "other", summary: "打ち合わせ", start: { dateTime: "2026-09-10T19:00:00+09:00" }, end: { dateTime: "2026-09-10T20:00:00+09:00" } }] }),
-          { status: 200 }
-        );
-      }
       return new Response(
-        JSON.stringify({ items: [{ id: "seminar", summary: "管理職セミナー", start: { dateTime: "2026-09-11T21:30:00+09:00" }, end: { dateTime: "2026-09-11T22:30:00+09:00" } }] }),
+        JSON.stringify({
+          items: [
+            {
+              id: "other",
+              summary: "打ち合わせ",
+              start: { dateTime: "2026-09-10T19:00:00+09:00" },
+              end: { dateTime: "2026-09-10T20:00:00+09:00" }
+            },
+            {
+              id: "seminar",
+              summary: "管理職セミナー",
+              start: { dateTime: "2026-09-11T21:30:00+09:00" },
+              end: { dateTime: "2026-09-11T22:30:00+09:00" }
+            }
+          ]
+        }),
         { status: 200 }
       );
     }
@@ -607,10 +616,12 @@ async function main() {
   assert.equal(leadRunUpdate.unmarkedCount, 1);
   assert.deepEqual(patchedSummaries, ["◯wing練習", "wing練習"]);
 
-  // 不可判定は marumnx / プライベート側の予定を見る（Wingカレンダー単体では見ない）
+  // 不可判定は設定した複数Calendarをまとめて見る
   const { env: leadEnvMultiCal } = createTestEnv();
   (leadEnvMultiCal as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
   (leadEnvMultiCal as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  (leadEnvMultiCal as any).GOOGLE_LEAD_CHECK_CALENDAR_IDS =
+    "marumnx@gmail.com,jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com";
   await leadEnvMultiCal.STATE.put("rui_calendar_event:regular:2026-09-28", JSON.stringify({ eventId: "event-28", status: "circle" }));
   await leadEnvMultiCal.STATE.put("rui_calendar_event:regular:2026-09-29", JSON.stringify({ eventId: "event-29", status: "circle" }));
   const multiPatched: string[] = [];
@@ -620,7 +631,7 @@ async function main() {
       return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
     }
     if (url.includes("/events?")) {
-      if (url.includes("marumnx") && url.includes("2026-09-28")) {
+      if (url.includes("marumnx")) {
         return new Response(
           JSON.stringify({
             items: [
@@ -635,7 +646,7 @@ async function main() {
           { status: 200 }
         );
       }
-      if (url.includes("jdq62uticpi33e2h7ahjh6nceo") && url.includes("2026-09-29")) {
+      if (url.includes("jdq62uticpi33e2h7ahjh6nceo")) {
         return new Response(
           JSON.stringify({
             items: [
@@ -694,15 +705,14 @@ async function main() {
   ]);
   assert.equal(leadRunMultiCal.unmarkedCount, 2);
   assert.deepEqual(multiPatched, ["28:wing練習", "29:wing練習"]);
-  assert.deepEqual(hooks.resolveLeadCheckCalendarIds({} as any), [
-    "marumnx@gmail.com",
-    "jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com"
-  ]);
+  assert.deepEqual(hooks.resolveLeadCheckCalendarIds({} as any), ["marumnx@gmail.com"]);
 
-  // プライベートが読めなくても、marumnxが読めればセミナー判定は継続する
+  // 追加Calendarが読めなくても、marumnxが読めればセミナー判定は継続する
   const { env: leadEnvPartialCal } = createTestEnv();
   (leadEnvPartialCal as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
   (leadEnvPartialCal as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  (leadEnvPartialCal as any).GOOGLE_LEAD_CHECK_CALENDAR_IDS =
+    "marumnx@gmail.com,jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com";
   await leadEnvPartialCal.STATE.put("rui_calendar_event:regular:2026-09-28", JSON.stringify({ eventId: "event-28b", status: "circle" }));
   await leadEnvPartialCal.STATE.put("rui_calendar_event:regular:2026-09-29", JSON.stringify({ eventId: "event-29b", status: "circle" }));
   globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -714,7 +724,7 @@ async function main() {
       if (url.includes("jdq62uticpi33e2h7ahjh6nceo")) {
         return new Response("forbidden", { status: 403 });
       }
-      if (url.includes("marumnx") && url.includes("2026-09-28")) {
+      if (url.includes("marumnx")) {
         return new Response(
           JSON.stringify({
             items: [

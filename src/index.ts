@@ -34,10 +34,8 @@ const WING_EVENT_TITLE = "wing練習";
 const WING_EVENT_MARKED_TITLE = "◯wing練習";
 const WING_EVENT_TENTATIVE_TITLE = "仮）wing練習";
 const DEFAULT_GOOGLE_CALENDAR_ID = "pachira803.2nd@gmail.com";
-const DEFAULT_LEAD_CHECK_CALENDAR_IDS = [
-  "marumnx@gmail.com",
-  "jdq62uticpi33e2h7ahjh6nceo@group.calendar.google.com"
-] as const;
+// プライベートは閲覧のみで共有不可のため、既定は marumnx のみ（飲み会は手動確認）
+const DEFAULT_LEAD_CHECK_CALENDAR_IDS = ["marumnx@gmail.com"] as const;
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
 const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
 const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
@@ -1487,7 +1485,12 @@ function decodePemBodyToPkcs8Der(privateKeyPem: string): ArrayBuffer | null {
   }
 }
 
+let cachedGoogleCalendarAccessToken: { token: string; expiresAtMs: number } | null = null;
+
 async function getGoogleCalendarAccessToken(env: Env): Promise<string | null> {
+  if (cachedGoogleCalendarAccessToken && cachedGoogleCalendarAccessToken.expiresAtMs > Date.now()) {
+    return cachedGoogleCalendarAccessToken.token;
+  }
   const email = env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const privateKeyRaw = env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY;
   if (!email || !privateKeyRaw) {
@@ -1543,7 +1546,14 @@ async function getGoogleCalendarAccessToken(env: Env): Promise<string | null> {
       return null;
     }
     const tokenJson = (await tokenRes.json()) as { access_token?: string };
-    return typeof tokenJson.access_token === "string" ? tokenJson.access_token : null;
+    const token = typeof tokenJson.access_token === "string" ? tokenJson.access_token : null;
+    if (token) {
+      cachedGoogleCalendarAccessToken = {
+        token,
+        expiresAtMs: Date.now() + 50 * 60 * 1000
+      };
+    }
+    return token;
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "unknown";
     console.log({ stage: "google_calendar_auth_exception", errorType });
@@ -1681,15 +1691,12 @@ async function fetchGoogleCalendarEventById(
   return { ok: true, event };
 }
 
-async function listGoogleCalendarEventsOnDate(
+async function listGoogleCalendarEventsInRange(
   env: Env,
-  ymd: string,
+  timeMin: string,
+  timeMax: string,
   calendarIdRaw?: string
-): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }> {
-  const range = toTimedRangeForJstDay(ymd);
-  if (!range) {
-    return { ok: false, reason: "invalid_date" };
-  }
+): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" }> {
   const accessToken = await getGoogleCalendarAccessToken(env);
   if (!accessToken) {
     console.log({ stage: "google_calendar_auth_missing" });
@@ -1697,11 +1704,12 @@ async function listGoogleCalendarEventsOnDate(
   }
   const calendarId = encodeURIComponent((calendarIdRaw ?? resolveGoogleCalendarId(env)).trim());
   const query = new URLSearchParams({
-    timeMin: range.timeMin,
-    timeMax: range.timeMax,
+    timeMin,
+    timeMax,
     singleEvents: "true",
     orderBy: "startTime",
-    timeZone: "Asia/Tokyo"
+    timeZone: "Asia/Tokyo",
+    maxResults: "250"
   });
   const response = await fetch(
     `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?${query.toString()}`,
@@ -1724,58 +1732,96 @@ async function listGoogleCalendarEventsOnDate(
   return { ok: true, events: Array.isArray(json.items) ? json.items : [] };
 }
 
-async function listLeadCheckConflictEventsOnDate(
+function calendarEventStartYmdJst(event: CalendarDateEvent): string | null {
+  const raw = event.start?.dateTime ?? event.start?.date;
+  if (typeof raw !== "string" || raw.length === 0) {
+    return null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return raw;
+  }
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) {
+    const matched = /^(\d{4}-\d{2}-\d{2})T/.exec(raw);
+    return matched?.[1] ?? null;
+  }
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(new Date(ms));
+}
+
+async function listGoogleCalendarEventsOnDate(
   env: Env,
   ymd: string,
-  calendarIds: string[]
+  calendarIdRaw?: string
 ): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }> {
+  const range = toTimedRangeForJstDay(ymd);
+  if (!range) {
+    return { ok: false, reason: "invalid_date" };
+  }
+  return listGoogleCalendarEventsInRange(env, range.timeMin, range.timeMax, calendarIdRaw);
+}
+
+async function prefetchLeadCheckConflictEventsByDate(
+  env: Env,
+  dates: string[],
+  calendarIds: string[]
+): Promise<
+  | { ok: true; byDate: Map<string, CalendarDateEvent[]>; failedCalendarIds: string[] }
+  | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }
+> {
   if (calendarIds.length === 0) {
     return { ok: false, reason: "fetch_failed" };
   }
-  const merged: CalendarDateEvent[] = [];
-  for (const calendarId of calendarIds) {
-    const listed = await listGoogleCalendarEventsOnDate(env, ymd, calendarId);
-    if (!listed.ok) {
-      return listed;
-    }
-    for (const event of listed.events) {
-      if (typeof event.id === "string" && typeof event.summary === "string") {
-        merged.push(event);
-      }
-    }
+  if (dates.length === 0) {
+    return { ok: true, byDate: new Map(), failedCalendarIds: [] };
   }
-  return { ok: true, events: merged };
-}
+  const sorted = [...dates].sort();
+  const first = sorted[0]!;
+  const last = sorted[sorted.length - 1]!;
+  const startRange = toTimedRangeForJstDay(first);
+  const endRange = toTimedRangeForJstDay(last);
+  if (!startRange || !endRange) {
+    return { ok: false, reason: "invalid_date" };
+  }
 
-async function resolveReadableLeadCheckCalendarIds(
-  env: Env,
-  sampleYmd: string
-): Promise<
-  | { ok: true; calendarIds: string[]; failedCalendarIds: string[] }
-  | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }
-> {
-  const configuredIds = resolveLeadCheckCalendarIds(env);
-  if (configuredIds.length === 0) {
-    return { ok: false, reason: "fetch_failed" };
+  const byDate = new Map<string, CalendarDateEvent[]>();
+  for (const date of dates) {
+    byDate.set(date, []);
   }
-  const readableIds: string[] = [];
   const failedCalendarIds: string[] = [];
-  for (const calendarId of configuredIds) {
-    const listed = await listGoogleCalendarEventsOnDate(env, sampleYmd, calendarId);
+  let readableCount = 0;
+
+  for (const calendarId of calendarIds) {
+    const listed = await listGoogleCalendarEventsInRange(env, startRange.timeMin, endRange.timeMax, calendarId);
     if (!listed.ok) {
-      if (listed.reason === "auth_missing" || listed.reason === "invalid_date") {
-        return { ok: false, reason: listed.reason };
+      if (listed.reason === "auth_missing") {
+        return { ok: false, reason: "auth_missing" };
       }
       failedCalendarIds.push(calendarId);
       console.log({ stage: "lead_check_conflict_calendar_unavailable", calendar: calendarId });
       continue;
     }
-    readableIds.push(calendarId);
+    readableCount += 1;
+    for (const event of listed.events) {
+      if (typeof event.id !== "string" || typeof event.summary !== "string") {
+        continue;
+      }
+      const ymd = calendarEventStartYmdJst(event);
+      if (!ymd || !byDate.has(ymd)) {
+        continue;
+      }
+      byDate.get(ymd)!.push(event);
+    }
   }
-  if (readableIds.length === 0) {
+
+  if (readableCount === 0) {
     return { ok: false, reason: "fetch_failed" };
   }
-  return { ok: true, calendarIds: readableIds, failedCalendarIds };
+  return { ok: true, byDate, failedCalendarIds };
 }
 
 async function patchGoogleCalendarEventSummary(
@@ -4592,32 +4638,37 @@ async function runLeadCheckForDates(
   const holdDates: Array<{ date: string; message: string }> = [];
   let markedCount = 0;
   let unmarkedCount = 0;
-  let failedConflictCalendarIds: string[] = [];
-  let readableConflictCalendarIds: string[] | null = null;
+
+  const conflictPrefetch = await prefetchLeadCheckConflictEventsByDate(
+    env,
+    dates,
+    resolveLeadCheckCalendarIds(env)
+  );
+  if (!conflictPrefetch.ok) {
+    for (const date of dates) {
+      holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
+    }
+    return {
+      availableDates,
+      unavailableDates,
+      holdDates,
+      markedCount,
+      unmarkedCount,
+      failedConflictCalendarIds: []
+    };
+  }
+  const failedConflictCalendarIds = conflictPrefetch.failedCalendarIds;
 
   for (const date of dates) {
-    if (!readableConflictCalendarIds) {
-      const probed = await resolveReadableLeadCheckCalendarIds(env, date);
-      if (!probed.ok) {
-        holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
-        continue;
-      }
-      readableConflictCalendarIds = probed.calendarIds;
-      failedConflictCalendarIds = probed.failedCalendarIds;
+    const conflictEvents = conflictPrefetch.byDate.get(date) ?? [];
+    const unavailableReason = detectLeadCheckUnavailableReason(conflictEvents);
+    const mappingRaw = await env.STATE.get(ruiCalendarEventKey("regular", date));
+    let wingDayEvents: CalendarDateEvent[] = [];
+    if (!mappingRaw) {
+      const listedWing = await listGoogleCalendarEventsOnDate(env, date);
+      wingDayEvents = listedWing.ok ? listedWing.events : [];
     }
-
-    const conflictEvents = await listLeadCheckConflictEventsOnDate(env, date, readableConflictCalendarIds);
-    if (!conflictEvents.ok) {
-      holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
-      continue;
-    }
-    const unavailableReason = detectLeadCheckUnavailableReason(conflictEvents.events);
-    const wingDayEvents = await listGoogleCalendarEventsOnDate(env, date);
-    const resolved = await resolveMappedWingEventId(
-      env,
-      date,
-      wingDayEvents.ok ? wingDayEvents.events : []
-    );
+    const resolved = await resolveMappedWingEventId(env, date, wingDayEvents);
     if (!resolved) {
       holdDates.push({ date, message: "Wing予定を特定できませんでした" });
       continue;
