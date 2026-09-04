@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import { TEST_HOOKS } from "../src/index";
@@ -244,11 +245,20 @@ function baseResult(overrides: Record<string, unknown>) {
   };
 }
 
+function createGoogleCalendarTestCredentials() {
+  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  return {
+    email: "bot@example.com",
+    privateKeyPem: privateKey.export({ type: "pkcs8", format: "pem" }).toString()
+  };
+}
+
 async function main() {
   const { raw, env } = createTestEnv();
   const hooks = TEST_HOOKS;
   const sourceId = "wing" as const;
   const userId = "test-user";
+  const googleCreds = createGoogleCalendarTestCredentials();
 
   // Pairing Case A: take-nearestが正常nullでも本文処理継続相当（null返却）
   let pairingFetchCalled = false;
@@ -322,6 +332,22 @@ async function main() {
   assert.equal(hooks.isMonthlyFeeCommand("月謝"), true);
   assert.equal(hooks.isMonthlyFeeCommand(" 月謝 "), true);
   assert.equal(hooks.isMonthlyFeeCommand("月謝一覧"), false);
+  assert.equal(hooks.isExcelCommand("Excel"), true);
+  assert.equal(hooks.isExcelCommand(" Excel "), true);
+  assert.equal(hooks.isExcelCommand("Excel一覧"), false);
+  assert.equal(hooks.isExcelCommand("excel"), false);
+  assert.equal(hooks.isExcelCommand("エクセル"), false);
+  assert.match(
+    hooks.buildExcelReplyText({} as any),
+    /https:\/\/1drv\.ms\/x\/c\/9bd7af7f5c25ad41\/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc\?e=sfvpfA/
+  );
+  assert.equal(hooks.isLeadCheckCommand("引率チェック"), true);
+  assert.equal(hooks.isLeadCheckCommand("引率チェックして"), false);
+  assert.match(hooks.buildExcelReplyText({ EXCEL_URL: undefined } as any), /羽魂Excelはこちら/);
+  assert.match(
+    hooks.buildExcelReplyText({ EXCEL_URL: "https://example.com/excel" } as any),
+    /https:\/\/example\.com\/excel/
+  );
 
   // 月謝コマンド: 渡辺塁の名前判定（空白差を許容）
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺塁"), true);
@@ -331,6 +357,377 @@ async function main() {
   assert.equal(hooks.isMonthlyFeeTargetRuiName("1年生渡辺塁"), true);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺花子"), false);
   assert.equal(hooks.isMonthlyFeeTargetRuiName("渡辺瑠衣"), false);
+
+  // 引率不可判定: セミナー/飲み会/境界条件
+  const leadSeminar2100 = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "a",
+      summary: "管理職セミナー",
+      start: { dateTime: "2026-09-01T21:00:00+09:00" },
+      end: { dateTime: "2026-09-01T22:00:00+09:00" }
+    }
+  ]);
+  assert.equal(leadSeminar2100, "セミナー");
+  const leadSeminar2130 = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "b",
+      summary: "管理職セミナー",
+      start: { dateTime: "2026-09-01T21:30:00+09:00" },
+      end: { dateTime: "2026-09-01T22:30:00+09:00" }
+    }
+  ]);
+  assert.equal(leadSeminar2130, "セミナー");
+  const leadSeminarEndsAfter2100 = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "c",
+      summary: "塁臨海セミナー",
+      start: { dateTime: "2026-09-01T19:10:00+09:00" },
+      end: { dateTime: "2026-09-01T21:30:00+09:00" }
+    }
+  ]);
+  assert.equal(leadSeminarEndsAfter2100, "セミナー");
+  const leadSeminarBefore2100 = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "d",
+      summary: "塁臨海セミナー",
+      start: { dateTime: "2026-09-01T19:00:00+09:00" },
+      end: { dateTime: "2026-09-01T20:30:00+09:00" }
+    }
+  ]);
+  assert.equal(leadSeminarBefore2100, null);
+  const leadSeminarAllDay = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "e",
+      summary: "セミナー準備",
+      start: { date: "2026-09-01" },
+      end: { date: "2026-09-02" }
+    }
+  ]);
+  assert.equal(leadSeminarAllDay, null);
+  const leadDrinking = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "f",
+      summary: "飲み会",
+      start: { dateTime: "2026-09-01T17:00:00+09:00" },
+      end: { dateTime: "2026-09-01T18:00:00+09:00" }
+    }
+  ]);
+  assert.equal(leadDrinking, "飲み会");
+  const leadDrinkingVariant = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "g",
+      summary: "ママ友飲み",
+      start: { dateTime: "2026-09-01T18:00:00+09:00" },
+      end: { dateTime: "2026-09-01T19:00:00+09:00" }
+    }
+  ]);
+  assert.equal(leadDrinkingVariant, "飲み会");
+  const leadKonshinkai = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "h",
+      summary: "懇親会",
+      start: { dateTime: "2026-09-01T18:00:00+09:00" },
+      end: { dateTime: "2026-09-01T19:00:00+09:00" }
+    }
+  ]);
+  assert.equal(leadKonshinkai, null);
+  const leadOtherBusy = hooks.detectLeadCheckUnavailableReason([
+    {
+      id: "i",
+      summary: "打ち合わせ",
+      start: { dateTime: "2026-09-01T18:00:00+09:00" },
+      end: { dateTime: "2026-09-01T20:30:00+09:00" }
+    }
+  ]);
+  assert.equal(leadOtherBusy, null);
+
+  // 引率候補日抽出: 通常調整さんの塁○のみを対象（△/×除外）
+  const originalFetchLead = globalThis.fetch;
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith("https://chouseisan.com/s?h=regular-lead")) {
+      return new Response(`<!DOCTYPE html><html><body><script>window.Chouseisan = ${JSON.stringify({
+        event: { id: "regular-lead", name: "9月通常練習", detail: null, upd_datetime: "2026-09-01T00:00:00.000Z", members: [{ name: "1年渡辺塁", attend: "1,2,3", kouho: null }] },
+        choices: [{ choice: "9/7(月) 19:00〜" }, { choice: "9/8(火) 19:00〜" }, { choice: "9/10(木) 19:00〜" }]
+      })};</script></body></html>`, {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" }
+      });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  await env.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular-lead");
+  const leadDates = await hooks.extractRegularCircleDatesForLeadCheck(env as any, fixedNow);
+  assert.equal(leadDates.ok, true);
+  if (!leadDates.ok) throw new Error(leadDates.message);
+  assert.deepEqual(leadDates.dates, ["2026-09-07"]);
+
+  // 引率チェック実行: map欠損時は保留で新規eventを作らない
+  const { env: leadEnvMissingMap } = createTestEnv();
+  await leadEnvMissingMap.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular-lead");
+  (leadEnvMissingMap as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvMissingMap as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  let leadCreateCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.startsWith("https://chouseisan.com/s?h=regular-lead")) {
+      return new Response(`<!DOCTYPE html><html><body><script>window.Chouseisan = ${JSON.stringify({
+        event: { id: "regular-lead", name: "9月通常練習", detail: null, upd_datetime: "2026-09-01T00:00:00.000Z", members: [{ name: "1年渡辺塁", attend: "1", kouho: null }] },
+        choices: [{ choice: "9/7(月) 19:00〜" }]
+      })};</script></body></html>`, {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" }
+      });
+    }
+    if (url.includes("/events?")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      leadCreateCount += 1;
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadRunMissingMap = await hooks.runLeadCheckForDates(leadEnvMissingMap as any, ["2026-09-07"]);
+  assert.equal(leadRunMissingMap.holdDates.length, 1);
+  assert.equal(leadRunMissingMap.holdDates[0]?.message, "Wing予定を特定できませんでした");
+  assert.equal(leadCreateCount, 0);
+
+  // 引率チェック実行: 可能日は○付与、不可日は○解除
+  const { env: leadEnvUpdate } = createTestEnv();
+  (leadEnvUpdate as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvUpdate as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await leadEnvUpdate.STATE.put("rui_calendar_event:regular:2026-09-10", JSON.stringify({ eventId: "event-10", status: "circle" }));
+  await leadEnvUpdate.STATE.put("rui_calendar_event:regular:2026-09-11", JSON.stringify({ eventId: "event-11", status: "circle" }));
+  const patchedSummaries: string[] = [];
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      if (url.includes("2026-09-10")) {
+        return new Response(
+          JSON.stringify({ items: [{ id: "other", summary: "打ち合わせ", start: { dateTime: "2026-09-10T19:00:00+09:00" }, end: { dateTime: "2026-09-10T20:00:00+09:00" } }] }),
+          { status: 200 }
+        );
+      }
+      return new Response(
+        JSON.stringify({ items: [{ id: "seminar", summary: "管理職セミナー", start: { dateTime: "2026-09-11T21:30:00+09:00" }, end: { dateTime: "2026-09-11T22:30:00+09:00" } }] }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/event-10?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "event-10", summary: "wing練習", start: { dateTime: "2026-09-10T19:00:00+09:00" }, end: { dateTime: "2026-09-10T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/event-11?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "event-11", summary: "◯wing練習", start: { dateTime: "2026-09-11T19:00:00+09:00" }, end: { dateTime: "2026-09-11T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/event-10") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      patchedSummaries.push(body.summary ?? "");
+      return new Response(JSON.stringify({ id: "event-10" }), { status: 200 });
+    }
+    if (url.includes("/events/event-11") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      patchedSummaries.push(body.summary ?? "");
+      return new Response(JSON.stringify({ id: "event-11" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadRunUpdate = await hooks.runLeadCheckForDates(leadEnvUpdate as any, ["2026-09-10", "2026-09-11"]);
+  assert.deepEqual(leadRunUpdate.availableDates, ["2026-09-10"]);
+  assert.deepEqual(leadRunUpdate.unavailableDates, [{ date: "2026-09-11", reason: "セミナー" }]);
+  assert.equal(leadRunUpdate.markedCount, 1);
+  assert.equal(leadRunUpdate.unmarkedCount, 1);
+  assert.deepEqual(patchedSummaries, ["◯wing練習", "wing練習"]);
+
+  // 調整さん再同期: 既に◯wing練習ならmarker維持（通常練習○で上書きしない）
+  const { env: syncEnv } = createTestEnv();
+  (syncEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (syncEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await syncEnv.STATE.put("rui_calendar_event:regular:2026-09-10", JSON.stringify({ eventId: "event-sync", status: "circle" }));
+  const syncPatchedSummaries: string[] = [];
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events/event-sync?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "event-sync", summary: "◯wing練習", start: { dateTime: "2026-09-10T19:00:00+09:00" }, end: { dateTime: "2026-09-10T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/event-sync") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      syncPatchedSummaries.push(body.summary ?? "");
+      return new Response(JSON.stringify({ id: "event-sync" }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      throw new Error("must not create new event");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const syncOutcome = await hooks.syncRuiCalendarFromChouseisan(
+    syncEnv as any,
+    "regular",
+    {
+      event: { id: "event", name: "9月通常", detail: null, upd_datetime: "2026-09-01T00:00:00.000Z" },
+      choices: [{ choice: "9/10(木) 19:00〜" }],
+      members: [{ name: "渡辺塁", attend: "1", kouho: null }]
+    } as any,
+    2026
+  );
+  assert.equal(syncOutcome.updated, 1);
+  assert.deepEqual(syncPatchedSummaries, ["◯wing練習"]);
+
+  // 調整さん再同期: 既存event取得失敗時はsummaryを上書きせず重複作成しない
+  const { env: syncEnvFetchFail } = createTestEnv();
+  (syncEnvFetchFail as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (syncEnvFetchFail as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await syncEnvFetchFail.STATE.put("rui_calendar_event:regular:2026-09-10", JSON.stringify({ eventId: "event-sync-fail", status: "circle" }));
+  const syncFailBodies: Array<Record<string, unknown>> = [];
+  let syncFailCreateCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events/event-sync-fail?fields=id,summary,start,end")) {
+      return new Response("missing", { status: 404 });
+    }
+    if (url.includes("/events/event-sync-fail") && init?.method === "PATCH") {
+      syncFailBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ id: "event-sync-fail" }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      syncFailCreateCount += 1;
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const syncFailOutcome = await hooks.syncRuiCalendarFromChouseisan(
+    syncEnvFetchFail as any,
+    "regular",
+    {
+      event: { id: "event", name: "9月通常", detail: null, upd_datetime: "2026-09-01T00:00:00.000Z" },
+      choices: [{ choice: "9/10(木) 19:00〜" }],
+      members: [{ name: "渡辺塁", attend: "1", kouho: null }]
+    } as any,
+    2026
+  );
+  assert.equal(syncFailOutcome.updated, 1);
+  assert.equal(syncFailCreateCount, 0);
+  assert.equal(Object.prototype.hasOwnProperty.call(syncFailBodies[0] ?? {}, "summary"), false);
+
+  // 個人練習の○は引率候補に含めない
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.startsWith("https://chouseisan.com/s?h=regular-lead-only")) {
+      return new Response(`<!DOCTYPE html><html><body><script>window.Chouseisan = ${JSON.stringify({
+        event: { id: "regular-lead-only", name: "9月通常練習", detail: null, upd_datetime: "2026-09-01T00:00:00.000Z", members: [{ name: "1年渡辺塁", attend: "1", kouho: null }] },
+        choices: [{ choice: "9/7(月) 19:00〜" }]
+      })};</script></body></html>`, {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" }
+      });
+    }
+    if (url.startsWith("https://chouseisan.com/s?h=personal-lead")) {
+      throw new Error("personal chouseisan must not be fetched for lead check");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const { env: leadPersonalEnv } = createTestEnv();
+  await leadPersonalEnv.STATE.put("chouseisan_url:regular", "https://chouseisan.com/s?h=regular-lead-only");
+  await leadPersonalEnv.STATE.put("chouseisan_url:personal", "https://chouseisan.com/s?h=personal-lead");
+  const leadDatesExcludePersonal = await hooks.extractRegularCircleDatesForLeadCheck(leadPersonalEnv as any, fixedNow);
+  assert.equal(leadDatesExcludePersonal.ok, true);
+  if (!leadDatesExcludePersonal.ok) throw new Error(leadDatesExcludePersonal.message);
+  assert.deepEqual(leadDatesExcludePersonal.dates, ["2026-09-07"]);
+
+  // 既に◯wing練習で引率可能な日は変更なし
+  const { env: leadEnvAlreadyMarked } = createTestEnv();
+  (leadEnvAlreadyMarked as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvAlreadyMarked as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await leadEnvAlreadyMarked.STATE.put("rui_calendar_event:regular:2026-09-13", JSON.stringify({ eventId: "event-13", status: "circle" }));
+  let alreadyMarkedPatchCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      return new Response(JSON.stringify({ items: [{ id: "other", summary: "打ち合わせ", start: { dateTime: "2026-09-13T10:00:00+09:00" }, end: { dateTime: "2026-09-13T11:00:00+09:00" } }] }), { status: 200 });
+    }
+    if (url.includes("/events/event-13?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "event-13", summary: "◯wing練習", start: { dateTime: "2026-09-13T18:00:00+09:00" }, end: { dateTime: "2026-09-13T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/event-13") && init?.method === "PATCH") {
+      alreadyMarkedPatchCount += 1;
+      return new Response(JSON.stringify({ id: "event-13" }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      throw new Error("must not create new event");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadAlreadyMarked = await hooks.runLeadCheckForDates(leadEnvAlreadyMarked as any, ["2026-09-13"]);
+  assert.deepEqual(leadAlreadyMarked.availableDates, ["2026-09-13"]);
+  assert.equal(leadAlreadyMarked.markedCount, 0);
+  assert.equal(alreadyMarkedPatchCount, 0);
+
+  // 独自タイトルは壊さず保留
+  const { env: leadEnvCustom } = createTestEnv();
+  (leadEnvCustom as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvCustom as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await leadEnvCustom.STATE.put("rui_calendar_event:regular:2026-09-14", JSON.stringify({ eventId: "event-14", status: "circle" }));
+  let customTitlePatchCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.includes("/events/event-14?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "event-14", summary: "塁の練習", start: { dateTime: "2026-09-14T19:00:00+09:00" }, end: { dateTime: "2026-09-14T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/event-14") && init?.method === "PATCH") {
+      customTitlePatchCount += 1;
+      return new Response(JSON.stringify({ id: "event-14" }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      throw new Error("must not create new event");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadCustom = await hooks.runLeadCheckForDates(leadEnvCustom as any, ["2026-09-14"]);
+  assert.equal(leadCustom.holdDates.length, 1);
+  assert.equal(leadCustom.holdDates[0]?.message, "Wing予定タイトルが自動更新対象外です");
+  assert.equal(customTitlePatchCount, 0);
+  assert.equal(hooks.isSafeWingEventSummary("塁の練習"), false);
+  assert.equal(hooks.isSafeWingEventSummary("wing練習"), true);
+  assert.equal(hooks.isSafeWingEventSummary("◯wing練習"), true);
+
+  const leadReplyText = hooks.buildLeadCheckReplyText({
+    dates: ["2026-09-10", "2026-09-21", "2026-09-28"],
+    availableDates: ["2026-09-10"],
+    unavailableDates: [{ date: "2026-09-21", reason: "セミナー" }],
+    holdDates: [{ date: "2026-09-28", message: "カレンダー予定を確認できませんでした" }],
+    markedCount: 1,
+    unmarkedCount: 0
+  });
+  assert.match(leadReplyText, /9月 引率チェック/);
+  assert.match(leadReplyText, /9\/10（木）/);
+  assert.match(leadReplyText, /9\/21（月） セミナー/);
+  assert.match(leadReplyText, /9\/28（月） カレンダー予定を確認できませんでした/);
+  assert.equal(leadReplyText.includes("管理職セミナー"), false);
+  assert.equal(leadReplyText.includes("飲み会相手"), false);
+  assert.equal(leadReplyText.includes("description"), false);
+
+  globalThis.fetch = originalFetchLead;
 
   // 月謝計算: 日曜通常を含める（9月ルール: 月木日700 / 火1250）
   const monthlyFeeSnapshot = {

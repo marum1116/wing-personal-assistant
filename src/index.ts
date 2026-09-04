@@ -2,6 +2,7 @@ interface Env {
   LINE_CHANNEL_SECRET: string;
   LINE_CHANNEL_ACCESS_TOKEN: string;
   OPENAI_API_KEY: string;
+  EXCEL_URL?: string;
   GOOGLE_SERVICE_ACCOUNT_EMAIL?: string;
   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
   GOOGLE_CALENDAR_ID?: string;
@@ -24,6 +25,13 @@ const MENU_TRIGGERS = new Set(["情報源", "メニュー", "開始"]);
 const UNPAID_COMMANDS = new Set(["未払い", "未払い一覧", "支払い"]);
 const CONTACT_RUI_COMMAND = "塁に連絡";
 const MONTHLY_FEE_COMMAND = "月謝";
+const EXCEL_COMMAND = "Excel";
+const LEAD_CHECK_COMMAND = "引率チェック";
+const DEFAULT_EXCEL_URL =
+  "https://1drv.ms/x/c/9bd7af7f5c25ad41/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc?e=sfvpfA";
+const WING_EVENT_TITLE = "wing練習";
+const WING_EVENT_MARKED_TITLE = "◯wing練習";
+const WING_EVENT_TENTATIVE_TITLE = "仮）wing練習";
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
 const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
 const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
@@ -178,10 +186,18 @@ type MonthlyFeeFinalizedSummary = {
 
 type BillingScope = "event" | "monthly" | "other";
 type PaymentDirection = "outbound" | "return" | "none";
+type LeadCheckReasonCategory = "セミナー" | "飲み会";
 
 type PaymentForStorage = ParsedPayment & {
   billing_scope: BillingScope;
   direction: PaymentDirection;
+};
+
+type CalendarDateEvent = {
+  id: string;
+  summary: string;
+  start: { dateTime?: string; date?: string } | null;
+  end: { dateTime?: string; date?: string } | null;
 };
 
 type PaymentStatus = "unpaid" | "paid";
@@ -1480,11 +1496,131 @@ function ruiCalendarEventKey(kind: ChouseisanSyncKind, practiceDate: string): st
   return `rui_calendar_event:${kind}:${practiceDate}`;
 }
 
+function isSafeWingEventSummary(summary: string): boolean {
+  return summary === WING_EVENT_TITLE || summary === WING_EVENT_MARKED_TITLE;
+}
+
+function isDrinkingEvent(summary: string): boolean {
+  return summary.includes("飲み");
+}
+
+function toTimedRangeForJstDay(ymd: string): { timeMin: string; timeMax: string } | null {
+  const date = parseYmdAsUtcDate(ymd);
+  if (!date) {
+    return null;
+  }
+  const [year, month, day] = ymd.split("-").map((value) => Number(value));
+  if (!year || !month || !day) {
+    return null;
+  }
+  const start = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
+  const next = new Date(Date.UTC(year, month - 1, day + 1, 0, 0, 0));
+  const toOffsetIso = (value: Date): string => {
+    const y = value.getUTCFullYear();
+    const m = String(value.getUTCMonth() + 1).padStart(2, "0");
+    const d = String(value.getUTCDate()).padStart(2, "0");
+    const hh = String(value.getUTCHours()).padStart(2, "0");
+    const mm = String(value.getUTCMinutes()).padStart(2, "0");
+    const ss = String(value.getUTCSeconds()).padStart(2, "0");
+    return `${y}-${m}-${d}T${hh}:${mm}:${ss}+09:00`;
+  };
+  return { timeMin: toOffsetIso(start), timeMax: toOffsetIso(next) };
+}
+
+async function fetchGoogleCalendarEventById(
+  env: Env,
+  eventId: string
+): Promise<{ ok: true; event: CalendarDateEvent } | { ok: false; reason: "auth_missing" | "fetch_failed" }> {
+  const accessToken = await getGoogleCalendarAccessToken(env);
+  if (!accessToken) {
+    return { ok: false, reason: "auth_missing" };
+  }
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const response = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}?fields=id,summary,start,end`,
+    {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+  if (!response.ok) {
+    return { ok: false, reason: "fetch_failed" };
+  }
+  const event = (await response.json()) as CalendarDateEvent;
+  if (typeof event.id !== "string" || typeof event.summary !== "string") {
+    return { ok: false, reason: "fetch_failed" };
+  }
+  return { ok: true, event };
+}
+
+async function listGoogleCalendarEventsOnDate(
+  env: Env,
+  ymd: string
+): Promise<{ ok: true; events: CalendarDateEvent[] } | { ok: false; reason: "auth_missing" | "fetch_failed" | "invalid_date" }> {
+  const range = toTimedRangeForJstDay(ymd);
+  if (!range) {
+    return { ok: false, reason: "invalid_date" };
+  }
+  const accessToken = await getGoogleCalendarAccessToken(env);
+  if (!accessToken) {
+    return { ok: false, reason: "auth_missing" };
+  }
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const query = new URLSearchParams({
+    timeMin: range.timeMin,
+    timeMax: range.timeMax,
+    singleEvents: "true",
+    orderBy: "startTime",
+    fields: "items(id,summary,start,end)"
+  });
+  const response = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events?${query.toString()}`,
+    {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+  if (!response.ok) {
+    return { ok: false, reason: "fetch_failed" };
+  }
+  const json = (await response.json()) as { items?: CalendarDateEvent[] };
+  return { ok: true, events: Array.isArray(json.items) ? json.items : [] };
+}
+
+async function patchGoogleCalendarEventSummary(
+  env: Env,
+  eventId: string,
+  nextSummary: string
+): Promise<"updated" | "skipped"> {
+  const accessToken = await getGoogleCalendarAccessToken(env);
+  if (!accessToken) {
+    return "skipped";
+  }
+  const calendarId = encodeURIComponent(env.GOOGLE_CALENDAR_ID ?? "pachira803.2nd");
+  const response = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(eventId)}`,
+    {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ summary: nextSummary })
+    }
+  );
+  return response.ok ? "updated" : "skipped";
+}
+
 async function upsertGoogleCalendarEvent(
   env: Env,
   practiceKind: ChouseisanSyncKind,
   practiceDate: string,
-  payload: GoogleCalendarEventPayload
+  payload: GoogleCalendarEventPayload,
+  options?: { preserveCircleMarker?: boolean }
 ): Promise<"created" | "updated" | "skipped"> {
   const accessToken = await getGoogleCalendarAccessToken(env);
   if (!accessToken) {
@@ -1497,8 +1633,19 @@ async function upsertGoogleCalendarEvent(
   const existing = existingRaw
     ? (JSON.parse(existingRaw) as { eventId?: string; status?: "circle" | "triangle" })
     : null;
+  let summary = payload.summary;
+  let includeSummary = true;
+  if (options?.preserveCircleMarker && summary === WING_EVENT_TITLE && existing?.eventId) {
+    const current = await fetchGoogleCalendarEventById(env, existing.eventId);
+    if (current.ok && current.event.summary === WING_EVENT_MARKED_TITLE) {
+      summary = WING_EVENT_MARKED_TITLE;
+    } else if (!current.ok) {
+      includeSummary = false;
+    }
+  }
+  const mappedStatus = summary.includes("仮）") ? "triangle" : "circle";
   const body = {
-    summary: payload.summary,
+    ...(includeSummary ? { summary } : {}),
     description: payload.description,
     location: payload.location ?? undefined,
     start: { dateTime: payload.start, timeZone },
@@ -1526,10 +1673,16 @@ async function upsertGoogleCalendarEvent(
     if (updateRes.ok) {
       await env.STATE.put(
         mappingKey,
-        JSON.stringify({ eventId: existing.eventId, status: payload.summary.includes("仮）") ? "triangle" : "circle" }),
+        JSON.stringify({
+          eventId: existing.eventId,
+          status: includeSummary ? mappedStatus : existing.status ?? "circle"
+        }),
         { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
       );
       return "updated";
+    }
+    if (!includeSummary) {
+      return "skipped";
     }
   }
   const createRes = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`, {
@@ -1547,7 +1700,7 @@ async function upsertGoogleCalendarEvent(
   if (typeof created.id === "string") {
     await env.STATE.put(
       mappingKey,
-      JSON.stringify({ eventId: created.id, status: payload.summary.includes("仮）") ? "triangle" : "circle" }),
+      JSON.stringify({ eventId: created.id, status: summary.includes("仮）") ? "triangle" : "circle" }),
       { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
     );
     return "created";
@@ -1639,14 +1792,14 @@ async function syncRuiCalendarFromChouseisan(
       inferLocationFromChouseisanDetail(snapshot.event.detail, practiceDate) ??
       defaultPracticeLocation(practiceDate, practiceType) ??
       null;
-    const title = status === "circle" ? "wing練習" : "仮）wing練習";
+    const title = status === "circle" ? WING_EVENT_TITLE : WING_EVENT_TENTATIVE_TITLE;
     const syncOutcome = await upsertGoogleCalendarEvent(env, kind, practiceDate, {
       summary: title,
       description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${status === "circle" ? "○" : "△"}）`,
       location,
       start: timing.start,
       end: timing.end
-    });
+    }, { preserveCircleMarker: kind === "regular" && status === "circle" });
     if (syncOutcome === "created") {
       created += 1;
     } else if (syncOutcome === "updated") {
@@ -3355,6 +3508,14 @@ function isMonthlyFeeCommand(inputText: string): boolean {
   return inputText.trim() === MONTHLY_FEE_COMMAND;
 }
 
+function isExcelCommand(inputText: string): boolean {
+  return inputText.trim() === EXCEL_COMMAND;
+}
+
+function isLeadCheckCommand(inputText: string): boolean {
+  return inputText.trim() === LEAD_CHECK_COMMAND;
+}
+
 function normalizeNameWithoutSpaces(name: string): string {
   return name.replace(/[ \t\r\n　]+/g, "");
 }
@@ -4027,6 +4188,308 @@ async function handleMonthlyFeeCommand(event: LineWebhookEvent, env: Env): Promi
   const lineStatus = await replyMessages(
     event.replyToken,
     [{ type: "text", text: monthlyFeeText }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
+}
+
+function buildExcelReplyText(env: Env): string {
+  const url = env.EXCEL_URL ?? DEFAULT_EXCEL_URL;
+  return `羽魂Excelはこちら\n${url}`;
+}
+
+async function handleExcelCommand(event: LineWebhookEvent, env: Env): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: buildExcelReplyText(env) }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+  if (typeof lineStatus === "number") {
+    console.log({ stage: "line_reply_success", status: lineStatus });
+    console.log({ stage: "background_processing_complete" });
+  }
+}
+
+function extractTimeMinutesFromDateTimeText(value: string | undefined): number | null {
+  if (!value) {
+    return null;
+  }
+  const matched = /T(\d{2}):(\d{2})/.exec(value);
+  if (!matched) {
+    return null;
+  }
+  const hour = Number(matched[1]);
+  const minute = Number(matched[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) {
+    return null;
+  }
+  return hour * 60 + minute;
+}
+
+function detectLeadCheckUnavailableReason(events: CalendarDateEvent[]): LeadCheckReasonCategory | null {
+  for (const event of events) {
+    const summary = typeof event.summary === "string" ? event.summary : "";
+    if (isDrinkingEvent(summary)) {
+      return "飲み会";
+    }
+    if (!summary.includes("セミナー")) {
+      continue;
+    }
+    const startDateTime = event.start?.dateTime;
+    const endDateTime = event.end?.dateTime;
+    const startMinutes = extractTimeMinutesFromDateTimeText(startDateTime);
+    const endMinutes = extractTimeMinutesFromDateTimeText(endDateTime);
+    if (startMinutes === null || endMinutes === null) {
+      continue;
+    }
+    if (startMinutes >= 21 * 60 || endMinutes > 21 * 60) {
+      return "セミナー";
+    }
+  }
+  return null;
+}
+
+async function extractRegularCircleDatesForLeadCheck(
+  env: Env,
+  nowMs: number
+): Promise<
+  | { ok: true; dates: string[] }
+  | { ok: false; message: string }
+> {
+  const regularUrl = await env.STATE.get(chouseisanUrlKey("regular"));
+  if (!regularUrl) {
+    return { ok: false, message: "通常練習用の調整さんURLが登録されていません。" };
+  }
+  let snapshot: ChouseisanSnapshot;
+  try {
+    snapshot = await fetchChouseisanSnapshot(regularUrl);
+  } catch {
+    return { ok: false, message: "通常練習用の調整さんを取得できませんでした。" };
+  }
+  const year = inferYearFromChouseisan(snapshot, nowMs);
+  const ruiMember = snapshot.members.find((member) => isMonthlyFeeTargetRuiName(member.name));
+  if (!ruiMember) {
+    return { ok: false, message: "通常練習用の調整さんで渡辺塁を特定できませんでした。" };
+  }
+  const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
+  const dates: string[] = [];
+  for (let i = 0; i < snapshot.choices.length; i += 1) {
+    if (ruiStatusFromAttendMark(marks[i] ?? Number.NaN) !== "circle") {
+      continue;
+    }
+    const choice = snapshot.choices[i];
+    if (!choice) {
+      continue;
+    }
+    const ymd = parseChoiceDateToYmd(choice.choice, year);
+    if (!ymd) {
+      continue;
+    }
+    dates.push(ymd);
+  }
+  return { ok: true, dates: [...new Set(dates)].sort() };
+}
+
+function monthHeaderForLeadCheck(dates: string[]): string {
+  if (dates.length === 0) {
+    return "引率チェック";
+  }
+  const first = parseYmdAsUtcDate(dates[0]);
+  if (!first) {
+    return "引率チェック";
+  }
+  return `${first.getUTCMonth() + 1}月 引率チェック`;
+}
+
+function buildLeadCheckReplyText(params: {
+  dates: string[];
+  availableDates: string[];
+  unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }>;
+  holdDates: Array<{ date: string; message: string }>;
+  markedCount: number;
+  unmarkedCount: number;
+}): string {
+  if (params.dates.length === 0) {
+    return `${monthHeaderForLeadCheck(params.dates)}\n\n対象の通常練習（○）はありませんでした。`;
+  }
+  const header = monthHeaderForLeadCheck(params.dates);
+  const availableLines = params.availableDates.map((date) => formatYmdWithJapaneseWeekday(date));
+  const unavailableLines = params.unavailableDates.map(
+    (item) => `${formatYmdWithJapaneseWeekday(item.date)} ${item.reason}`
+  );
+  const holdLines = params.holdDates.map(
+    (item) => `${formatYmdWithJapaneseWeekday(item.date)} ${item.message}`
+  );
+  return [
+    header,
+    "",
+    "引率可能",
+    ...(availableLines.length > 0 ? availableLines : ["なし"]),
+    "",
+    "引率不可",
+    ...(unavailableLines.length > 0 ? unavailableLines : ["なし"]),
+    "",
+    "保留",
+    ...(holdLines.length > 0 ? holdLines : ["なし"]),
+    "",
+    "カレンダー更新",
+    `○付与 ${params.markedCount}件`,
+    `○解除 ${params.unmarkedCount}件`,
+    `保留 ${holdLines.length}件`
+  ].join("\n");
+}
+
+async function runLeadCheckForDates(
+  env: Env,
+  dates: string[]
+): Promise<{
+  availableDates: string[];
+  unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }>;
+  holdDates: Array<{ date: string; message: string }>;
+  markedCount: number;
+  unmarkedCount: number;
+}> {
+  const availableDates: string[] = [];
+  const unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }> = [];
+  const holdDates: Array<{ date: string; message: string }> = [];
+  let markedCount = 0;
+  let unmarkedCount = 0;
+
+  for (const date of dates) {
+    const dayEvents = await listGoogleCalendarEventsOnDate(env, date);
+    if (!dayEvents.ok) {
+      holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
+      continue;
+    }
+    const unavailableReason = detectLeadCheckUnavailableReason(dayEvents.events);
+    const mappingRaw = await env.STATE.get(ruiCalendarEventKey("regular", date));
+    if (!mappingRaw) {
+      holdDates.push({ date, message: "Wing予定を特定できませんでした" });
+      continue;
+    }
+    let mappedEventId: string | null = null;
+    try {
+      const parsed = JSON.parse(mappingRaw) as { eventId?: string };
+      mappedEventId = typeof parsed.eventId === "string" && parsed.eventId.length > 0 ? parsed.eventId : null;
+    } catch {
+      mappedEventId = null;
+    }
+    if (!mappedEventId) {
+      holdDates.push({ date, message: "Wing予定を特定できませんでした" });
+      continue;
+    }
+    const mappedEvent = await fetchGoogleCalendarEventById(env, mappedEventId);
+    if (!mappedEvent.ok) {
+      holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
+      continue;
+    }
+    const currentSummary = mappedEvent.event.summary;
+    if (!isSafeWingEventSummary(currentSummary)) {
+      holdDates.push({ date, message: "Wing予定タイトルが自動更新対象外です" });
+      continue;
+    }
+
+    if (unavailableReason) {
+      unavailableDates.push({ date, reason: unavailableReason });
+      if (currentSummary === WING_EVENT_MARKED_TITLE) {
+        const updateResult = await patchGoogleCalendarEventSummary(env, mappedEventId, WING_EVENT_TITLE);
+        if (updateResult === "updated") {
+          unmarkedCount += 1;
+        } else {
+          holdDates.push({ date, message: "カレンダー更新に失敗しました" });
+        }
+      }
+      continue;
+    }
+
+    availableDates.push(date);
+    if (currentSummary === WING_EVENT_TITLE) {
+      const updateResult = await patchGoogleCalendarEventSummary(env, mappedEventId, WING_EVENT_MARKED_TITLE);
+      if (updateResult === "updated") {
+        markedCount += 1;
+      } else {
+        holdDates.push({ date, message: "カレンダー更新に失敗しました" });
+      }
+    }
+  }
+
+  return { availableDates, unavailableDates, holdDates, markedCount, unmarkedCount };
+}
+
+async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  console.log({ stage: "lead_check_start" });
+  const nowMs = event.timestamp ?? Date.now();
+  const extracted = await extractRegularCircleDatesForLeadCheck(env, nowMs);
+  if (!extracted.ok) {
+    console.log({ stage: "lead_check_failed" });
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: `引率チェックを実行できませんでした。\n理由: ${extracted.message}` }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+  const dates = extracted.dates;
+  if (dates.length === 0) {
+    console.log({ stage: "lead_check_done", candidateCount: 0, availableCount: 0, unavailableCount: 0, holdCount: 0 });
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: buildLeadCheckReplyText({
+        dates,
+        availableDates: [],
+        unavailableDates: [],
+        holdDates: [],
+        markedCount: 0,
+        unmarkedCount: 0
+      }) }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+    return;
+  }
+
+  const leadCheckResult = await runLeadCheckForDates(env, dates);
+  console.log({
+    stage: "lead_check_done",
+    candidateCount: dates.length,
+    availableCount: leadCheckResult.availableDates.length,
+    unavailableCount: leadCheckResult.unavailableDates.length,
+    holdCount: leadCheckResult.holdDates.length,
+    markedCount: leadCheckResult.markedCount,
+    unmarkedCount: leadCheckResult.unmarkedCount
+  });
+  const replyText = buildLeadCheckReplyText({
+    dates,
+    availableDates: leadCheckResult.availableDates,
+    unavailableDates: leadCheckResult.unavailableDates,
+    holdDates: leadCheckResult.holdDates,
+    markedCount: leadCheckResult.markedCount,
+    unmarkedCount: leadCheckResult.unmarkedCount
+  });
+
+  console.log({ stage: "line_reply_start" });
+  const lineStatus = await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: replyText }],
     env.LINE_CHANNEL_ACCESS_TOKEN
   );
   if (typeof lineStatus === "number") {
@@ -7354,6 +7817,14 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     await handleMonthlyFeeCommand(event, env);
     return;
   }
+  if (isExcelCommand(inputText)) {
+    await handleExcelCommand(event, env);
+    return;
+  }
+  if (isLeadCheckCommand(inputText)) {
+    await handleLeadCheckCommand(event, env);
+    return;
+  }
 
   if (MENU_TRIGGERS.has(inputText)) {
     console.log({ stage: "line_reply_start" });
@@ -7870,8 +8341,17 @@ export const TEST_HOOKS = {
   reconcileDateResolutionUncertainty,
   parseChouseisanSyncCommand,
   isMonthlyFeeCommand,
+  isExcelCommand,
+  isLeadCheckCommand,
   isMonthlyFeeTargetRuiName,
+  isSafeWingEventSummary,
+  detectLeadCheckUnavailableReason,
+  extractRegularCircleDatesForLeadCheck,
+  runLeadCheckForDates,
+  buildExcelReplyText,
+  buildLeadCheckReplyText,
   calculateMonthlyFeeFromRegularSnapshot,
+  syncRuiCalendarFromChouseisan,
   finalizeMonthlyFeeFromNotice,
   buildMonthlyFeeReplyText,
   parseRuiContactCommand,
