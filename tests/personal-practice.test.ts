@@ -523,6 +523,41 @@ async function main() {
   assert.equal(leadRunMissingMap.holdDates[0]?.message, "Wing予定を特定できませんでした");
   assert.equal(leadCreateCount, 0);
 
+  // KV map未登録でも、当日のwing練習が1件だけなら特定して○付与する
+  const { env: leadEnvDiscover } = createTestEnv();
+  (leadEnvDiscover as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadEnvDiscover as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  let discoverPatchCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      return new Response(
+        JSON.stringify({
+          items: [
+            { id: "other", summary: "打ち合わせ", start: { dateTime: "2026-09-08T18:00:00+09:00" }, end: { dateTime: "2026-09-08T19:00:00+09:00" } },
+            { id: "wing-08", summary: "wing練習", start: { dateTime: "2026-09-08T19:00:00+09:00" }, end: { dateTime: "2026-09-08T21:00:00+09:00" } }
+          ]
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/wing-08") && init?.method === "PATCH") {
+      discoverPatchCount += 1;
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      assert.equal(body.summary, "◯wing練習");
+      return new Response(JSON.stringify({ id: "wing-08" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const leadRunDiscover = await hooks.runLeadCheckForDates(leadEnvDiscover as any, ["2026-09-08"]);
+  assert.deepEqual(leadRunDiscover.availableDates, ["2026-09-08"]);
+  assert.equal(leadRunDiscover.markedCount, 1);
+  assert.equal(discoverPatchCount, 1);
+  assert.ok(await leadEnvDiscover.STATE.get("rui_calendar_event:regular:2026-09-08"));
+
   // 引率チェック実行: 可能日は○付与、不可日は○解除
   const { env: leadEnvUpdate } = createTestEnv();
   (leadEnvUpdate as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;

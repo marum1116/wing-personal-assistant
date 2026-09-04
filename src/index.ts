@@ -1570,6 +1570,45 @@ function isSafeWingEventSummary(summary: string): boolean {
   return summary === WING_EVENT_TITLE || summary === WING_EVENT_MARKED_TITLE;
 }
 
+function findUniqueSafeWingEvent(events: CalendarDateEvent[]): CalendarDateEvent | null {
+  const matches = events.filter(
+    (event) => typeof event.id === "string" && event.id.length > 0 && isSafeWingEventSummary(event.summary ?? "")
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+async function resolveMappedWingEventId(
+  env: Env,
+  practiceDate: string,
+  dayEvents: CalendarDateEvent[]
+): Promise<{ eventId: string; summary: string } | null> {
+  const mappingRaw = await env.STATE.get(ruiCalendarEventKey("regular", practiceDate));
+  if (mappingRaw) {
+    try {
+      const parsed = JSON.parse(mappingRaw) as { eventId?: string };
+      if (typeof parsed.eventId === "string" && parsed.eventId.length > 0) {
+        const mappedEvent = await fetchGoogleCalendarEventById(env, parsed.eventId);
+        if (mappedEvent.ok) {
+          return { eventId: mappedEvent.event.id, summary: mappedEvent.event.summary };
+        }
+      }
+    } catch {
+      // fall through to same-day title match
+    }
+  }
+
+  const discovered = findUniqueSafeWingEvent(dayEvents);
+  if (!discovered) {
+    return null;
+  }
+  await env.STATE.put(
+    ruiCalendarEventKey("regular", practiceDate),
+    JSON.stringify({ eventId: discovered.id, status: "circle" }),
+    { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+  );
+  return { eventId: discovered.id, summary: discovered.summary };
+}
+
 function isDrinkingEvent(summary: string): boolean {
   return summary.includes("飲み");
 }
@@ -1758,6 +1797,40 @@ async function upsertGoogleCalendarEvent(
       return "skipped";
     }
   }
+
+  // KV mapが無い場合でも、当日のwing練習が1件だけなら新規作成せず再利用する
+  if (!existing?.eventId) {
+    const dayEvents = await listGoogleCalendarEventsOnDate(env, practiceDate);
+    if (dayEvents.ok) {
+      const discovered = findUniqueSafeWingEvent(dayEvents.events);
+      if (discovered) {
+        if (options?.preserveCircleMarker && summary === WING_EVENT_TITLE && discovered.summary === WING_EVENT_MARKED_TITLE) {
+          summary = WING_EVENT_MARKED_TITLE;
+          body.summary = summary;
+        }
+        const reuseRes = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(discovered.id)}`,
+          {
+            method: "PATCH",
+            headers: {
+              authorization: `Bearer ${accessToken}`,
+              "content-type": "application/json"
+            },
+            body: JSON.stringify(body)
+          }
+        );
+        if (reuseRes.ok) {
+          await env.STATE.put(
+            mappingKey,
+            JSON.stringify({ eventId: discovered.id, status: mappedStatus }),
+            { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+          );
+          return "updated";
+        }
+      }
+    }
+  }
+
   const createRes = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`, {
     method: "POST",
     headers: {
@@ -4442,28 +4515,13 @@ async function runLeadCheckForDates(
       continue;
     }
     const unavailableReason = detectLeadCheckUnavailableReason(dayEvents.events);
-    const mappingRaw = await env.STATE.get(ruiCalendarEventKey("regular", date));
-    if (!mappingRaw) {
+    const resolved = await resolveMappedWingEventId(env, date, dayEvents.events);
+    if (!resolved) {
       holdDates.push({ date, message: "Wing予定を特定できませんでした" });
       continue;
     }
-    let mappedEventId: string | null = null;
-    try {
-      const parsed = JSON.parse(mappingRaw) as { eventId?: string };
-      mappedEventId = typeof parsed.eventId === "string" && parsed.eventId.length > 0 ? parsed.eventId : null;
-    } catch {
-      mappedEventId = null;
-    }
-    if (!mappedEventId) {
-      holdDates.push({ date, message: "Wing予定を特定できませんでした" });
-      continue;
-    }
-    const mappedEvent = await fetchGoogleCalendarEventById(env, mappedEventId);
-    if (!mappedEvent.ok) {
-      holdDates.push({ date, message: "カレンダー予定を確認できませんでした" });
-      continue;
-    }
-    const currentSummary = mappedEvent.event.summary;
+    const mappedEventId = resolved.eventId;
+    const currentSummary = resolved.summary;
     if (!isSafeWingEventSummary(currentSummary)) {
       holdDates.push({ date, message: "Wing予定タイトルが自動更新対象外です" });
       continue;
