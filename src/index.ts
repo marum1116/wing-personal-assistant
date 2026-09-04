@@ -1441,56 +1441,109 @@ type GoogleCalendarEventPayload = {
   end: string;
 };
 
+function normalizeGoogleServiceAccountPrivateKeyPem(privateKeyRaw: string): string | null {
+  let normalized = privateKeyRaw.trim();
+  if (
+    (normalized.startsWith('"') && normalized.endsWith('"')) ||
+    (normalized.startsWith("'") && normalized.endsWith("'"))
+  ) {
+    normalized = normalized.slice(1, -1).trim();
+  }
+  normalized = normalized.replace(/\\n/g, "\n").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (/-----BEGIN RSA PRIVATE KEY-----/.test(normalized)) {
+    return null;
+  }
+  const pkcs8Match = /-----BEGIN PRIVATE KEY-----([\s\S]*?)-----END PRIVATE KEY-----/.exec(normalized);
+  if (!pkcs8Match?.[1]) {
+    return null;
+  }
+  const body = pkcs8Match[1].replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]+=*$/.test(body) || body.length < 100) {
+    return null;
+  }
+  return `-----BEGIN PRIVATE KEY-----\n${body}\n-----END PRIVATE KEY-----`;
+}
+
+function decodePemBodyToPkcs8Der(privateKeyPem: string): ArrayBuffer | null {
+  const match = /-----BEGIN PRIVATE KEY-----([\s\S]*?)-----END PRIVATE KEY-----/.exec(privateKeyPem);
+  if (!match?.[1]) {
+    return null;
+  }
+  const body = match[1].replace(/\s+/g, "");
+  try {
+    const binary = atob(body);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes.buffer;
+  } catch {
+    return null;
+  }
+}
+
 async function getGoogleCalendarAccessToken(env: Env): Promise<string | null> {
   const email = env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const privateKeyRaw = env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY;
   if (!email || !privateKeyRaw) {
     return null;
   }
-  const privateKey = privateKeyRaw.replace(/\\n/g, "\n");
-  const nowSec = Math.floor(Date.now() / 1000);
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: email,
-    scope: "https://www.googleapis.com/auth/calendar",
-    aud: "https://oauth2.googleapis.com/token",
-    iat: nowSec,
-    exp: nowSec + 3600
-  };
-  const base64Url = (input: string): string =>
-    btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-  const encoder = new TextEncoder();
-  const signingInput = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
-  const keyData = Uint8Array.from(
-    atob(privateKey.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s+/g, "")),
-    (c) => c.charCodeAt(0)
-  );
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    keyData.buffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const signatureBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, encoder.encode(signingInput));
-  const signature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-  const assertion = `${signingInput}.${signature}`;
-  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion
-    })
-  });
-  if (!tokenRes.ok) {
+  try {
+    const privateKeyPem = normalizeGoogleServiceAccountPrivateKeyPem(privateKeyRaw);
+    if (!privateKeyPem) {
+      console.log({ stage: "google_calendar_private_key_invalid" });
+      return null;
+    }
+    const keyData = decodePemBodyToPkcs8Der(privateKeyPem);
+    if (!keyData) {
+      console.log({ stage: "google_calendar_private_key_decode_failed" });
+      return null;
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    const header = { alg: "RS256", typ: "JWT" };
+    const payload = {
+      iss: email,
+      scope: "https://www.googleapis.com/auth/calendar",
+      aud: "https://oauth2.googleapis.com/token",
+      iat: nowSec,
+      exp: nowSec + 3600
+    };
+    const base64Url = (input: string): string =>
+      btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    const encoder = new TextEncoder();
+    const signingInput = `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}`;
+    const cryptoKey = await crypto.subtle.importKey(
+      "pkcs8",
+      keyData,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const signatureBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, encoder.encode(signingInput));
+    const signature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+    const assertion = `${signingInput}.${signature}`;
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion
+      })
+    });
+    if (!tokenRes.ok) {
+      console.log({ stage: "google_calendar_token_exchange_failed", status: tokenRes.status });
+      return null;
+    }
+    const tokenJson = (await tokenRes.json()) as { access_token?: string };
+    return typeof tokenJson.access_token === "string" ? tokenJson.access_token : null;
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    console.log({ stage: "google_calendar_auth_exception", errorType });
     return null;
   }
-  const tokenJson = (await tokenRes.json()) as { access_token?: string };
-  return typeof tokenJson.access_token === "string" ? tokenJson.access_token : null;
 }
 
 function ruiCalendarEventKey(kind: ChouseisanSyncKind, practiceDate: string): string {
@@ -4448,87 +4501,128 @@ async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promis
     return;
   }
   console.log({ stage: "lead_check_start" });
-  if (!isGoogleCalendarConfigured(env)) {
-    console.log({ stage: "lead_check_calendar_auth_missing" });
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [{ type: "text", text: "引率チェックを実行できませんでした。\n理由: Googleカレンダーに接続できません。" }],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
+  try {
+    if (!isGoogleCalendarConfigured(env)) {
+      console.log({ stage: "lead_check_calendar_auth_missing" });
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [{ type: "text", text: "引率チェックを実行できませんでした。\n理由: Googleカレンダーに接続できません。" }],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
     }
-    return;
-  }
-  const nowMs = event.timestamp ?? Date.now();
-  const extracted = await extractRegularCircleDatesForLeadCheck(env, nowMs);
-  if (!extracted.ok) {
-    console.log({ stage: "lead_check_failed" });
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [{ type: "text", text: `引率チェックを実行できませんでした。\n理由: ${extracted.message}` }],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
+    const accessToken = await getGoogleCalendarAccessToken(env);
+    if (!accessToken) {
+      console.log({ stage: "lead_check_calendar_auth_failed" });
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [
+          {
+            type: "text",
+            text:
+              "引率チェックを実行できませんでした。\n理由: Googleカレンダー認証に失敗しました。\nサービスアカウントの秘密鍵形式を確認してください。"
+          }
+        ],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
     }
-    return;
-  }
-  const dates = extracted.dates;
-  if (dates.length === 0) {
-    console.log({ stage: "lead_check_done", candidateCount: 0, availableCount: 0, unavailableCount: 0, holdCount: 0 });
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [{ type: "text", text: buildLeadCheckReplyText({
-        dates,
-        availableDates: [],
-        unavailableDates: [],
-        holdDates: [],
-        markedCount: 0,
-        unmarkedCount: 0
-      }) }],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
+    const nowMs = event.timestamp ?? Date.now();
+    const extracted = await extractRegularCircleDatesForLeadCheck(env, nowMs);
+    if (!extracted.ok) {
+      console.log({ stage: "lead_check_failed" });
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [{ type: "text", text: `引率チェックを実行できませんでした。\n理由: ${extracted.message}` }],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
     }
-    return;
-  }
+    const dates = extracted.dates;
+    if (dates.length === 0) {
+      console.log({ stage: "lead_check_done", candidateCount: 0, availableCount: 0, unavailableCount: 0, holdCount: 0 });
+      console.log({ stage: "line_reply_start" });
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [
+          {
+            type: "text",
+            text: buildLeadCheckReplyText({
+              dates,
+              availableDates: [],
+              unavailableDates: [],
+              holdDates: [],
+              markedCount: 0,
+              unmarkedCount: 0
+            })
+          }
+        ],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+        console.log({ stage: "background_processing_complete" });
+      }
+      return;
+    }
 
-  const leadCheckResult = await runLeadCheckForDates(env, dates);
-  console.log({
-    stage: "lead_check_done",
-    candidateCount: dates.length,
-    availableCount: leadCheckResult.availableDates.length,
-    unavailableCount: leadCheckResult.unavailableDates.length,
-    holdCount: leadCheckResult.holdDates.length,
-    markedCount: leadCheckResult.markedCount,
-    unmarkedCount: leadCheckResult.unmarkedCount
-  });
-  const replyText = buildLeadCheckReplyText({
-    dates,
-    availableDates: leadCheckResult.availableDates,
-    unavailableDates: leadCheckResult.unavailableDates,
-    holdDates: leadCheckResult.holdDates,
-    markedCount: leadCheckResult.markedCount,
-    unmarkedCount: leadCheckResult.unmarkedCount
-  });
+    const leadCheckResult = await runLeadCheckForDates(env, dates);
+    console.log({
+      stage: "lead_check_done",
+      candidateCount: dates.length,
+      availableCount: leadCheckResult.availableDates.length,
+      unavailableCount: leadCheckResult.unavailableDates.length,
+      holdCount: leadCheckResult.holdDates.length,
+      markedCount: leadCheckResult.markedCount,
+      unmarkedCount: leadCheckResult.unmarkedCount
+    });
+    const replyText = buildLeadCheckReplyText({
+      dates,
+      availableDates: leadCheckResult.availableDates,
+      unavailableDates: leadCheckResult.unavailableDates,
+      holdDates: leadCheckResult.holdDates,
+      markedCount: leadCheckResult.markedCount,
+      unmarkedCount: leadCheckResult.unmarkedCount
+    });
 
-  console.log({ stage: "line_reply_start" });
-  const lineStatus = await replyMessages(
-    event.replyToken,
-    [{ type: "text", text: replyText }],
-    env.LINE_CHANNEL_ACCESS_TOKEN
-  );
-  if (typeof lineStatus === "number") {
-    console.log({ stage: "line_reply_success", status: lineStatus });
-    console.log({ stage: "background_processing_complete" });
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: replyText }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    console.log({ stage: "lead_check_exception", errorType });
+    console.log({ stage: "line_reply_start" });
+    const lineStatus = await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "引率チェックを実行できませんでした。\n理由: 処理中にエラーが発生しました。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+      console.log({ stage: "background_processing_complete" });
+    }
   }
 }
 
@@ -8380,6 +8474,7 @@ export const TEST_HOOKS = {
   isMonthlyFeeTargetRuiName,
   isGoogleCalendarConfigured,
   resolveGoogleCalendarId,
+  normalizeGoogleServiceAccountPrivateKeyPem,
   isSafeWingEventSummary,
   detectLeadCheckUnavailableReason,
   extractRegularCircleDatesForLeadCheck,

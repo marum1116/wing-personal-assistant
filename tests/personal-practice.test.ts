@@ -351,6 +351,19 @@ async function main() {
     hooks.resolveGoogleCalendarId({ GOOGLE_CALENDAR_ID: "pachira803.2nd@gmail.com" } as any),
     "pachira803.2nd@gmail.com"
   );
+  const sampleBody = `${"A".repeat(120)}=`;
+  const normalizedQuoted = hooks.normalizeGoogleServiceAccountPrivateKeyPem(
+    `"-----BEGIN PRIVATE KEY-----\\n${sampleBody}\\n-----END PRIVATE KEY-----\\n"`
+  );
+  assert.ok(normalizedQuoted);
+  assert.match(normalizedQuoted ?? "", /BEGIN PRIVATE KEY/);
+  assert.equal(hooks.normalizeGoogleServiceAccountPrivateKeyPem("not-a-key"), null);
+  assert.equal(
+    hooks.normalizeGoogleServiceAccountPrivateKeyPem(
+      `-----BEGIN RSA PRIVATE KEY-----\n${sampleBody}\n-----END RSA PRIVATE KEY-----`
+    ),
+    null
+  );
   assert.match(
     hooks.buildExcelReplyText({} as any),
     /https:\/\/1drv\.ms\/x\/c\/9bd7af7f5c25ad41\/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc\?e=sfvpfA/
