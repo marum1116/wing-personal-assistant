@@ -4923,14 +4923,17 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
 
   const practiceDate = parseYmdAsUtcDate(practice.practice_date);
   const weekday = practiceDate ? practiceDate.getUTCDay() : -1;
-  const isWeekdayRegularPractice = (weekday === 1 || weekday === 2 || weekday === 4) && practice.practice_type === "通常練習";
+  const isRegularPractice = practice.practice_type === "通常練習";
+  const isWeekdayRegularPractice = (weekday === 1 || weekday === 2 || weekday === 4) && isRegularPractice;
+  const isSundayRegularPractice = weekday === 0 && isRegularPractice;
   let practiceLocation = "不明";
-  if (practice.practice_type === "通常練習") {
+  if (isRegularPractice) {
     if (weekday === 1 || weekday === 2) {
       practiceLocation = "犬蔵中";
     } else if (weekday === 4) {
       practiceLocation = "白幡台小";
     }
+    // 日曜は会場定型なし（都度連絡）。不明のままにする。
   }
   lines.push(`練習場所：${practiceLocation}`);
 
@@ -4940,6 +4943,9 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
   let meetingLabel = meetingParts.length > 0 ? meetingParts.join(" ") : "不明";
   if (meetingLabel === "不明" && isWeekdayRegularPractice) {
     meetingLabel = "17:55ごろ KSP（または18:20 溝の口南口）";
+  } else if (meetingLabel === "不明" && isSundayRegularPractice) {
+    // 日曜通常練習は原則18:00〜21:00。会場・集合場所は補完しない。
+    meetingLabel = "18:00〜21:00（詳細未登録）";
   }
   lines.push(`集合：${meetingLabel}`);
 
@@ -7686,6 +7692,9 @@ async function callOpenAIForStructuredResult(
     "判断できなければ必ず不明にしてください。" +
     "meeting_time/meeting_place/outbound_companions/return_dropoff_place/return_release_placeも同様に、本文に明示があるときのみ設定し、" +
     "根拠がなければ必ずnullにしてください。" +
+    "配車表画像に『降りる場所』列がある場合は、渡辺塁本人行のそのセルをreturn_dropoff_placeへ必ず入れてください。" +
+    "『二ケ領用水ファミマ』『溝の口南口』『向ヶ丘遊園駅』などの固有地名を落とさないでください。" +
+    "本人行に降りる場所が空欄ならnullにし、他人行の降車場所を本人へ流用しないでください。" +
     "same_grade_boysは、村中佑史・山田健太・丹下洸・中村詠太の4名のうち、その日の練習参加が明示または画像で確認できる人だけをフルネーム配列で入れてください。" +
     "交通手段が同じかどうかは判定条件にしません。塁本人・保護者・引率者・運転者は含めないでください。" +
     "4名について参加情報が読み取れない場合はsame_grade_boysをnullにしてください。4名が全員不参加と明確に判断できる場合のみ空配列を返してください。" +

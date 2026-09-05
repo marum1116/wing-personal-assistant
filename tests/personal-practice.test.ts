@@ -1722,7 +1722,8 @@ async function main() {
       practice_type_evidence: "通常練習",
       practice_date: "2026-09-07",
       outbound_transport: { type: "バス", person: null },
-      return_transport: { type: "車", person: "重松さん" }
+      return_transport: { type: "車", person: "重松さん" },
+      return_dropoff_place: "二ケ領用水ファミマ"
     }) as any,
     "explicit",
     300
@@ -1735,7 +1736,35 @@ async function main() {
   assert.match(contactOtherSourceText, /【9\/7（月）】/);
   assert.match(contactOtherSourceText, /行き：バス/);
   assert.match(contactOtherSourceText, /帰り：重松さんの車/);
+  assert.match(contactOtherSourceText, /降りる場所：二ケ領用水ファミマ/);
   assert.ok(!contactOtherSourceText.includes("練習情報なし"));
+
+  // 塁に連絡 Case: 日曜通常練習・集合未登録は時間帯のみ補完（会場は不明）
+  const { env: contactEnvSunday } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvSunday,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-06",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null }
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactSundayText = await hooks.buildRuiContactMessage(
+    contactEnvSunday.DB as any,
+    ["2026-09-06"],
+    ["9/6（日）"]
+  );
+  assert.match(contactSundayText, /【9\/6（日）】/);
+  assert.match(contactSundayText, /練習場所：不明/);
+  assert.match(contactSundayText, /集合：18:00〜21:00（詳細未登録）/);
+  assert.ok(!contactSundayText.includes("17:55ごろ KSP"));
 
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(
