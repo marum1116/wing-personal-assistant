@@ -152,15 +152,14 @@ async function main(): Promise<void> {
   console.log(`Created richMenuId=${richMenuId}`);
 
   console.log("Uploading image...");
-  const uploadRes = await lineFetch(
-    `/v2/bot/richmenu/${richMenuId}/content`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "image/png" },
-      body: image
+  const uploadRes = await fetch(`https://api-data.line.me/v2/bot/richmenu/${richMenuId}/content`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "image/png"
     },
-    token
-  );
+    body: image
+  });
   const uploadText = await uploadRes.text();
   if (!uploadRes.ok) {
     throw new Error(`upload image failed: ${uploadRes.status} ${uploadText}`);
