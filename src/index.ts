@@ -4973,7 +4973,6 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
 
 async function buildRuiContactMessage(
   db: D1Database,
-  sourceLabel: string,
   dates: string[],
   labels: string[]
 ): Promise<string> {
@@ -4981,10 +4980,18 @@ async function buildRuiContactMessage(
   for (let i = 0; i < dates.length; i += 1) {
     const practiceDate = dates[i];
     const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
-    const practice = await getPracticeByDateAndSource(db, practiceDate, sourceLabel);
+    const practice = await getPracticeForRuiContact(db, practiceDate);
     sections.push(buildRuiContactPracticeBlock(headerLabel, practice).join("\n"));
   }
   return sections.join("\n\n");
+}
+
+async function getPracticeForRuiContact(db: D1Database, practiceDate: string): Promise<PracticeRow | null> {
+  const preferred = await getPracticeByDateAndSource(db, practiceDate, "羽魂練習会");
+  if (preferred) {
+    return preferred;
+  }
+  return getPracticeByDate(db, practiceDate);
 }
 
 function parseParticipationConfirmCommand(inputText: string, nowMs: number): string | null {
@@ -8243,10 +8250,9 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
   const contactCommand = parseRuiContactCommand(inputText, event.timestamp ?? Date.now());
   if (contactCommand) {
-    // 塁に連絡は情報源選択と無関係。羽魂練習会の確定情報から決定論生成する。
+    // 塁に連絡は情報源選択と無関係。日付の確定practiceを決定論生成する。
     const contactText = await buildRuiContactMessage(
       env.DB,
-      sourceIdToLabel("wing"),
       contactCommand.dates,
       contactCommand.labels
     );

@@ -1383,7 +1383,6 @@ async function main() {
   );
   const contactTodayText = await hooks.buildRuiContactMessage(
     contactEnvToday.DB as any,
-    "羽魂練習会",
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
@@ -1419,7 +1418,6 @@ async function main() {
   );
   const contactTomorrowText = await hooks.buildRuiContactMessage(
     contactEnvTomorrow.DB as any,
-    "羽魂練習会",
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
@@ -1469,7 +1467,6 @@ async function main() {
   );
   const contactBothText = await hooks.buildRuiContactMessage(
     contactEnvBoth.DB as any,
-    "羽魂練習会",
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
@@ -1480,7 +1477,6 @@ async function main() {
   const { env: contactEnvNone } = createTestEnv();
   const contactNoneText = await hooks.buildRuiContactMessage(
     contactEnvNone.DB as any,
-    "羽魂練習会",
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
@@ -1521,7 +1517,6 @@ async function main() {
   );
   const contactPriorityText = await hooks.buildRuiContactMessage(
     contactEnvPriority.DB as any,
-    "羽魂練習会",
     ["2026-08-20"],
     ["今日 8/20（木）"]
   );
@@ -1548,7 +1543,6 @@ async function main() {
   );
   const contactPartialText = await hooks.buildRuiContactMessage(
     contactEnvPartial.DB as any,
-    "羽魂練習会",
     ["2026-08-20"],
     ["今日 8/20（木）"]
   );
@@ -1584,7 +1578,6 @@ async function main() {
   );
   const contactRuleFallbackText = await hooks.buildRuiContactMessage(
     contactEnvRuleFallback.DB as any,
-    "羽魂練習会",
     ["2026-08-20"],
     ["8/20（木）"]
   );
@@ -1614,7 +1607,6 @@ async function main() {
   );
   const contactRuleFallbackMonText = await hooks.buildRuiContactMessage(
     contactEnvRuleFallbackMon.DB as any,
-    "羽魂練習会",
     ["2026-08-24"],
     ["8/24（月）"]
   );
@@ -1642,7 +1634,6 @@ async function main() {
   );
   const contactSameGradeText = await hooks.buildRuiContactMessage(
     contactEnvSameGrade.DB as any,
-    "羽魂練習会",
     ["2026-08-25"],
     ["8/25（火）"]
   );
@@ -1670,7 +1661,6 @@ async function main() {
   );
   const contactSameGradeChangedText = await hooks.buildRuiContactMessage(
     contactEnvSameGrade.DB as any,
-    "羽魂練習会",
     ["2026-08-25"],
     ["8/25（火）"]
   );
@@ -1693,7 +1683,6 @@ async function main() {
   );
   const contactSameGradeAllText = await hooks.buildRuiContactMessage(
     contactEnvSameGrade.DB as any,
-    "羽魂練習会",
     ["2026-08-26"],
     ["8/26（水）"]
   );
@@ -1716,11 +1705,37 @@ async function main() {
   );
   const contactSameGradeNoneText = await hooks.buildRuiContactMessage(
     contactEnvSameGrade.DB as any,
-    "羽魂練習会",
     ["2026-08-28"],
     ["8/28（金）"]
   );
   assert.ok(!contactSameGradeNoneText.includes("一緒："));
+
+  // 塁に連絡 Case: 羽魂練習会以外の情報源でも日付一致すれば表示する
+  const { env: contactEnvOtherSource } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    contactEnvOtherSource,
+    "R8年度保護者会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-07",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "車", person: "重松さん" }
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactOtherSourceText = await hooks.buildRuiContactMessage(
+    contactEnvOtherSource.DB as any,
+    ["2026-09-07"],
+    ["9/7（月）"]
+  );
+  assert.match(contactOtherSourceText, /【9\/7（月）】/);
+  assert.match(contactOtherSourceText, /行き：バス/);
+  assert.match(contactOtherSourceText, /帰り：重松さんの車/);
+  assert.ok(!contactOtherSourceText.includes("練習情報なし"));
 
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(
