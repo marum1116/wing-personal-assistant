@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit",
-    "test:personal-practice": "tsx tests/personal-practice.test.ts"
+    "test:personal-practice": "tsx tests/personal-practice.test.ts",
+    "generate:rich-menu-image": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-rich-menu-image.ps1",
+    "setup:rich-menu": "tsx scripts/setup-rich-menu.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "latest",
