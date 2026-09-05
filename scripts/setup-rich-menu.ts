@@ -4,10 +4,12 @@
  * Does NOT run on Worker deploy. Invoke manually:
  *   npx.cmd tsx scripts/setup-rich-menu.ts
  *
- * Requires env LINE_CHANNEL_ACCESS_TOKEN (same value as the Worker secret).
+ * Token resolution order:
+ * 1. env LINE_CHANNEL_ACCESS_TOKEN
+ * 2. .dev.vars LINE_CHANNEL_ACCESS_TOKEN=...
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const EXCEL_URL =
@@ -62,21 +64,57 @@ const AREAS: Area[] = [
   }
 ];
 
+function loadAccessToken(): string | null {
+  const fromEnv = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+  const devVarsPath = resolve(process.cwd(), ".dev.vars");
+  if (!existsSync(devVarsPath)) {
+    return null;
+  }
+  const content = readFileSync(devVarsPath, "utf8");
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) {
+      continue;
+    }
+    const key = trimmed.slice(0, eq).trim();
+    if (key !== "LINE_CHANNEL_ACCESS_TOKEN") {
+      continue;
+    }
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    return value.trim() || null;
+  }
+  return null;
+}
+
 async function lineFetch(path: string, init: RequestInit, token: string): Promise<Response> {
-  const response = await fetch(`https://api.line.me${path}`, {
+  return fetch(`https://api.line.me${path}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${token}`,
       ...(init.headers ?? {})
     }
   });
-  return response;
 }
 
 async function main(): Promise<void> {
-  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
+  const token = loadAccessToken();
   if (!token) {
-    throw new Error("LINE_CHANNEL_ACCESS_TOKEN env is required");
+    throw new Error(
+      "LINE_CHANNEL_ACCESS_TOKEN not found. Set env or add it to .dev.vars (gitignored)."
+    );
   }
 
   const image = readFileSync(IMAGE_PATH);
@@ -130,11 +168,9 @@ async function main(): Promise<void> {
   console.log("Image uploaded");
 
   console.log("Setting as default rich menu...");
-  const defaultRes = await lineFetch(
-    `/v2/bot/user/all/richmenu/${richMenuId}`,
-    { method: "POST" },
-    token
-  );
+  const defaultRes = await lineFetch(`/v2/bot/user/all/richmenu/${richMenuId}`, {
+    method: "POST"
+  }, token);
   const defaultText = await defaultRes.text();
   if (!defaultRes.ok) {
     throw new Error(`set default failed: ${defaultRes.status} ${defaultText}`);
