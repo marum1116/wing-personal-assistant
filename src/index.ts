@@ -3,6 +3,7 @@ interface Env {
   LINE_CHANNEL_ACCESS_TOKEN: string;
   OPENAI_API_KEY: string;
   EXCEL_URL?: string;
+  PUBLIC_BASE_URL?: string;
   GOOGLE_SERVICE_ACCOUNT_EMAIL?: string;
   GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY?: string;
   GOOGLE_CALENDAR_ID?: string;
@@ -38,6 +39,10 @@ const WING_EVENT_TENTATIVE_TITLE = "仮）wing練習";
 const DEFAULT_GOOGLE_CALENDAR_ID = "pachira803.2nd@gmail.com";
 // プライベートは閲覧のみで共有不可のため、既定は marumnx のみ（飲み会は手動確認）
 const DEFAULT_LEAD_CHECK_CALENDAR_IDS = ["marumnx@gmail.com"] as const;
+const DEFAULT_PUBLIC_BASE_URL = "https://wing-personal-assistant.marumnx.workers.dev";
+const LEAD_CHECK_SESSION_TTL_SECONDS = 72 * 60 * 60;
+const LEAD_CHECK_SESSION_KV_PREFIX = "lead_check_session:";
+const LEAD_CHECK_MONTH_REV_KV_PREFIX = "lead_check_month_rev:";
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
 const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
 const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
@@ -60,21 +65,33 @@ const MAX_UNPAID_DISPLAY_COUNT = 10;
 const MAX_REMINDER_DISPLAY_COUNT = 20;
 const MAX_REMINDER_QUICK_REPLY_COUNT = 10;
 
-type LineReplyMessage = {
-  type: "text";
-  text: string;
-  quickReply?: {
-    items: Array<{
-      type: "action";
-      action: {
-        type: "postback";
-        label: string;
-        data: string;
-        displayText: string;
-      };
-    }>;
-  };
+type LineQuickReply = {
+  items: Array<{
+    type: "action";
+    action: {
+      type: "postback";
+      label: string;
+      data: string;
+      displayText: string;
+    };
+  }>;
 };
+
+type LineReplyMessage =
+  | {
+      type: "text";
+      text: string;
+      quickReply?: LineQuickReply;
+    }
+  | {
+      type: "template";
+      altText: string;
+      template: {
+        type: "buttons";
+        text: string;
+        actions: Array<{ type: "uri"; label: string; uri: string }>;
+      };
+    };
 
 type LineWebhookEvent = {
   type: "message" | "postback" | string;
@@ -193,6 +210,36 @@ type MonthlyFeeFinalizedSummary = {
 type BillingScope = "event" | "monthly" | "other";
 type PaymentDirection = "outbound" | "return" | "none";
 type LeadCheckReasonCategory = "セミナー" | "飲み会";
+type LeadCheckAutoCandidate = "available" | "unavailable" | "unknown";
+type LeadCheckHumanStatus = "available" | "unavailable";
+type LeadCheckDecisionSource = "html" | "command";
+type LeadCheckCandidateRow = {
+  date: string;
+  autoCandidate: LeadCheckAutoCandidate;
+  autoReason: LeadCheckReasonCategory | null;
+  holdMessage: string | null;
+  checkboxInitial: boolean;
+};
+type LeadCheckSessionPayload = {
+  sessionId: string;
+  billingMonth: string;
+  revision: number;
+  expiresAtMs: number;
+  candidates: LeadCheckCandidateRow[];
+  failedConflictCalendarIds: string[];
+  confirmed: null | {
+    availableDates: string[];
+    unavailableDates: string[];
+    markedCount: number;
+    unmarkedCount: number;
+    holdDates: Array<{ date: string; message: string }>;
+  };
+};
+type BusLeadManualCommand = {
+  month: number;
+  day: number;
+  status: LeadCheckHumanStatus;
+};
 
 type PaymentForStorage = ParsedPayment & {
   billing_scope: BillingScope;
@@ -3483,9 +3530,7 @@ function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
 function buildMarkPaidQuickReplyItems(
   payments: Array<{ id: number; payment_kind?: "event" | "monthly" }>,
   maxItems: number
-): NonNullable<
-  LineReplyMessage["quickReply"]
->["items"] {
+): LineQuickReply["items"] {
   const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
   return payments.slice(0, maxItems).map((payment, index) => ({
     type: "action",
@@ -3498,7 +3543,7 @@ function buildMarkPaidQuickReplyItems(
   }));
 }
 
-function buildMonthlyNoteDoneQuickReply(month: string): LineReplyMessage["quickReply"] {
+function buildMonthlyNoteDoneQuickReply(month: string): LineQuickReply {
   return {
     items: [
       {
@@ -4754,6 +4799,214 @@ function monthHeaderForLeadCheck(dates: string[]): string {
   return `${first.getUTCMonth() + 1}月 引率チェック`;
 }
 
+function resolvePublicBaseUrl(env: Env): string {
+  const fromEnv = typeof env.PUBLIC_BASE_URL === "string" ? env.PUBLIC_BASE_URL.trim() : "";
+  if (fromEnv.length > 0) {
+    return fromEnv.replace(/\/$/, "");
+  }
+  return DEFAULT_PUBLIC_BASE_URL;
+}
+
+function leadCheckSessionKvKey(sessionId: string): string {
+  return `${LEAD_CHECK_SESSION_KV_PREFIX}${sessionId}`;
+}
+
+function leadCheckMonthRevisionKvKey(billingMonth: string): string {
+  return `${LEAD_CHECK_MONTH_REV_KV_PREFIX}${billingMonth}`;
+}
+
+function billingMonthFromYmd(ymd: string): string {
+  return ymd.slice(0, 7);
+}
+
+function monthLabelFromBillingMonth(billingMonth: string): string {
+  const month = Number(billingMonth.slice(5, 7));
+  return `${month}月`;
+}
+
+function toBase64Url(bytes: ArrayBuffer | Uint8Array): string {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let binary = "";
+  for (const b of arr) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function fromBase64Url(value: string): Uint8Array {
+  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a[i]! ^ b[i]!;
+  }
+  return diff === 0;
+}
+
+async function hmacSha256Base64Url(secret: string, message: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return toBase64Url(mac);
+}
+
+function leadCheckSignPayload(sessionId: string, expiresAtMs: number, revision: number): string {
+  return `lead-check|${sessionId}|${expiresAtMs}|${revision}`;
+}
+
+async function signLeadCheckToken(
+  env: Env,
+  sessionId: string,
+  expiresAtMs: number,
+  revision: number
+): Promise<string> {
+  return hmacSha256Base64Url(
+    env.LINE_CHANNEL_SECRET,
+    leadCheckSignPayload(sessionId, expiresAtMs, revision)
+  );
+}
+
+async function verifyLeadCheckToken(
+  env: Env,
+  sessionId: string,
+  expiresAtMs: number,
+  revision: number,
+  signature: string
+): Promise<boolean> {
+  if (!sessionId || !signature || !Number.isFinite(expiresAtMs) || !Number.isFinite(revision)) {
+    return false;
+  }
+  if (Date.now() > expiresAtMs) {
+    return false;
+  }
+  const expected = await signLeadCheckToken(env, sessionId, expiresAtMs, revision);
+  try {
+    return timingSafeEqualBytes(fromBase64Url(expected), fromBase64Url(signature));
+  } catch {
+    return false;
+  }
+}
+
+function buildLeadCheckConfirmUrl(
+  env: Env,
+  sessionId: string,
+  expiresAtMs: number,
+  revision: number,
+  signature: string
+): string {
+  const url = new URL("/lead-check", `${resolvePublicBaseUrl(env)}/`);
+  url.searchParams.set("s", sessionId);
+  url.searchParams.set("e", String(expiresAtMs));
+  url.searchParams.set("r", String(revision));
+  url.searchParams.set("sig", signature);
+  return url.toString();
+}
+
+async function getLeadCheckMonthRevision(env: Env, billingMonth: string): Promise<number> {
+  const raw = await env.STATE.get(leadCheckMonthRevisionKvKey(billingMonth));
+  const parsed = raw ? Number(raw) : 0;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+async function bumpLeadCheckMonthRevision(env: Env, billingMonth: string): Promise<number> {
+  const next = (await getLeadCheckMonthRevision(env, billingMonth)) + 1;
+  await env.STATE.put(leadCheckMonthRevisionKvKey(billingMonth), String(next), {
+    expirationTtl: LEAD_CHECK_SESSION_TTL_SECONDS * 2
+  });
+  return next;
+}
+
+async function loadLeadCheckHumanStatuses(
+  db: D1Database,
+  dates: string[]
+): Promise<Map<string, LeadCheckHumanStatus>> {
+  const map = new Map<string, LeadCheckHumanStatus>();
+  for (const date of dates) {
+    const row = await db
+      .prepare(
+        `SELECT human_status
+         FROM lead_check_decisions
+         WHERE practice_date = ?1
+         LIMIT 1`
+      )
+      .bind(date)
+      .first<{ human_status: string | null }>();
+    if (row?.human_status === "available" || row?.human_status === "unavailable") {
+      map.set(date, row.human_status);
+    }
+  }
+  return map;
+}
+
+async function upsertLeadCheckAutoCandidates(
+  db: D1Database,
+  candidates: LeadCheckCandidateRow[]
+): Promise<void> {
+  const now = new Date().toISOString();
+  for (const candidate of candidates) {
+    await db
+      .prepare(
+        `INSERT INTO lead_check_decisions (
+           practice_date, billing_month, auto_candidate, auto_reason,
+           human_status, source, confirmed_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5)
+         ON CONFLICT(practice_date) DO UPDATE SET
+           billing_month = excluded.billing_month,
+           auto_candidate = excluded.auto_candidate,
+           auto_reason = excluded.auto_reason,
+           updated_at = excluded.updated_at`
+      )
+      .bind(
+        candidate.date,
+        billingMonthFromYmd(candidate.date),
+        candidate.autoCandidate,
+        candidate.autoReason,
+        now
+      )
+      .run();
+  }
+}
+
+async function saveLeadCheckHumanDecisions(
+  db: D1Database,
+  decisions: Array<{ date: string; status: LeadCheckHumanStatus }>,
+  source: LeadCheckDecisionSource
+): Promise<void> {
+  const now = new Date().toISOString();
+  for (const decision of decisions) {
+    await db
+      .prepare(
+        `INSERT INTO lead_check_decisions (
+           practice_date, billing_month, auto_candidate, auto_reason,
+           human_status, source, confirmed_at, updated_at
+         ) VALUES (?1, ?2, 'unknown', NULL, ?3, ?4, ?5, ?5)
+         ON CONFLICT(practice_date) DO UPDATE SET
+           human_status = excluded.human_status,
+           source = excluded.source,
+           confirmed_at = excluded.confirmed_at,
+           updated_at = excluded.updated_at`
+      )
+      .bind(decision.date, billingMonthFromYmd(decision.date), decision.status, source, now)
+      .run();
+  }
+}
+
 function buildLeadCheckReplyText(params: {
   dates: string[];
   availableDates: string[];
@@ -4777,19 +5030,16 @@ function buildLeadCheckReplyText(params: {
   const lines = [
     header,
     "",
-    "引率可能",
+    "引率可能候補",
     ...(availableLines.length > 0 ? availableLines : ["なし"]),
     "",
-    "引率不可",
+    "引率不可候補",
     ...(unavailableLines.length > 0 ? unavailableLines : ["なし"]),
     "",
     "保留",
     ...(holdLines.length > 0 ? holdLines : ["なし"]),
     "",
-    "カレンダー更新",
-    `○付与 ${params.markedCount}件`,
-    `○解除 ${params.unmarkedCount}件`,
-    `保留 ${holdLines.length}件`
+    "※ 自動判定は候補です。カレンダー反映は確認画面で確定後に行います。"
   ];
   if ((params.failedConflictCalendarIds?.length ?? 0) > 0) {
     lines.push(
@@ -4801,22 +5051,18 @@ function buildLeadCheckReplyText(params: {
   return lines.join("\n");
 }
 
-async function runLeadCheckForDates(
+async function evaluateLeadCheckCandidates(
   env: Env,
   dates: string[]
 ): Promise<{
   availableDates: string[];
   unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }>;
   holdDates: Array<{ date: string; message: string }>;
-  markedCount: number;
-  unmarkedCount: number;
   failedConflictCalendarIds: string[];
 }> {
   const availableDates: string[] = [];
   const unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }> = [];
   const holdDates: Array<{ date: string; message: string }> = [];
-  let markedCount = 0;
-  let unmarkedCount = 0;
 
   const conflictPrefetch = await prefetchLeadCheckConflictEventsByDate(
     env,
@@ -4831,8 +5077,6 @@ async function runLeadCheckForDates(
       availableDates,
       unavailableDates,
       holdDates,
-      markedCount,
-      unmarkedCount,
       failedConflictCalendarIds: []
     };
   }
@@ -4852,45 +5096,385 @@ async function runLeadCheckForDates(
       holdDates.push({ date, message: "Wing予定を特定できませんでした" });
       continue;
     }
-    const mappedEventId = resolved.eventId;
-    const currentSummary = resolved.summary;
-    if (!isSafeWingEventSummary(currentSummary)) {
+    if (!isSafeWingEventSummary(resolved.summary)) {
       holdDates.push({ date, message: "Wing予定タイトルが自動更新対象外です" });
       continue;
     }
-
     if (unavailableReason) {
       unavailableDates.push({ date, reason: unavailableReason });
-      if (currentSummary === WING_EVENT_MARKED_TITLE) {
-        const updateResult = await patchGoogleCalendarEventSummary(env, mappedEventId, WING_EVENT_TITLE);
-        if (updateResult === "updated") {
-          unmarkedCount += 1;
-        } else {
-          holdDates.push({ date, message: "カレンダー更新に失敗しました" });
-        }
-      }
       continue;
     }
-
     availableDates.push(date);
-    if (currentSummary === WING_EVENT_TITLE) {
-      const updateResult = await patchGoogleCalendarEventSummary(env, mappedEventId, WING_EVENT_MARKED_TITLE);
-      if (updateResult === "updated") {
-        markedCount += 1;
-      } else {
-        holdDates.push({ date, message: "カレンダー更新に失敗しました" });
-      }
-    }
   }
 
   return {
     availableDates,
     unavailableDates,
     holdDates,
-    markedCount,
-    unmarkedCount,
     failedConflictCalendarIds
   };
+}
+
+async function applyLeadCheckHumanStatuses(
+  env: Env,
+  decisions: Array<{ date: string; status: LeadCheckHumanStatus }>
+): Promise<{
+  markedCount: number;
+  unmarkedCount: number;
+  holdDates: Array<{ date: string; message: string }>;
+  appliedDates: string[];
+}> {
+  let markedCount = 0;
+  let unmarkedCount = 0;
+  const holdDates: Array<{ date: string; message: string }> = [];
+  const appliedDates: string[] = [];
+
+  for (const decision of decisions) {
+    const mappingRaw = await env.STATE.get(ruiCalendarEventKey("regular", decision.date));
+    let wingDayEvents: CalendarDateEvent[] = [];
+    if (!mappingRaw) {
+      const listedWing = await listGoogleCalendarEventsOnDate(env, decision.date);
+      wingDayEvents = listedWing.ok ? listedWing.events : [];
+    }
+    const resolved = await resolveMappedWingEventId(env, decision.date, wingDayEvents);
+    if (!resolved) {
+      holdDates.push({ date: decision.date, message: "Wing予定を特定できませんでした" });
+      continue;
+    }
+    if (!isSafeWingEventSummary(resolved.summary)) {
+      holdDates.push({ date: decision.date, message: "Wing予定タイトルが自動更新対象外です" });
+      continue;
+    }
+    const wantTitle =
+      decision.status === "available" ? WING_EVENT_MARKED_TITLE : WING_EVENT_TITLE;
+    if (resolved.summary === wantTitle) {
+      appliedDates.push(decision.date);
+      continue;
+    }
+    const updateResult = await patchGoogleCalendarEventSummary(env, resolved.eventId, wantTitle);
+    if (updateResult !== "updated") {
+      holdDates.push({ date: decision.date, message: "カレンダー更新に失敗しました" });
+      continue;
+    }
+    if (decision.status === "available") {
+      markedCount += 1;
+    } else {
+      unmarkedCount += 1;
+    }
+    appliedDates.push(decision.date);
+  }
+
+  return { markedCount, unmarkedCount, holdDates, appliedDates };
+}
+
+/** @deprecated Use evaluateLeadCheckCandidates + applyLeadCheckHumanStatuses. Kept for tests transitioning. */
+async function runLeadCheckForDates(
+  env: Env,
+  dates: string[]
+): Promise<{
+  availableDates: string[];
+  unavailableDates: Array<{ date: string; reason: LeadCheckReasonCategory }>;
+  holdDates: Array<{ date: string; message: string }>;
+  markedCount: number;
+  unmarkedCount: number;
+  failedConflictCalendarIds: string[];
+}> {
+  const evaluated = await evaluateLeadCheckCandidates(env, dates);
+  return {
+    ...evaluated,
+    markedCount: 0,
+    unmarkedCount: 0
+  };
+}
+
+async function buildLeadCheckCandidateRows(
+  env: Env,
+  dates: string[],
+  evaluated: Awaited<ReturnType<typeof evaluateLeadCheckCandidates>>
+): Promise<LeadCheckCandidateRow[]> {
+  const humanMap = await loadLeadCheckHumanStatuses(env.DB, dates);
+  const unavailableMap = new Map(evaluated.unavailableDates.map((item) => [item.date, item.reason]));
+  const holdMap = new Map(evaluated.holdDates.map((item) => [item.date, item.message]));
+  const availableSet = new Set(evaluated.availableDates);
+
+  return dates.map((date) => {
+    let autoCandidate: LeadCheckAutoCandidate = "unknown";
+    let autoReason: LeadCheckReasonCategory | null = null;
+    let holdMessage: string | null = null;
+    if (availableSet.has(date)) {
+      autoCandidate = "available";
+    } else if (unavailableMap.has(date)) {
+      autoCandidate = "unavailable";
+      autoReason = unavailableMap.get(date) ?? null;
+    } else if (holdMap.has(date)) {
+      autoCandidate = "unknown";
+      holdMessage = holdMap.get(date) ?? null;
+    }
+
+    const human = humanMap.get(date) ?? null;
+    let checkboxInitial = autoCandidate === "available";
+    if (human === "available") {
+      checkboxInitial = true;
+    } else if (human === "unavailable") {
+      checkboxInitial = false;
+    }
+
+    return {
+      date,
+      autoCandidate,
+      autoReason,
+      holdMessage,
+      checkboxInitial
+    };
+  });
+}
+
+async function createLeadCheckSession(
+  env: Env,
+  billingMonth: string,
+  candidates: LeadCheckCandidateRow[],
+  failedConflictCalendarIds: string[]
+): Promise<{ session: LeadCheckSessionPayload; signature: string; confirmUrl: string }> {
+  const sessionId = crypto.randomUUID();
+  const revision = await bumpLeadCheckMonthRevision(env, billingMonth);
+  const expiresAtMs = Date.now() + LEAD_CHECK_SESSION_TTL_SECONDS * 1000;
+  const session: LeadCheckSessionPayload = {
+    sessionId,
+    billingMonth,
+    revision,
+    expiresAtMs,
+    candidates,
+    failedConflictCalendarIds,
+    confirmed: null
+  };
+  await env.STATE.put(leadCheckSessionKvKey(sessionId), JSON.stringify(session), {
+    expirationTtl: LEAD_CHECK_SESSION_TTL_SECONDS
+  });
+  const signature = await signLeadCheckToken(env, sessionId, expiresAtMs, revision);
+  const confirmUrl = buildLeadCheckConfirmUrl(env, sessionId, expiresAtMs, revision, signature);
+  return { session, signature, confirmUrl };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderLeadCheckHtmlPage(params: {
+  title: string;
+  bodyHtml: string;
+}): Response {
+  const html = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(params.title)}</title>
+  <style>
+    body { font-family: sans-serif; margin: 16px; line-height: 1.5; color: #222; }
+    h1 { font-size: 1.25rem; margin: 0 0 12px; }
+    .note { color: #555; font-size: 0.9rem; margin-bottom: 16px; }
+    label.row { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid #eee; }
+    .reason { color: #888; font-size: 0.85rem; }
+    button { width: 100%; margin-top: 20px; padding: 14px; font-size: 1rem; border: 0; border-radius: 8px; background: #1a73e8; color: #fff; }
+    .ok { background: #e8f5e9; padding: 12px; border-radius: 8px; }
+    .err { background: #fdecea; padding: 12px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+${params.bodyHtml}
+</body>
+</html>`;
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=UTF-8",
+      "cache-control": "no-store"
+    }
+  });
+}
+
+function renderLeadCheckErrorPage(message: string): Response {
+  return renderLeadCheckHtmlPage({
+    title: "引率確認",
+    bodyHtml: `<div class="err">${escapeHtml(message)}</div>`
+  });
+}
+
+function renderLeadCheckSuccessHtml(confirmed: NonNullable<LeadCheckSessionPayload["confirmed"]>, billingMonth: string): string {
+  const available =
+    confirmed.availableDates.length > 0
+      ? confirmed.availableDates.map((d) => formatYmdWithJapaneseWeekday(d)).join("、")
+      : "なし";
+  const unavailable =
+    confirmed.unavailableDates.length > 0
+      ? confirmed.unavailableDates.map((d) => formatYmdWithJapaneseWeekday(d)).join("、")
+      : "なし";
+  const hold =
+    confirmed.holdDates.length > 0
+      ? confirmed.holdDates
+          .map((item) => `${formatYmdWithJapaneseWeekday(item.date)} ${item.message}`)
+          .join("<br>")
+      : "";
+  return `<div class="ok">
+  <h1>${escapeHtml(monthLabelFromBillingMonth(billingMonth))}のバス引率予定を更新しました。</h1>
+  <p><strong>引率可：</strong><br>${escapeHtml(available)}</p>
+  <p><strong>引率なし：</strong><br>${escapeHtml(unavailable)}</p>
+  ${hold ? `<p><strong>保留：</strong><br>${hold}</p>` : ""}
+</div>`;
+}
+
+async function handleLeadCheckHtmlGet(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const sessionId = url.searchParams.get("s") ?? "";
+  const expiresAtMs = Number(url.searchParams.get("e") ?? "");
+  const revision = Number(url.searchParams.get("r") ?? "");
+  const signature = url.searchParams.get("sig") ?? "";
+
+  if (!(await verifyLeadCheckToken(env, sessionId, expiresAtMs, revision, signature))) {
+    if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+      return renderLeadCheckErrorPage(
+        "確認リンクの期限が切れました。LINEで「引率チェック」をもう一度押してください。"
+      );
+    }
+    return renderLeadCheckErrorPage("確認リンクが無効です。LINEで「引率チェック」をもう一度押してください。");
+  }
+
+  const raw = await env.STATE.get(leadCheckSessionKvKey(sessionId));
+  if (!raw) {
+    return renderLeadCheckErrorPage(
+      "確認リンクの期限が切れました。LINEで「引率チェック」をもう一度押してください。"
+    );
+  }
+  const session = JSON.parse(raw) as LeadCheckSessionPayload;
+  const monthRevision = await getLeadCheckMonthRevision(env, session.billingMonth);
+  if (session.revision !== revision || session.revision !== monthRevision) {
+    return renderLeadCheckErrorPage(
+      "この確認画面は新しいものに更新されています。LINEで「引率チェック」をもう一度押してください。"
+    );
+  }
+  if (session.confirmed) {
+    return renderLeadCheckHtmlPage({
+      title: "引率確認",
+      bodyHtml: renderLeadCheckSuccessHtml(session.confirmed, session.billingMonth)
+    });
+  }
+
+  const rowsHtml = session.candidates
+    .map((candidate) => {
+      const checked = candidate.checkboxInitial ? "checked" : "";
+      const reasonParts: string[] = [];
+      if (candidate.autoReason) {
+        reasonParts.push(candidate.autoReason);
+      }
+      if (candidate.holdMessage) {
+        reasonParts.push(candidate.holdMessage);
+      }
+      const reason =
+        reasonParts.length > 0
+          ? `<div class="reason">${escapeHtml(reasonParts.join(" / "))}</div>`
+          : "";
+      return `<label class="row">
+  <input type="checkbox" name="date" value="${escapeHtml(candidate.date)}" ${checked} />
+  <span>${escapeHtml(formatYmdWithJapaneseWeekday(candidate.date))}${reason}</span>
+</label>`;
+    })
+    .join("\n");
+
+  const bodyHtml = `
+  <h1>${escapeHtml(monthLabelFromBillingMonth(session.billingMonth))} 帰りバス引率</h1>
+  <p class="note">自動判定は候補です。実際に引率できる日を選んでください。</p>
+  <form method="POST" action="/lead-check/confirm">
+    <input type="hidden" name="s" value="${escapeHtml(session.sessionId)}" />
+    <input type="hidden" name="e" value="${escapeHtml(String(session.expiresAtMs))}" />
+    <input type="hidden" name="r" value="${escapeHtml(String(session.revision))}" />
+    <input type="hidden" name="sig" value="${escapeHtml(signature)}" />
+    ${rowsHtml}
+    <button type="submit">この内容で確定</button>
+  </form>`;
+  return renderLeadCheckHtmlPage({ title: "引率確認", bodyHtml });
+}
+
+async function handleLeadCheckHtmlConfirm(request: Request, env: Env): Promise<Response> {
+  const form = await request.formData();
+  const sessionId = String(form.get("s") ?? "");
+  const expiresAtMs = Number(form.get("e") ?? "");
+  const revision = Number(form.get("r") ?? "");
+  const signature = String(form.get("sig") ?? "");
+
+  if (!(await verifyLeadCheckToken(env, sessionId, expiresAtMs, revision, signature))) {
+    if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+      return renderLeadCheckErrorPage(
+        "確認リンクの期限が切れました。LINEで「引率チェック」をもう一度押してください。"
+      );
+    }
+    return renderLeadCheckErrorPage("確認リンクが無効です。LINEで「引率チェック」をもう一度押してください。");
+  }
+
+  const raw = await env.STATE.get(leadCheckSessionKvKey(sessionId));
+  if (!raw) {
+    return renderLeadCheckErrorPage(
+      "確認リンクの期限が切れました。LINEで「引率チェック」をもう一度押してください。"
+    );
+  }
+  const session = JSON.parse(raw) as LeadCheckSessionPayload;
+  const monthRevision = await getLeadCheckMonthRevision(env, session.billingMonth);
+  if (session.confirmed) {
+    return renderLeadCheckHtmlPage({
+      title: "引率確認",
+      bodyHtml: renderLeadCheckSuccessHtml(session.confirmed, session.billingMonth)
+    });
+  }
+  if (session.revision !== revision || session.revision !== monthRevision) {
+    return renderLeadCheckErrorPage(
+      "この確認画面は新しいものに更新されています。LINEで「引率チェック」をもう一度押してください。"
+    );
+  }
+
+  const checked = new Set(
+    form
+      .getAll("date")
+      .map((value) => String(value))
+      .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))
+  );
+  const displayedDates = new Set(session.candidates.map((candidate) => candidate.date));
+  const decisions: Array<{ date: string; status: LeadCheckHumanStatus }> = [];
+  for (const candidate of session.candidates) {
+    if (!displayedDates.has(candidate.date)) {
+      continue;
+    }
+    decisions.push({
+      date: candidate.date,
+      status: checked.has(candidate.date) ? "available" : "unavailable"
+    });
+  }
+
+  const applied = await applyLeadCheckHumanStatuses(env, decisions);
+  await saveLeadCheckHumanDecisions(env.DB, decisions, "html");
+
+  const availableDates = decisions.filter((d) => d.status === "available").map((d) => d.date);
+  const unavailableDates = decisions.filter((d) => d.status === "unavailable").map((d) => d.date);
+  session.confirmed = {
+    availableDates,
+    unavailableDates,
+    markedCount: applied.markedCount,
+    unmarkedCount: applied.unmarkedCount,
+    holdDates: applied.holdDates
+  };
+  // revision は新規確認画面生成時のみ上げる。確定後も同じURLで結果再表示できるようにする。
+  const ttlSeconds = Math.max(60, Math.floor((session.expiresAtMs - Date.now()) / 1000));
+  await env.STATE.put(leadCheckSessionKvKey(sessionId), JSON.stringify(session), {
+    expirationTtl: ttlSeconds
+  });
+
+  return renderLeadCheckHtmlPage({
+    title: "引率確認",
+    bodyHtml: renderLeadCheckSuccessHtml(session.confirmed, session.billingMonth)
+  });
 }
 
 async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promise<void> {
@@ -4952,7 +5536,7 @@ async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promis
     }
     const dates = extracted.dates;
     if (dates.length === 0) {
-      console.log({ stage: "lead_check_done", candidateCount: 0, availableCount: 0, unavailableCount: 0, holdCount: 0 });
+      console.log({ stage: "lead_check_done", candidateCount: 0 });
       console.log({ stage: "line_reply_start" });
       const lineStatus = await replyMessages(
         event.replyToken,
@@ -4978,30 +5562,48 @@ async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promis
       return;
     }
 
-    const leadCheckResult = await runLeadCheckForDates(env, dates);
+    const evaluated = await evaluateLeadCheckCandidates(env, dates);
+    const candidates = await buildLeadCheckCandidateRows(env, dates, evaluated);
+    await upsertLeadCheckAutoCandidates(env.DB, candidates);
+    const billingMonth = billingMonthFromYmd(dates[0]!);
+    const { confirmUrl } = await createLeadCheckSession(
+      env,
+      billingMonth,
+      candidates,
+      evaluated.failedConflictCalendarIds
+    );
     console.log({
-      stage: "lead_check_done",
+      stage: "lead_check_candidates_ready",
       candidateCount: dates.length,
-      availableCount: leadCheckResult.availableDates.length,
-      unavailableCount: leadCheckResult.unavailableDates.length,
-      holdCount: leadCheckResult.holdDates.length,
-      markedCount: leadCheckResult.markedCount,
-      unmarkedCount: leadCheckResult.unmarkedCount
-    });
-    const replyText = buildLeadCheckReplyText({
-      dates,
-      availableDates: leadCheckResult.availableDates,
-      unavailableDates: leadCheckResult.unavailableDates,
-      holdDates: leadCheckResult.holdDates,
-      markedCount: leadCheckResult.markedCount,
-      unmarkedCount: leadCheckResult.unmarkedCount,
-      failedConflictCalendarIds: leadCheckResult.failedConflictCalendarIds
+      availableCount: evaluated.availableDates.length,
+      unavailableCount: evaluated.unavailableDates.length,
+      holdCount: evaluated.holdDates.length
     });
 
+    const summaryText = [
+      `${monthLabelFromBillingMonth(billingMonth)}の帰りバス引率候補を確認しました。`,
+      "実際に対応できる日を確認してください。"
+    ].join("\n");
     console.log({ stage: "line_reply_start" });
     const lineStatus = await replyMessages(
       event.replyToken,
-      [{ type: "text", text: replyText }],
+      [
+        {
+          type: "template",
+          altText: `${monthLabelFromBillingMonth(billingMonth)}の帰りバス引率候補を確認してください`,
+          template: {
+            type: "buttons",
+            text: summaryText.slice(0, 160),
+            actions: [
+              {
+                type: "uri",
+                label: "引率日を確認する",
+                uri: confirmUrl
+              }
+            ]
+          }
+        }
+      ],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
     if (typeof lineStatus === "number") {
@@ -5022,6 +5624,119 @@ async function handleLeadCheckCommand(event: LineWebhookEvent, env: Env): Promis
       console.log({ stage: "background_processing_complete" });
     }
   }
+}
+
+function parseBusLeadManualCommand(inputText: string, _nowMs: number): BusLeadManualCommand | null {
+  const trimmed = inputText.trim();
+  const matched = /^(\d{1,2})\/(\d{1,2})\s+バス引率(追加|不可)$/u.exec(trimmed);
+  if (!matched) {
+    return null;
+  }
+  const month = Number(matched[1]);
+  const day = Number(matched[2]);
+  if (!Number.isInteger(month) || !Number.isInteger(day) || month < 1 || month > 12 || day < 1 || day > 31) {
+    return null;
+  }
+  return {
+    month,
+    day,
+    status: matched[3] === "追加" ? "available" : "unavailable"
+  };
+}
+
+function resolveBusLeadPracticeDateFromCircleDates(
+  month: number,
+  day: number,
+  circleDates: string[]
+): string | null {
+  const mmdd = `${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  const matches = circleDates.filter((date) => date.slice(5) === mmdd).sort();
+  if (matches.length === 0) {
+    return null;
+  }
+  // 年跨ぎで複数ある場合は、調整さん上の最新年を採用する
+  return matches[matches.length - 1] ?? null;
+}
+
+async function handleBusLeadManualCommand(
+  event: LineWebhookEvent,
+  env: Env,
+  command: BusLeadManualCommand
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  console.log({
+    stage: "bus_lead_manual_start",
+    month: command.month,
+    day: command.day,
+    status: command.status
+  });
+  const nowMs = event.timestamp ?? Date.now();
+  const extracted = await extractRegularCircleDatesForLeadCheck(env, nowMs);
+  if (!extracted.ok) {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: `バス引率の更新ができませんでした。\n理由: ${extracted.message}` }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  const practiceDate = resolveBusLeadPracticeDateFromCircleDates(
+    command.month,
+    command.day,
+    extracted.dates
+  );
+  if (!practiceDate) {
+    await replyMessages(
+      event.replyToken,
+      [
+        {
+          type: "text",
+          text: `${command.month}/${command.day} は通常練習の○対象日ではないため、バス引率を更新しませんでした。`
+        }
+      ],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  if (!isGoogleCalendarConfigured(env) || !(await getGoogleCalendarAccessToken(env))) {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "バス引率の更新ができませんでした。\n理由: Googleカレンダーに接続できません。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  await saveLeadCheckHumanDecisions(
+    env.DB,
+    [{ date: practiceDate, status: command.status }],
+    "command"
+  );
+  const applied = await applyLeadCheckHumanStatuses(env, [
+    { date: practiceDate, status: command.status }
+  ]);
+  const label = formatYmdWithJapaneseWeekday(practiceDate);
+  if (applied.holdDates.length > 0) {
+    await replyMessages(
+      event.replyToken,
+      [
+        {
+          type: "text",
+          text: `${label} のバス引率判断は保存しましたが、カレンダー反映は保留です。\n理由: ${applied.holdDates[0]?.message ?? "不明"}`
+        }
+      ],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  const actionLabel = command.status === "available" ? "引率可（○wing練習）" : "引率なし（wing練習）";
+  await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: `${label} を${actionLabel}に更新しました。` }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
 }
 
 async function getPracticeByDateAndSource(
@@ -8379,6 +9094,11 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     await handleLeadCheckCommand(event, env);
     return;
   }
+  const busLeadManual = parseBusLeadManualCommand(inputText, event.timestamp ?? Date.now());
+  if (busLeadManual) {
+    await handleBusLeadManualCommand(event, env, busLeadManual);
+    return;
+  }
   if (isRegularChouseisanUrlCommand(inputText)) {
     await handleChouseisanUrlCommand(event, env, "regular");
     return;
@@ -8777,6 +9497,14 @@ export default {
       });
     }
 
+    if (request.method === "GET" && url.pathname === "/lead-check") {
+      return handleLeadCheckHtmlGet(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/lead-check/confirm") {
+      return handleLeadCheckHtmlConfirm(request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/webhook") {
       return handleWebhook(request, env, ctx);
     }
@@ -8888,7 +9616,17 @@ export const TEST_HOOKS = {
   isSafeWingEventSummary,
   detectLeadCheckUnavailableReason,
   extractRegularCircleDatesForLeadCheck,
+  evaluateLeadCheckCandidates,
+  applyLeadCheckHumanStatuses,
   runLeadCheckForDates,
+  buildLeadCheckCandidateRows,
+  createLeadCheckSession,
+  verifyLeadCheckToken,
+  signLeadCheckToken,
+  parseBusLeadManualCommand,
+  resolveBusLeadPracticeDateFromCircleDates,
+  handleLeadCheckHtmlGet,
+  handleLeadCheckHtmlConfirm,
   buildExcelReplyText,
   buildLeadCheckReplyText,
   calculateMonthlyFeeFromRegularSnapshot,

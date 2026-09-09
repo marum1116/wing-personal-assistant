@@ -207,13 +207,25 @@ function createTestEnv() {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS lead_check_decisions (
+      practice_date TEXT PRIMARY KEY,
+      billing_month TEXT NOT NULL,
+      auto_candidate TEXT NOT NULL,
+      auto_reason TEXT,
+      human_status TEXT,
+      source TEXT,
+      confirmed_at TEXT,
+      updated_at TEXT NOT NULL
+    );
   `);
 
   return {
     raw: sqlite,
     env: {
       DB: new MockD1Database(sqlite),
-      STATE: new MockKvNamespace()
+      STATE: new MockKvNamespace(),
+      LINE_CHANNEL_SECRET: "test-lead-check-secret"
     } as any
   };
 }
@@ -574,6 +586,17 @@ async function main() {
         { status: 200 }
       );
     }
+    if (url.includes("/events/wing-08?fields=id,summary,start,end")) {
+      return new Response(
+        JSON.stringify({
+          id: "wing-08",
+          summary: "wing練習",
+          start: { dateTime: "2026-09-08T19:00:00+09:00" },
+          end: { dateTime: "2026-09-08T21:00:00+09:00" }
+        }),
+        { status: 200 }
+      );
+    }
     if (url.includes("/events/wing-08") && init?.method === "PATCH") {
       discoverPatchCount += 1;
       const body = JSON.parse(String(init.body)) as { summary?: string };
@@ -582,9 +605,13 @@ async function main() {
     }
     return new Response("not found", { status: 404 });
   };
-  const leadRunDiscover = await hooks.runLeadCheckForDates(leadEnvDiscover as any, ["2026-09-08"]);
+  const leadRunDiscover = await hooks.evaluateLeadCheckCandidates(leadEnvDiscover as any, ["2026-09-08"]);
   assert.deepEqual(leadRunDiscover.availableDates, ["2026-09-08"]);
-  assert.equal(leadRunDiscover.markedCount, 1);
+  assert.equal(discoverPatchCount, 0);
+  const leadApplyDiscover = await hooks.applyLeadCheckHumanStatuses(leadEnvDiscover as any, [
+    { date: "2026-09-08", status: "available" }
+  ]);
+  assert.equal(leadApplyDiscover.markedCount, 1);
   assert.equal(discoverPatchCount, 1);
   assert.ok(await leadEnvDiscover.STATE.get("rui_calendar_event:regular:2026-09-08"));
 
@@ -639,11 +666,16 @@ async function main() {
     }
     return new Response("not found", { status: 404 });
   };
-  const leadRunUpdate = await hooks.runLeadCheckForDates(leadEnvUpdate as any, ["2026-09-10", "2026-09-11"]);
+  const leadRunUpdate = await hooks.evaluateLeadCheckCandidates(leadEnvUpdate as any, ["2026-09-10", "2026-09-11"]);
   assert.deepEqual(leadRunUpdate.availableDates, ["2026-09-10"]);
   assert.deepEqual(leadRunUpdate.unavailableDates, [{ date: "2026-09-11", reason: "セミナー" }]);
-  assert.equal(leadRunUpdate.markedCount, 1);
-  assert.equal(leadRunUpdate.unmarkedCount, 1);
+  assert.deepEqual(patchedSummaries, []);
+  const leadApplyUpdate = await hooks.applyLeadCheckHumanStatuses(leadEnvUpdate as any, [
+    { date: "2026-09-10", status: "available" },
+    { date: "2026-09-11", status: "unavailable" }
+  ]);
+  assert.equal(leadApplyUpdate.markedCount, 1);
+  assert.equal(leadApplyUpdate.unmarkedCount, 1);
   assert.deepEqual(patchedSummaries, ["◯wing練習", "wing練習"]);
 
   // 不可判定は設定した複数Calendarをまとめて見る
@@ -727,13 +759,18 @@ async function main() {
     }
     return new Response("not found", { status: 404 });
   };
-  const leadRunMultiCal = await hooks.runLeadCheckForDates(leadEnvMultiCal as any, ["2026-09-28", "2026-09-29"]);
+  const leadRunMultiCal = await hooks.evaluateLeadCheckCandidates(leadEnvMultiCal as any, ["2026-09-28", "2026-09-29"]);
   assert.deepEqual(leadRunMultiCal.availableDates, []);
   assert.deepEqual(leadRunMultiCal.unavailableDates, [
     { date: "2026-09-28", reason: "セミナー" },
     { date: "2026-09-29", reason: "飲み会" }
   ]);
-  assert.equal(leadRunMultiCal.unmarkedCount, 2);
+  assert.deepEqual(multiPatched, []);
+  const leadApplyMultiCal = await hooks.applyLeadCheckHumanStatuses(leadEnvMultiCal as any, [
+    { date: "2026-09-28", status: "unavailable" },
+    { date: "2026-09-29", status: "unavailable" }
+  ]);
+  assert.equal(leadApplyMultiCal.unmarkedCount, 2);
   assert.deepEqual(multiPatched, ["28:wing練習", "29:wing練習"]);
   assert.deepEqual(hooks.resolveLeadCheckCalendarIds({} as any), ["marumnx@gmail.com"]);
 
@@ -801,7 +838,7 @@ async function main() {
     }
     return new Response("not found", { status: 404 });
   };
-  const leadRunPartialCal = await hooks.runLeadCheckForDates(leadEnvPartialCal as any, ["2026-09-28", "2026-09-29"]);
+  const leadRunPartialCal = await hooks.evaluateLeadCheckCandidates(leadEnvPartialCal as any, ["2026-09-28", "2026-09-29"]);
   assert.deepEqual(leadRunPartialCal.unavailableDates, [{ date: "2026-09-28", reason: "セミナー" }]);
   assert.deepEqual(leadRunPartialCal.availableDates, ["2026-09-29"]);
   assert.deepEqual(leadRunPartialCal.failedConflictCalendarIds, [
@@ -814,7 +851,7 @@ async function main() {
       unavailableDates: leadRunPartialCal.unavailableDates,
       holdDates: [],
       markedCount: 0,
-      unmarkedCount: 1,
+      unmarkedCount: 0,
       failedConflictCalendarIds: leadRunPartialCal.failedConflictCalendarIds
     }),
     /一部カレンダーを確認できませんでした/
@@ -947,9 +984,13 @@ async function main() {
     }
     return new Response("not found", { status: 404 });
   };
-  const leadAlreadyMarked = await hooks.runLeadCheckForDates(leadEnvAlreadyMarked as any, ["2026-09-13"]);
+  const leadAlreadyMarked = await hooks.evaluateLeadCheckCandidates(leadEnvAlreadyMarked as any, ["2026-09-13"]);
   assert.deepEqual(leadAlreadyMarked.availableDates, ["2026-09-13"]);
-  assert.equal(leadAlreadyMarked.markedCount, 0);
+  assert.equal(alreadyMarkedPatchCount, 0);
+  const leadApplyAlreadyMarked = await hooks.applyLeadCheckHumanStatuses(leadEnvAlreadyMarked as any, [
+    { date: "2026-09-13", status: "available" }
+  ]);
+  assert.equal(leadApplyAlreadyMarked.markedCount, 0);
   assert.equal(alreadyMarkedPatchCount, 0);
 
   // 独自タイトルは壊さず保留
@@ -978,9 +1019,13 @@ async function main() {
     }
     return new Response("not found", { status: 404 });
   };
-  const leadCustom = await hooks.runLeadCheckForDates(leadEnvCustom as any, ["2026-09-14"]);
-  assert.equal(leadCustom.holdDates.length, 1);
-  assert.equal(leadCustom.holdDates[0]?.message, "Wing予定タイトルが自動更新対象外です");
+  const leadCustomEval = await hooks.evaluateLeadCheckCandidates(leadEnvCustom as any, ["2026-09-14"]);
+  assert.equal(leadCustomEval.holdDates.length, 1);
+  assert.equal(leadCustomEval.holdDates[0]?.message, "Wing予定タイトルが自動更新対象外です");
+  const leadCustomApply = await hooks.applyLeadCheckHumanStatuses(leadEnvCustom as any, [
+    { date: "2026-09-14", status: "available" }
+  ]);
+  assert.equal(leadCustomApply.holdDates.length, 1);
   assert.equal(customTitlePatchCount, 0);
   assert.equal(hooks.isSafeWingEventSummary("塁の練習"), false);
   assert.equal(hooks.isSafeWingEventSummary("wing練習"), true);
@@ -991,16 +1036,229 @@ async function main() {
     availableDates: ["2026-09-10"],
     unavailableDates: [{ date: "2026-09-21", reason: "セミナー" }],
     holdDates: [{ date: "2026-09-28", message: "カレンダー予定を確認できませんでした" }],
-    markedCount: 1,
+    markedCount: 0,
     unmarkedCount: 0
   });
   assert.match(leadReplyText, /9月 引率チェック/);
   assert.match(leadReplyText, /9\/10（木）/);
   assert.match(leadReplyText, /9\/21（月） セミナー/);
   assert.match(leadReplyText, /9\/28（月） カレンダー予定を確認できませんでした/);
+  assert.match(leadReplyText, /確認画面で確定後/);
   assert.equal(leadReplyText.includes("管理職セミナー"), false);
   assert.equal(leadReplyText.includes("飲み会相手"), false);
   assert.equal(leadReplyText.includes("description"), false);
+
+  // --- 新フロー: HTML確認 / human優先 / token / 手動command ---
+  const { env: leadFlowEnv } = createTestEnv();
+  (leadFlowEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (leadFlowEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  (leadFlowEnv as any).PUBLIC_BASE_URL = "https://example.test";
+  await leadFlowEnv.STATE.put("rui_calendar_event:regular:2026-09-10", JSON.stringify({ eventId: "flow-10", status: "plain" }));
+  await leadFlowEnv.STATE.put("rui_calendar_event:regular:2026-09-11", JSON.stringify({ eventId: "flow-11", status: "circle" }));
+  await leadFlowEnv.STATE.put("rui_calendar_event:regular:2026-09-12", JSON.stringify({ eventId: "flow-12", status: "plain" }));
+  const flowPatched: string[] = [];
+  let flowCreateCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events?")) {
+      return new Response(
+        JSON.stringify({
+          items: [
+            {
+              id: "seminar-11",
+              summary: "管理職セミナー",
+              start: { dateTime: "2026-09-11T21:30:00+09:00" },
+              end: { dateTime: "2026-09-11T22:30:00+09:00" }
+            }
+          ]
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/flow-10?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "flow-10", summary: "wing練習", start: { dateTime: "2026-09-10T19:00:00+09:00" }, end: { dateTime: "2026-09-10T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/flow-11?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "flow-11", summary: "◯wing練習", start: { dateTime: "2026-09-11T19:00:00+09:00" }, end: { dateTime: "2026-09-11T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/flow-12?fields=id,summary,start,end")) {
+      return new Response(JSON.stringify({ id: "flow-12", summary: "wing練習", start: { dateTime: "2026-09-12T19:00:00+09:00" }, end: { dateTime: "2026-09-12T21:00:00+09:00" } }), { status: 200 });
+    }
+    if (url.includes("/events/flow-") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      const id = url.match(/flow-\d+/)?.[0] ?? "unknown";
+      flowPatched.push(`${id}:${body.summary ?? ""}`);
+      return new Response(JSON.stringify({ id }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      flowCreateCount += 1;
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+
+  const flowEval = await hooks.evaluateLeadCheckCandidates(leadFlowEnv as any, [
+    "2026-09-10",
+    "2026-09-11",
+    "2026-09-12"
+  ]);
+  assert.deepEqual(flowEval.availableDates, ["2026-09-10", "2026-09-12"]);
+  assert.deepEqual(flowEval.unavailableDates, [{ date: "2026-09-11", reason: "セミナー" }]);
+  assert.deepEqual(flowPatched, []);
+  assert.equal(flowCreateCount, 0);
+
+  let flowCandidates = await hooks.buildLeadCheckCandidateRows(leadFlowEnv as any, ["2026-09-10", "2026-09-11", "2026-09-12"], flowEval);
+  assert.equal(flowCandidates.find((c: any) => c.date === "2026-09-10")?.checkboxInitial, true);
+  assert.equal(flowCandidates.find((c: any) => c.date === "2026-09-11")?.checkboxInitial, false);
+  assert.equal(flowCandidates.find((c: any) => c.date === "2026-09-12")?.checkboxInitial, true);
+
+  // human_status があれば auto より優先
+  await leadFlowEnv.DB.prepare(
+    `INSERT INTO lead_check_decisions (
+       practice_date, billing_month, auto_candidate, auto_reason, human_status, source, confirmed_at, updated_at
+     ) VALUES ('2026-09-10', '2026-09', 'available', NULL, 'unavailable', 'command', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z'),
+              ('2026-09-11', '2026-09', 'unavailable', 'セミナー', 'available', 'html', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z')`
+  ).run();
+  flowCandidates = await hooks.buildLeadCheckCandidateRows(leadFlowEnv as any, ["2026-09-10", "2026-09-11", "2026-09-12"], flowEval);
+  assert.equal(flowCandidates.find((c: any) => c.date === "2026-09-10")?.checkboxInitial, false);
+  assert.equal(flowCandidates.find((c: any) => c.date === "2026-09-11")?.checkboxInitial, true);
+
+  const { session, signature, confirmUrl } = await hooks.createLeadCheckSession(
+    leadFlowEnv as any,
+    "2026-09",
+    flowCandidates.filter((c: any) => c.date === "2026-09-10" || c.date === "2026-09-11"),
+    []
+  );
+  assert.match(confirmUrl, /^https:\/\/example\.test\/lead-check\?/);
+  assert.equal(await hooks.verifyLeadCheckToken(leadFlowEnv as any, session.sessionId, session.expiresAtMs, session.revision, signature), true);
+  assert.equal(await hooks.verifyLeadCheckToken(leadFlowEnv as any, session.sessionId, session.expiresAtMs, session.revision, "tampered"), false);
+  assert.equal(
+    await hooks.verifyLeadCheckToken(
+      leadFlowEnv as any,
+      session.sessionId,
+      Date.now() - 1000,
+      session.revision,
+      await hooks.signLeadCheckToken(leadFlowEnv as any, session.sessionId, Date.now() - 1000, session.revision)
+    ),
+    false
+  );
+
+  const getOk = await hooks.handleLeadCheckHtmlGet(
+    new Request(`${confirmUrl}`),
+    leadFlowEnv as any
+  );
+  const getOkHtml = await getOk.text();
+  assert.match(getOkHtml, /帰りバス引率/);
+  assert.match(getOkHtml, /この内容で確定/);
+
+  // HTML確定: 表示日のみ。10=ON → available、11=OFF → unavailable。12は触らない
+  const form = new FormData();
+  form.set("s", session.sessionId);
+  form.set("e", String(session.expiresAtMs));
+  form.set("r", String(session.revision));
+  form.set("sig", signature);
+  form.append("date", "2026-09-10");
+  const confirmRes = await hooks.handleLeadCheckHtmlConfirm(
+    new Request("https://example.test/lead-check/confirm", { method: "POST", body: form }),
+    leadFlowEnv as any
+  );
+  const confirmHtml = await confirmRes.text();
+  assert.match(confirmHtml, /バス引率予定を更新しました/);
+  assert.match(confirmHtml, /引率可/);
+  assert.ok(flowPatched.includes("flow-10:◯wing練習"));
+  assert.ok(flowPatched.includes("flow-11:wing練習"));
+  assert.equal(flowPatched.some((x) => x.startsWith("flow-12:")), false);
+  assert.equal(flowCreateCount, 0);
+
+  const saved10 = await leadFlowEnv.DB.prepare(
+    `SELECT human_status, source, auto_reason FROM lead_check_decisions WHERE practice_date = '2026-09-10'`
+  ).first<{ human_status: string; source: string; auto_reason: string | null }>();
+  assert.equal(saved10?.human_status, "available");
+  assert.equal(saved10?.source, "html");
+  assert.equal(saved10?.auto_reason === null || !String(saved10?.auto_reason).includes("管理職"), true);
+
+  // 再submit冪等
+  const patchBeforeResubmit = flowPatched.length;
+  const form2 = new FormData();
+  form2.set("s", session.sessionId);
+  form2.set("e", String(session.expiresAtMs));
+  form2.set("r", String(session.revision));
+  form2.set("sig", signature);
+  form2.append("date", "2026-09-10");
+  form2.append("date", "2026-09-11");
+  const resubmit = await hooks.handleLeadCheckHtmlConfirm(
+    new Request("https://example.test/lead-check/confirm", { method: "POST", body: form2 }),
+    leadFlowEnv as any
+  );
+  assert.match(await resubmit.text(), /バス引率予定を更新しました/);
+  assert.equal(flowPatched.length, patchBeforeResubmit);
+
+  // 古いsession（未confirmのまま revision が進んだもの）は拒否
+  const staleSession = await hooks.createLeadCheckSession(
+    leadFlowEnv as any,
+    "2026-09",
+    flowCandidates.filter((c: any) => c.date === "2026-09-10"),
+    []
+  );
+  const newerSession = await hooks.createLeadCheckSession(
+    leadFlowEnv as any,
+    "2026-09",
+    flowCandidates.filter((c: any) => c.date === "2026-09-10"),
+    []
+  );
+  const staleForm = new FormData();
+  staleForm.set("s", staleSession.session.sessionId);
+  staleForm.set("e", String(staleSession.session.expiresAtMs));
+  staleForm.set("r", String(staleSession.session.revision));
+  staleForm.set("sig", staleSession.signature);
+  staleForm.append("date", "2026-09-10");
+  const staleRes = await hooks.handleLeadCheckHtmlConfirm(
+    new Request("https://example.test/lead-check/confirm", { method: "POST", body: staleForm }),
+    leadFlowEnv as any
+  );
+  assert.match(await staleRes.text(), /新しいものに更新/);
+  const newerGet = await hooks.handleLeadCheckHtmlGet(new Request(newerSession.confirmUrl), leadFlowEnv as any);
+  assert.match(await newerGet.text(), /帰りバス引率/);
+
+  // 手動command parse
+  assert.deepEqual(hooks.parseBusLeadManualCommand("9/14 バス引率追加", fixedNow), {
+    month: 9,
+    day: 14,
+    status: "available"
+  });
+  assert.deepEqual(hooks.parseBusLeadManualCommand("9/13 バス引率不可", fixedNow), {
+    month: 9,
+    day: 13,
+    status: "unavailable"
+  });
+  assert.equal(hooks.parseBusLeadManualCommand("バス引率追加", fixedNow), null);
+  assert.equal(
+    hooks.resolveBusLeadPracticeDateFromCircleDates(9, 14, ["2026-09-10", "2026-09-14"]),
+    "2026-09-14"
+  );
+  assert.equal(hooks.resolveBusLeadPracticeDateFromCircleDates(9, 15, ["2026-09-10", "2026-09-14"]), null);
+
+  // command が後なら command が勝つ / html が後なら html が勝つ（updated_at / source）
+  await leadFlowEnv.DB.prepare(
+    `UPDATE lead_check_decisions
+     SET human_status = 'unavailable', source = 'command', confirmed_at = '2026-09-02T00:00:00.000Z', updated_at = '2026-09-02T00:00:00.000Z'
+     WHERE practice_date = '2026-09-10'`
+  ).run();
+  flowCandidates = await hooks.buildLeadCheckCandidateRows(leadFlowEnv as any, ["2026-09-10"], flowEval);
+  assert.equal(flowCandidates[0]?.checkboxInitial, false);
+  await leadFlowEnv.DB.prepare(
+    `UPDATE lead_check_decisions
+     SET human_status = 'available', source = 'html', confirmed_at = '2026-09-03T00:00:00.000Z', updated_at = '2026-09-03T00:00:00.000Z'
+     WHERE practice_date = '2026-09-10'`
+  ).run();
+  flowCandidates = await hooks.buildLeadCheckCandidateRows(leadFlowEnv as any, ["2026-09-10"], flowEval);
+  assert.equal(flowCandidates[0]?.checkboxInitial, true);
+
+  // rich menu 既存 action 文言はそのまま新処理へ入る
+  assert.equal(hooks.isLeadCheckCommand("引率チェック"), true);
 
   globalThis.fetch = originalFetchLead;
 
