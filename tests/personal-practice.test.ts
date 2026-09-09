@@ -1359,6 +1359,81 @@ async function main() {
   assert.equal(formattedWithoutNotes.includes("確認が必要："), true);
   assert.equal(formattedWithoutNotes.includes("帰りの集合場所の確認が必要です。"), true);
 
+  // 読み取り結果: バス帰りは解散=溝の口南口、引率は分離、null/重複なし
+  const busReturnNormalized = hooks.applyReturnReleaseBusinessRules(
+    baseResult({
+      practice_date: "2026-09-10",
+      attendance: "参加",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: "林さん" },
+      bus_guide: "林さん",
+      return_dropoff_place: null,
+      return_release_place: null,
+      payments: [
+        {
+          type: "バス引率代",
+          amount: 100,
+          payee: "林さん",
+          due_date: null,
+          payment_method: null,
+          billing_scope: "event",
+          direction: "return"
+        }
+      ],
+      uncertain_points: [
+        "降りる場所がnullのため確認が必要です。",
+        "支払先が特定できないため確認が必要です。"
+      ],
+      needs_confirmation: true
+    }) as any
+  );
+  assert.equal(busReturnNormalized.return_release_place, "溝の口南口");
+  assert.equal(busReturnNormalized.uncertain_points.length, 0);
+  assert.equal(busReturnNormalized.needs_confirmation, false);
+  const busReturnFormatted = hooks.formatStructuredResultForLine("R8年度保護者会", busReturnNormalized);
+  assert.match(busReturnFormatted, /帰り：バス$/m);
+  assert.ok(!busReturnFormatted.includes("帰り：バス（林さん）"));
+  assert.match(busReturnFormatted, /バス引率：林さん/);
+  assert.match(busReturnFormatted, /解散：溝の口南口/);
+  assert.ok(!busReturnFormatted.includes("null"));
+  assert.ok(!busReturnFormatted.includes("確認が必要："));
+  assert.ok(!busReturnFormatted.includes("降りる場所"));
+
+  // 読み取り結果: 車帰り＋解散場所あり
+  const carReturnWithPlace = hooks.applyReturnReleaseBusinessRules(
+    baseResult({
+      practice_date: "2026-09-07",
+      return_transport: { type: "車", person: "重松さん" },
+      return_dropoff_place: "二ケ領用水ファミマ",
+      return_release_place: null,
+      uncertain_points: ["降りる場所の確認が必要です。"],
+      needs_confirmation: true
+    }) as any
+  );
+  assert.equal(carReturnWithPlace.return_release_place, "二ケ領用水ファミマ");
+  assert.equal(carReturnWithPlace.uncertain_points.length, 0);
+  const carReturnFormatted = hooks.formatStructuredResultForLine("R8年度保護者会", carReturnWithPlace);
+  assert.match(carReturnFormatted, /帰り：重松さんの車/);
+  assert.match(carReturnFormatted, /解散：二ケ領用水ファミマ/);
+  assert.ok(!carReturnFormatted.includes("降りる場所"));
+
+  // 読み取り結果: 車帰り＋解散場所なし → 確認必要
+  const carReturnMissingPlace = hooks.applyReturnReleaseBusinessRules(
+    baseResult({
+      practice_date: "2026-09-11",
+      return_transport: { type: "車", person: "重松さん" },
+      return_dropoff_place: null,
+      return_release_place: null,
+      uncertain_points: [],
+      needs_confirmation: false
+    }) as any
+  );
+  assert.ok(carReturnMissingPlace.uncertain_points.some((point: string) => /解散場所/.test(point)));
+  assert.equal(carReturnMissingPlace.needs_confirmation, true);
+  const carMissingFormatted = hooks.formatStructuredResultForLine("羽魂練習会", carReturnMissingPlace);
+  assert.ok(carMissingFormatted.includes("確認が必要："));
+  assert.ok(!/解散：/.test(carMissingFormatted.split("確認が必要：")[0]));
+
   // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
   const { env: contactEnvToday } = createTestEnv();
   await hooks.saveStructuredResultToD1(
@@ -1391,7 +1466,7 @@ async function main() {
   assert.match(contactTodayText, /集合：17:55ごろ KSP/);
   assert.match(contactTodayText, /行き：バス/);
   assert.match(contactTodayText, /帰り：バス/);
-  assert.match(contactTodayText, /引率：山田さん・遠山さん/);
+  assert.match(contactTodayText, /バス引率：山田さん・遠山さん/);
   assert.match(contactTodayText, /解散：溝の口南口/);
   assert.ok(!contactTodayText.includes("一緒："));
   assert.match(contactTodayText, /【明日 8\/21（金）】\n練習情報なし/);
@@ -1427,7 +1502,7 @@ async function main() {
   assert.match(contactTomorrowText, /集合：18:20 志村さん宅/);
   assert.match(contactTomorrowText, /行き：志村さんの車/);
   assert.match(contactTomorrowText, /帰り：志村さんの車/);
-  assert.match(contactTomorrowText, /降りる場所：溝の口駅前/);
+  assert.match(contactTomorrowText, /解散：溝の口駅前/);
   assert.ok(!contactTomorrowText.includes("一緒："));
 
   // 塁に連絡 Case: 今日・明日両方あり
@@ -1521,7 +1596,7 @@ async function main() {
     ["今日 8/20（木）"]
   );
   assert.match(contactPriorityText, /帰り：志村さんの車/);
-  assert.match(contactPriorityText, /降りる場所：自宅前/);
+  assert.match(contactPriorityText, /解散：自宅前/);
 
   // 塁に連絡 Case: 一部項目不明でも壊れない
   const { env: contactEnvPartial } = createTestEnv();
@@ -1552,7 +1627,8 @@ async function main() {
   assert.ok(!contactPartialText.includes("一緒："));
   assert.match(contactPartialText, /行き：不明/);
   assert.match(contactPartialText, /帰り：バス/);
-  assert.match(contactPartialText, /引率：不明/);
+  assert.ok(!contactPartialText.includes("引率："));
+  assert.ok(!contactPartialText.includes("バス引率："));
   assert.match(contactPartialText, /解散：溝の口南口/);
   assert.ok(!contactPartialText.includes("undefined"));
 
@@ -1736,7 +1812,7 @@ async function main() {
   assert.match(contactOtherSourceText, /【9\/7（月）】/);
   assert.match(contactOtherSourceText, /行き：バス/);
   assert.match(contactOtherSourceText, /帰り：重松さんの車/);
-  assert.match(contactOtherSourceText, /降りる場所：二ケ領用水ファミマ/);
+  assert.match(contactOtherSourceText, /解散：二ケ領用水ファミマ/);
   assert.ok(!contactOtherSourceText.includes("練習情報なし"));
 
   // 塁に連絡 Case: 日曜通常練習・集合未登録は時間帯のみ補完（会場は不明）

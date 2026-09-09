@@ -2308,6 +2308,139 @@ function transportToLineLabel(transport: ParsedTransport): string {
   return transport.type;
 }
 
+/** 帰り表示用。バスの引率者は「バス引率」行へ分離するため、帰り行には付けない。 */
+function returnTransportLabelForLine(transport: ParsedTransport): string {
+  if (transport.type === "バス") {
+    return "バス";
+  }
+  return transportToLineLabel(transport);
+}
+
+const DEFAULT_BUS_RELEASE_PLACE = "溝の口南口";
+
+function resolveReleasePlaceForDisplay(result: StructuredLineResult): string | null {
+  if (result.return_transport.type === "バス") {
+    return isConcreteText(result.return_release_place)
+      ? result.return_release_place
+      : DEFAULT_BUS_RELEASE_PLACE;
+  }
+  if (result.return_transport.type === "車") {
+    if (isConcreteText(result.return_dropoff_place)) {
+      return result.return_dropoff_place;
+    }
+    if (isConcreteText(result.return_release_place)) {
+      return result.return_release_place;
+    }
+    return null;
+  }
+  return null;
+}
+
+function isDropoffOrReleaseUncertainPoint(point: string): boolean {
+  return /(降りる場所|降車場所|解散場所|降車|解散|return_dropoff|return_release|dropoff|release)/.test(
+    point
+  );
+}
+
+function isBusGuideOrPayeeUncertainPoint(point: string): boolean {
+  return /(バス引率|引率者|支払先が特定できない|支払相手が特定できない|引率代.*特定できない)/.test(point);
+}
+
+function pruneResolvedUncertainPoints(result: StructuredLineResult): StructuredLineResult {
+  const hasBusRelease =
+    result.return_transport.type === "バス" && isConcreteText(result.return_release_place);
+  const carPlace =
+    result.return_transport.type === "車"
+      ? isConcreteText(result.return_dropoff_place)
+        ? result.return_dropoff_place
+        : isConcreteText(result.return_release_place)
+          ? result.return_release_place
+          : null
+      : null;
+  const hasCarPlace = carPlace !== null;
+  const hasConcreteBusGuide = isConcreteText(result.bus_guide);
+  const hasBusPayee = result.payments.some(
+    (payment) => payment.type === "バス引率代" && isConcreteText(payment.payee)
+  );
+  const singleGuide =
+    hasConcreteBusGuide && splitGuideNames(result.bus_guide).length === 1;
+
+  const points = result.uncertain_points.filter((raw) => {
+    const point = raw.trim();
+    if (!point) {
+      return false;
+    }
+    // 技術値の露出を避ける
+    if (/^(null|undefined)$/i.test(point)) {
+      return false;
+    }
+    if (/\b(null|undefined)\b/i.test(point) && isDropoffOrReleaseUncertainPoint(point)) {
+      if (hasBusRelease || hasCarPlace) {
+        return false;
+      }
+    }
+    if (hasBusRelease && isDropoffOrReleaseUncertainPoint(point)) {
+      return false;
+    }
+    if (hasCarPlace && isDropoffOrReleaseUncertainPoint(point)) {
+      return false;
+    }
+    if (isBusGuideOrPayeeUncertainPoint(point)) {
+      if (hasBusPayee || (hasConcreteBusGuide && singleGuide)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  return {
+    ...result,
+    uncertain_points: points,
+    needs_confirmation: points.length > 0
+  };
+}
+
+/**
+ * 帰り/解散の業務ルールを適用し、解決済み uncertain を除外する。
+ * - バス → 解散は溝の口南口
+ * - 車 → 明示された降りる場所/解散を解散として扱う。無い場合は確認必要
+ */
+function applyReturnReleaseBusinessRules(result: StructuredLineResult): StructuredLineResult {
+  let busGuide = result.bus_guide;
+  let returnReleasePlace = result.return_release_place;
+  let returnDropoffPlace = result.return_dropoff_place;
+  const uncertainPoints = [...result.uncertain_points];
+
+  if (result.return_transport.type === "バス") {
+    if (!isConcreteText(busGuide) && isConcreteText(result.return_transport.person)) {
+      busGuide = result.return_transport.person;
+    }
+    if (!isConcreteText(returnReleasePlace)) {
+      returnReleasePlace = DEFAULT_BUS_RELEASE_PLACE;
+    }
+  } else if (result.return_transport.type === "車") {
+    const place = isConcreteText(returnDropoffPlace)
+      ? returnDropoffPlace
+      : isConcreteText(returnReleasePlace)
+        ? returnReleasePlace
+        : null;
+    if (place) {
+      returnDropoffPlace = place;
+      returnReleasePlace = place;
+    } else if (!uncertainPoints.some((point) => isDropoffOrReleaseUncertainPoint(point))) {
+      uncertainPoints.push("帰りの解散場所の確認が必要です。");
+    }
+  }
+
+  return pruneResolvedUncertainPoints({
+    ...result,
+    bus_guide: busGuide,
+    return_dropoff_place: returnDropoffPlace,
+    return_release_place: returnReleasePlace,
+    uncertain_points: uncertainPoints
+  });
+}
+
 function formatPaymentLine(payment: ParsedPayment): string {
   const details: string[] = [];
   if (typeof payment.amount === "number") {
@@ -4959,19 +5092,24 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
   }
 
   const returnLabel = isConcreteTransportType(practice.return_type)
-    ? transportToLineLabel({ type: practice.return_type, person: practice.return_person ?? null })
+    ? returnTransportLabelForLine({ type: practice.return_type, person: practice.return_person ?? null })
     : "不明";
   lines.push(`帰り：${returnLabel}`);
 
   if (practice.return_type === "車") {
-    lines.push(`降りる場所：${isConcreteText(practice.return_dropoff_place) ? practice.return_dropoff_place : "不明"}`);
+    const releasePlace = isConcreteText(practice.return_dropoff_place)
+      ? practice.return_dropoff_place
+      : isConcreteText(practice.return_release_place)
+        ? practice.return_release_place
+        : null;
+    lines.push(`解散：${isConcreteText(releasePlace) ? releasePlace : "不明"}`);
   } else if (practice.return_type === "バス") {
-    lines.push(`引率：${isConcreteText(practice.bus_guide) ? practice.bus_guide : "不明"}`);
+    if (isConcreteText(practice.bus_guide)) {
+      lines.push(`バス引率：${practice.bus_guide}`);
+    }
     const returnReleasePlace = isConcreteText(practice.return_release_place)
       ? practice.return_release_place
-      : isWeekdayRegularPractice
-        ? "溝の口南口"
-        : "不明";
+      : DEFAULT_BUS_RELEASE_PLACE;
     lines.push(`解散：${returnReleasePlace}`);
   }
   return lines;
@@ -7627,9 +7765,13 @@ function formatStructuredResultForLine(sourceLabel: string, result: StructuredLi
   }
   lines.push(`参加：${result.attendance}`);
   lines.push(`行き：${transportToLineLabel(result.outbound_transport)}`);
-  lines.push(`帰り：${transportToLineLabel(result.return_transport)}`);
-  if (result.bus_guide) {
+  lines.push(`帰り：${returnTransportLabelForLine(result.return_transport)}`);
+  if (result.return_transport.type === "バス" && isConcreteText(result.bus_guide)) {
     lines.push(`バス引率：${result.bus_guide}`);
+  }
+  const releasePlace = resolveReleasePlaceForDisplay(result);
+  if (isConcreteText(releasePlace)) {
+    lines.push(`解散：${releasePlace}`);
   }
   lines.push("");
 
@@ -7642,12 +7784,15 @@ function formatStructuredResultForLine(sourceLabel: string, result: StructuredLi
     }
   }
 
-  if (result.needs_confirmation || result.uncertain_points.length > 0) {
+  const displayUncertain = result.uncertain_points
+    .map((point) => point.trim())
+    .filter((point) => point.length > 0 && !/^(null|undefined)$/i.test(point));
+  if (result.needs_confirmation || displayUncertain.length > 0) {
     lines.push("", "確認が必要：");
-    if (result.uncertain_points.length === 0) {
+    if (displayUncertain.length === 0) {
       lines.push("・本文から確定できない項目があります。");
     } else {
-      for (const point of result.uncertain_points) {
+      for (const point of displayUncertain) {
         lines.push(`・${point}`);
       }
     }
@@ -8395,7 +8540,8 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       resolved.resolvedPracticeType,
       existingPracticeForResolvedDate
     );
-    const standingApplied = applyStandingPaymentRules(transportApplied.result, {
+    const returnReleasePrepared = applyReturnReleaseBusinessRules(transportApplied.result);
+    const standingApplied = applyStandingPaymentRules(returnReleasePrepared, {
       resolvedPracticeType: resolved.resolvedPracticeType,
       practiceTypeBasis: resolvedTypeMeta.basis,
       practiceTypePriority: resolvedTypeMeta.priority
@@ -8408,7 +8554,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
         droppedMonthlyCharges: groupAccountingGuarded.droppedMonthlyCharges
       });
     }
-    const guardedResult = groupAccountingGuarded.result;
+    const guardedResult = pruneResolvedUncertainPoints(groupAccountingGuarded.result);
     const conditionalPaymentPending = hasConditionalPaymentCue(inputText);
     console.log({
       stage: "message_classification_resolved",
@@ -8756,6 +8902,10 @@ export const TEST_HOOKS = {
   saveRecentPracticeContext,
   loadRecentPracticeContext,
   formatStructuredResultForLine,
+  applyReturnReleaseBusinessRules,
+  pruneResolvedUncertainPoints,
+  returnTransportLabelForLine,
+  resolveReleasePlaceForDisplay,
   saveStructuredResultToD1,
   confirmParticipationAndReleaseConditionalFees,
   getUnifiedUnpaidPayments,
