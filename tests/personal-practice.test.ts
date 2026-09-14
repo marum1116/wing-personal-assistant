@@ -2479,6 +2479,140 @@ async function main() {
   assert.match(unknownReadout, /帰り：不明/);
   assert.ok(!unknownReadout.includes("null"));
 
+  // 《読み取り結果》支払い: paid/unpaidをstatus付き表示。voidは除外。未払いcommandはunpaidのみ
+  const { env: readoutPayEnv } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    readoutPayEnv,
+    "R8年度保護者会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-13",
+      attendance: "参加",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "車", person: "濱田さん" },
+      return_dropoff_place: "二ケ領用水ファミマ",
+      return_release_place: "二ケ領用水ファミマ",
+      payments: []
+    }) as any,
+    "explicit",
+    300
+  );
+  const paidMark = await hooks.markEventPaymentPaid(readoutPayEnv.DB as any, 1);
+  assert.ok(paidMark.outcome === "updated" || paidMark.outcome === "already_paid");
+
+  await readoutPayEnv.DB.prepare(
+    `INSERT INTO payments (
+      practice_date, payment_type, amount, payee, due_date, payment_method, status,
+      billing_scope, direction, source, created_at, updated_at, rule_key, voided_at, needs_review, review_reason
+    ) VALUES (
+      '2026-09-13', 'バス引率代', 100, '旧引率', NULL, NULL, 'unpaid',
+      'event', 'return', 'test', datetime('now'), datetime('now'), 'transport:return:bus', datetime('now'), 0, NULL
+    )`
+  ).run();
+
+  const { env: readoutPayUnpaidEnv } = createTestEnv();
+  await hooks.saveStructuredResultToD1(
+    readoutPayUnpaidEnv,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-09-15",
+      attendance: "参加",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null },
+      bus_guide: "林さん",
+      return_release_place: null,
+      payments: []
+    }) as any,
+    "explicit",
+    300
+  );
+
+  const sep13ReadoutPayments = await hooks.getActiveEventPaymentsForPracticeReadout(
+    readoutPayEnv.DB as any,
+    "2026-09-13"
+  );
+  assert.equal(sep13ReadoutPayments.length, 1);
+  assert.equal(sep13ReadoutPayments[0]?.type, "車同乗代");
+  assert.equal(sep13ReadoutPayments[0]?.status, "paid");
+  assert.equal(sep13ReadoutPayments[0]?.payee, "濱田さん");
+
+  const sep13PaymentFormatted = hooks.formatStructuredResultForLine(
+    "R8年度保護者会",
+    baseResult({
+      practice_date: "2026-09-13",
+      attendance: "参加",
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "車", person: "濱田さん" },
+      payments: sep13ReadoutPayments
+    }) as any
+  );
+  assert.match(sep13PaymentFormatted, /支払い：/);
+  assert.match(sep13PaymentFormatted, /車同乗代/);
+  assert.match(sep13PaymentFormatted, /支払済み/);
+  assert.ok(!sep13PaymentFormatted.includes("支払い：なし"));
+  assert.ok(!sep13PaymentFormatted.includes("バス引率代"));
+
+  const weekdayUnpaidPayments = await hooks.getActiveEventPaymentsForPracticeReadout(
+    readoutPayUnpaidEnv.DB as any,
+    "2026-09-15"
+  );
+  assert.equal(weekdayUnpaidPayments.length, 1);
+  assert.equal(weekdayUnpaidPayments[0]?.status, "unpaid");
+  const weekdayPaymentFormatted = hooks.formatStructuredResultForLine(
+    "羽魂練習会",
+    baseResult({
+      practice_date: "2026-09-15",
+      attendance: "参加",
+      payments: weekdayUnpaidPayments
+    }) as any
+  );
+  assert.match(weekdayPaymentFormatted, /バス引率代/);
+  assert.match(weekdayPaymentFormatted, /未払い/);
+
+  const unpaidListSep13 = await hooks.getUnifiedUnpaidPayments(readoutPayEnv.DB as any, 20);
+  assert.ok(
+    !unpaidListSep13.payments.some(
+      (item: { practice_date?: string; payment_type?: string }) =>
+        item.practice_date === "2026-09-13" && item.payment_type === "車同乗代"
+    )
+  );
+  const unpaidListWeekday = await hooks.getUnifiedUnpaidPayments(readoutPayUnpaidEnv.DB as any, 20);
+  assert.ok(
+    unpaidListWeekday.payments.some(
+      (item: { practice_date?: string; payment_type?: string }) =>
+        item.practice_date === "2026-09-15" && item.payment_type === "バス引率代"
+    )
+  );
+
+  const emptyPaymentFormatted = hooks.formatStructuredResultForLine(
+    "羽魂練習会",
+    baseResult({
+      practice_date: "2026-09-16",
+      payments: []
+    }) as any
+  );
+  assert.match(emptyPaymentFormatted, /支払い：なし/);
+
+  const needsReviewFormatted = hooks.formatPaymentLine({
+    type: "参加費",
+    amount: 800,
+    payee: "神邊さん",
+    due_date: null,
+    payment_method: null,
+    status: "unpaid",
+    needs_review: true
+  });
+  assert.match(needsReviewFormatted, /参加費/);
+  assert.match(needsReviewFormatted, /確認必要/);
+  assert.ok(!needsReviewFormatted.includes("未払い"));
+
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(
     env,

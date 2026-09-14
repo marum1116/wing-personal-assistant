@@ -152,6 +152,9 @@ type ParsedPayment = {
   payee: string | null;
   due_date: string | null;
   payment_method: string | null;
+  /** 《読み取り結果》表示用。D1再取得時のみ付与 */
+  status?: PaymentStatus;
+  needs_review?: boolean;
 };
 
 type MonthlyCharge = {
@@ -2498,6 +2501,19 @@ function applyReturnReleaseBusinessRules(result: StructuredLineResult): Structur
   });
 }
 
+function formatPaymentStatusLabel(payment: ParsedPayment): string | null {
+  if (payment.needs_review === true) {
+    return "確認必要";
+  }
+  if (payment.status === "paid") {
+    return "支払済み";
+  }
+  if (payment.status === "unpaid") {
+    return "未払い";
+  }
+  return null;
+}
+
 function formatPaymentLine(payment: ParsedPayment): string {
   const details: string[] = [];
   if (typeof payment.amount === "number") {
@@ -2512,10 +2528,10 @@ function formatPaymentLine(payment: ParsedPayment): string {
   if (payment.payment_method) {
     details.push(`支払方法：${payment.payment_method}`);
   }
-  if (details.length === 0) {
-    return `・${payment.type}`;
-  }
-  return `・${payment.type}（${details.join("、")}）`;
+  const base =
+    details.length === 0 ? `・${payment.type}` : `・${payment.type}（${details.join("、")}）`;
+  const statusLabel = formatPaymentStatusLabel(payment);
+  return statusLabel ? `${base}（${statusLabel}）` : base;
 }
 
 function paymentIdentityKey(payment: Pick<ParsedPayment, "type" | "amount" | "payee">): string {
@@ -8935,18 +8951,21 @@ async function saveStructuredResultToD1(
   };
 }
 
-async function getActiveUnpaidEventPaymentsForPractice(
+/**
+ * 《読み取り結果》用: その日の有効な event 支払い（unpaid / paid）を status 付きで返す。
+ * voided_at がある履歴行は除外。`未払い` command とは別経路。
+ */
+async function getActiveEventPaymentsForPracticeReadout(
   db: D1Database,
   practiceDate: string
 ): Promise<ParsedPayment[]> {
   const rows = await db
     .prepare(
-      `SELECT payment_type, amount, payee, due_date
-              ,payment_method
+      `SELECT payment_type, amount, payee, due_date, payment_method, status, needs_review
        FROM payments
        WHERE practice_date = ?1
          AND billing_scope = 'event'
-         AND status = 'unpaid'
+         AND status IN ('unpaid', 'paid')
          AND voided_at IS NULL
        ORDER BY id ASC`
     )
@@ -8957,6 +8976,8 @@ async function getActiveUnpaidEventPaymentsForPractice(
       payee: string | null;
       due_date: string | null;
       payment_method: string | null;
+      status: PaymentStatus;
+      needs_review: number;
     }>();
 
   return (rows.results ?? []).map((row) => ({
@@ -8964,21 +8985,25 @@ async function getActiveUnpaidEventPaymentsForPractice(
     amount: row.amount,
     payee: row.payee,
     due_date: row.due_date,
-    payment_method: row.payment_method
+    payment_method: row.payment_method,
+    status: row.status,
+    needs_review: Number(row.needs_review ?? 0) === 1
   }));
 }
 
-async function getActiveUnpaidPersonalPracticePaymentsForPractice(
+/**
+ * 《読み取り結果》用: 個人練習の有効支払い（unpaid / paid）を status 付きで返す。
+ */
+async function getActivePersonalPracticePaymentsForPracticeReadout(
   db: D1Database,
   practiceDate: string
 ): Promise<ParsedPayment[]> {
   const rows = await db
     .prepare(
-      `SELECT payment_type, amount, payee, due_date
-              ,payment_method
+      `SELECT payment_type, amount, payee, due_date, payment_method, status, needs_review
        FROM payments
        WHERE practice_date = ?1
-         AND status = 'unpaid'
+         AND status IN ('unpaid', 'paid')
          AND voided_at IS NULL
          AND rule_key IN ('personal_practice_fee', 'personal_practice_fee_adjustment')
        ORDER BY CASE rule_key
@@ -8993,6 +9018,8 @@ async function getActiveUnpaidPersonalPracticePaymentsForPractice(
       payee: string | null;
       due_date: string | null;
       payment_method: string | null;
+      status: PaymentStatus;
+      needs_review: number;
     }>();
 
   return (rows.results ?? []).map((row) => ({
@@ -9000,7 +9027,9 @@ async function getActiveUnpaidPersonalPracticePaymentsForPractice(
     amount: row.amount,
     payee: row.payee,
     due_date: row.due_date,
-    payment_method: row.payment_method
+    payment_method: row.payment_method,
+    status: row.status,
+    needs_review: Number(row.needs_review ?? 0) === 1
   }));
 }
 
@@ -9891,7 +9920,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
     let replyResult: StructuredLineResult = guardedResult;
     if (guardedResult.practice_date && standingApplied.resolvedPracticeType === "個人練習") {
-      const activePersonalPayments = await getActiveUnpaidPersonalPracticePaymentsForPractice(
+      const activePersonalPayments = await getActivePersonalPracticePaymentsForPracticeReadout(
         env.DB,
         guardedResult.practice_date
       );
@@ -9903,7 +9932,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       isDispatchOrChangeKind(guardedResult.message_kind) &&
       guardedResult.practice_date
     ) {
-      const activeEventPayments = await getActiveUnpaidEventPaymentsForPractice(
+      const activeEventPayments = await getActiveEventPaymentsForPracticeReadout(
         env.DB,
         guardedResult.practice_date
       );
@@ -10176,6 +10205,9 @@ export const TEST_HOOKS = {
   extractPracticeTimeFromText,
   toPracticeRowForDisplay,
   formatStructuredResultForLine,
+  formatPaymentLine,
+  getActiveEventPaymentsForPracticeReadout,
+  getActivePersonalPracticePaymentsForPracticeReadout,
   reconcileDateResolutionUncertainty,
   parseChouseisanSyncCommand,
   isMonthlyFeeCommand,
