@@ -3872,6 +3872,179 @@ function detectRuiExplicitTransportConflict(result: StructuredLineResult, inputT
   return ruiCarAssigned && result.outbound_transport.type === "バス";
 }
 
+/**
+ * 本文中の cue（号・集合場所など）が渡辺塁本人向けか。
+ * - rui: 塁名近傍にある
+ * - non_rui: 本文に存在するが塁向けではない
+ * - absent: 本文に見当たらない
+ */
+function findCueAttributionInText(inputText: string, cue: string): "rui" | "non_rui" | "absent" {
+  const trimmed = cue.trim();
+  if (trimmed.length < 2) {
+    return "absent";
+  }
+  const keys = new Set<string>([trimmed]);
+  const carMatch = /([^\s「」『』、。．]{1,12}号)/.exec(trimmed);
+  if (carMatch?.[1]) {
+    keys.add(carMatch[1]);
+  }
+  const placeMatch = /(プラウド前|溝の口南口|KSP|[^\s「」『』、。．]{2,20}前)/.exec(trimmed);
+  if (placeMatch?.[1]) {
+    keys.add(placeMatch[1]);
+  }
+  const timeMatch = /(\d{1,2}[:：]\d{2})/.exec(trimmed);
+  if (timeMatch?.[1] && /集合/.test(trimmed)) {
+    keys.add(timeMatch[1]);
+  }
+
+  let found = false;
+  let ruiNear = false;
+  let otherChildNear = false;
+  for (const key of keys) {
+    if (key.length < 2) {
+      continue;
+    }
+    let from = 0;
+    while (from < inputText.length) {
+      const idx = inputText.indexOf(key, from);
+      if (idx < 0) {
+        break;
+      }
+      found = true;
+      const window = inputText.slice(
+        Math.max(0, idx - 56),
+        Math.min(inputText.length, idx + key.length + 56)
+      );
+      if (isRuiNameInWindow(window)) {
+        ruiNear = true;
+      } else if (/(?:くん|ちゃん)/.test(window)) {
+        otherChildNear = true;
+      }
+      from = idx + Math.max(1, key.length);
+    }
+  }
+  if (!found) {
+    return "absent";
+  }
+  if (ruiNear) {
+    return "rui";
+  }
+  // 他児向け明示、または本人名が付かない個別指示は
+  // meeting/transport attribution と同様に渡辺塁非適用として扱う
+  if (otherChildNear) {
+    return "non_rui";
+  }
+  return "non_rui";
+}
+
+function extractPersonSpecificCuesFromUncertainPoint(point: string): string[] {
+  const cues: string[] = [];
+  for (const match of point.matchAll(/[「『]([^」』]{2,100})[」』]/g)) {
+    if (match[1]) {
+      cues.push(match[1]);
+    }
+  }
+  for (const match of point.matchAll(/([^\s「」『』、。．]{1,12}号)/g)) {
+    if (match[1]) {
+      cues.push(match[1]);
+    }
+  }
+  for (const match of point.matchAll(/(プラウド前|溝の口南口|[^\s「」『』、。．]{2,20}前)/g)) {
+    if (match[1]) {
+      cues.push(match[1]);
+    }
+  }
+  return [...new Set(cues.map((cue) => cue.trim()).filter((cue) => cue.length > 0))];
+}
+
+function isResolvedNonApplicationUncertain(point: string, result: StructuredLineResult): boolean {
+  // 条件付き一般案内を本人へ入れなかった、という説明は最終確定済み（非適用）
+  if (
+    /反映していません|適用していません|入れませんでした|採用していません/.test(point) &&
+    /(bus_guide|引率|見守り|条件付き)/.test(point)
+  ) {
+    if (result.return_transport.type === "車" || !isConcreteText(result.bus_guide)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isRejectedMeetingCandidateUncertain(
+  point: string,
+  result: StructuredLineResult
+): boolean {
+  const meetingAccepted =
+    isConcreteText(result.meeting_place) || isConcreteText(result.meeting_time);
+  if (meetingAccepted) {
+    return false;
+  }
+  // AI raw の会場→集合誤候補が残っている注記
+  if (
+    /(meeting_place|集合場所|集合が)/.test(point) &&
+    (KNOWN_PRACTICE_VENUE_NAMES as readonly string[]).some((venue) => point.includes(venue))
+  ) {
+    return true;
+  }
+  if (
+    isConcreteText(result.practice_location) &&
+    point.includes(result.practice_location) &&
+    /集合|meeting_place/.test(point)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * attribution / normalization で渡辺塁へ非適用と確定した情報に関する uncertain を除外する。
+ * 固有名詞の場当たり削除ではなく、本文cueの本人帰属結果を再利用する。
+ */
+function pruneNonApplicablePersonSpecificUncertainPoints(
+  result: StructuredLineResult,
+  inputText: string
+): StructuredLineResult {
+  const points = result.uncertain_points.filter((raw) => {
+    const point = raw.trim();
+    if (!point) {
+      return false;
+    }
+    if (isResolvedNonApplicationUncertain(point, result)) {
+      return false;
+    }
+    if (isRejectedMeetingCandidateUncertain(point, result)) {
+      return false;
+    }
+
+    const cues = extractPersonSpecificCuesFromUncertainPoint(point);
+    if (cues.length === 0) {
+      return true;
+    }
+
+    const attributions = cues.map((cue) => findCueAttributionInText(inputText, cue));
+    const hasRuiCue = attributions.some((value) => value === "rui");
+    const hasNonRuiCue = attributions.some((value) => value === "non_rui");
+
+    // 本文cueが別人向けと確定しているのに、塁への適用可否として残っている注記
+    if (hasNonRuiCue && !hasRuiCue) {
+      if (
+        /(渡辺塁|本人行|本人向け|食い違|矛盾|確定できません|適用|反映|outbound|行き|集合)/.test(
+          point
+        )
+      ) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  return {
+    ...result,
+    uncertain_points: points,
+    needs_confirmation: points.length > 0
+  };
+}
+
 function normalizePracticeLocationAndMeetingFields(
   result: StructuredLineResult,
   inputText: string
@@ -3948,15 +4121,18 @@ function normalizePracticeLocationAndMeetingFields(
     }
   }
 
-  return {
-    ...result,
-    practice_location: practiceLocation,
-    practice_time: practiceTime,
-    meeting_time: meetingTime,
-    meeting_place: meetingPlace,
-    needs_confirmation: needsConfirmation,
-    uncertain_points: uncertainPoints
-  };
+  return pruneNonApplicablePersonSpecificUncertainPoints(
+    {
+      ...result,
+      practice_location: practiceLocation,
+      practice_time: practiceTime,
+      meeting_time: meetingTime,
+      meeting_place: meetingPlace,
+      needs_confirmation: needsConfirmation,
+      uncertain_points: uncertainPoints
+    },
+    inputText
+  );
 }
 
 function resolveContactPracticeLocation(practice: PracticeRow): string {
@@ -8879,14 +9055,10 @@ function formatStructuredResultForLine(sourceLabel: string, result: StructuredLi
   const displayUncertain = result.uncertain_points
     .map((point) => point.trim())
     .filter((point) => point.length > 0 && !/^(null|undefined)$/i.test(point));
-  if (result.needs_confirmation || displayUncertain.length > 0) {
+  if (displayUncertain.length > 0) {
     lines.push("", "確認が必要：");
-    if (displayUncertain.length === 0) {
-      lines.push("・本文から確定できない項目があります。");
-    } else {
-      for (const point of displayUncertain) {
-        lines.push(`・${point}`);
-      }
+    for (const point of displayUncertain) {
+      lines.push(`・${point}`);
     }
   }
 
@@ -8937,6 +9109,8 @@ async function callOpenAIForStructuredResult(
     "本文中の『○○号に乗ってください』『○時○分に○○集合』など特定参加者向けの個別指示は、渡辺塁本人向けと確認できない限り本人項目へ入れないでください。" +
     "配車表画像に渡辺塁本人行がある場合、本人の行き/帰り交通手段は本人行を正として優先し、別人向け本文指示で上書きしないでください。" +
     "配車表本人行と、本文の渡辺塁本人向け明示指示が本当に矛盾する場合のみneeds_confirmation=trueとuncertain_pointsへ理由を入れてください。" +
+    "別人向けの個別指示（例: 他の子への号指定・集合）を渡辺塁へ適用しない場合、その非適用そのものをuncertain_pointsへ書かないでください。" +
+    "条件付き一般案内を本人へ入れなかった説明も、uncertain_pointsへ書かないでください。" +
     "配車表画像に『降りる場所』列がある場合は、渡辺塁本人行のそのセルをreturn_dropoff_placeへ必ず入れてください。" +
     "『二ケ領用水ファミマ』『溝の口南口』『向ヶ丘遊園駅』などの固有地名を落とさないでください。" +
     "本人行に降りる場所が空欄ならnullにし、他人行の降車場所を本人へ流用しないでください。" +
@@ -9663,7 +9837,10 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
         droppedMonthlyCharges: groupAccountingGuarded.droppedMonthlyCharges
       });
     }
-    const guardedResult = pruneResolvedUncertainPoints(groupAccountingGuarded.result);
+    const guardedResult = pruneNonApplicablePersonSpecificUncertainPoints(
+      pruneResolvedUncertainPoints(groupAccountingGuarded.result),
+      inputText
+    );
     const conditionalPaymentPending = hasConditionalPaymentCue(inputText);
     console.log({
       stage: "message_classification_resolved",
@@ -9990,6 +10167,8 @@ export const TEST_HOOKS = {
   applyReturnBusGuideTextFallback,
   applyKnownPracticeFallbackForSparseMessage,
   normalizePracticeLocationAndMeetingFields,
+  pruneNonApplicablePersonSpecificUncertainPoints,
+  findCueAttributionInText,
   resolveContactPracticeLocation,
   resolvePracticeTimeLabel,
   resolveContactMeetingLabel,

@@ -2235,6 +2235,101 @@ async function main() {
   assert.equal(conflicted.needs_confirmation, true);
   assert.ok(conflicted.uncertain_points.some((point: string) => /矛盾/.test(point)));
 
+  // uncertain_points: 別人向け確定は除外 / 本人矛盾は残す / rule解決済みは除外
+  const sep13UncertainText =
+    "9/13(日)\n18:00〜21:00\n白幡台小練習\n太郎くんは行き真舟号に乗ってください。\n花子ちゃんは17:20にプラウド前集合です。";
+  const sep13UncertainPruned = hooks.pruneNonApplicablePersonSpecificUncertainPoints(
+    {
+      ...baseResult({
+        practice_date: "2026-09-13",
+        practice_type: "通常練習",
+        practice_location: "白幡台小",
+        practice_time: "18:00〜21:00",
+        meeting_time: null,
+        meeting_place: null,
+        outbound_transport: { type: "バス", person: null },
+        return_transport: { type: "車", person: "濱田さん" },
+        return_dropoff_place: "二ケ領用水ファミマ",
+        return_release_place: "二ケ領用水ファミマ",
+        needs_confirmation: true,
+        uncertain_points: [
+          "本文に「行き真舟号に乗ってください」とあるが配車表の行きがバスのため食い違いが確定できません。",
+          "「17:20にプラウド前集合」が渡辺塁向けか確定できません。",
+          "条件付きの見守り案内をbus_guideには反映していません。"
+        ]
+      }),
+      notes: []
+    } as any,
+    sep13UncertainText
+  );
+  assert.equal(sep13UncertainPruned.uncertain_points.length, 0);
+  assert.equal(sep13UncertainPruned.needs_confirmation, false);
+  assert.equal(hooks.findCueAttributionInText(sep13UncertainText, "真舟号"), "non_rui");
+  assert.equal(hooks.findCueAttributionInText(sep13UncertainText, "プラウド前"), "non_rui");
+
+  const sep13UncertainFormatted = hooks.formatStructuredResultForLine(
+    "R8年度保護者会",
+    hooks.applyReturnReleaseBusinessRules(sep13UncertainPruned as any)
+  );
+  assert.ok(!sep13UncertainFormatted.includes("確認が必要："));
+  assert.ok(!sep13UncertainFormatted.includes("真舟号"));
+  assert.ok(!sep13UncertainFormatted.includes("プラウド前"));
+
+  const ruiConflictKept = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      outbound_transport: { type: "バス", person: null },
+      needs_confirmation: true,
+      uncertain_points: ["本文の「塁くんは真舟号」と配車表本人行バスが矛盾しています。"]
+    }) as any,
+    "塁くんは真舟号に乗ってください。"
+  );
+  assert.equal(ruiConflictKept.needs_confirmation, true);
+  assert.ok(ruiConflictKept.uncertain_points.some((point: string) => /矛盾|真舟号/.test(point)));
+  assert.equal(hooks.findCueAttributionInText("塁くんは真舟号に乗ってください。", "真舟号"), "rui");
+
+  // attribution不明: cueが本文に無く、塁向けか未解決の注記は残す
+  const attributionUnknown = hooks.pruneNonApplicablePersonSpecificUncertainPoints(
+    baseResult({
+      needs_confirmation: true,
+      uncertain_points: ["帰りの解散場所が本文から確定できないため確認が必要です。"]
+    }) as any,
+    "9/20 練習あり。詳細は追って連絡します。"
+  );
+  assert.equal(attributionUnknown.uncertain_points.length, 1);
+  assert.ok(hooks.formatStructuredResultForLine("羽魂練習会", attributionUnknown as any).includes("確認が必要："));
+
+  // business rule解決済み: 帰りバス→解散溝の口南口なら解散欠損uncertainを出さない
+  const busReleaseResolved = hooks.applyReturnReleaseBusinessRules(
+    baseResult({
+      return_transport: { type: "バス", person: null },
+      return_release_place: null,
+      return_dropoff_place: null,
+      needs_confirmation: true,
+      uncertain_points: ["降りる場所が空欄のため確認が必要です。"]
+    }) as any
+  );
+  assert.equal(busReleaseResolved.return_release_place, "溝の口南口");
+  assert.equal(busReleaseResolved.uncertain_points.length, 0);
+  assert.ok(!hooks.formatStructuredResultForLine("羽魂練習会", busReleaseResolved as any).includes("確認が必要："));
+
+  // raw誤抽出: meeting_place=犬蔵中 を不採用した注記は残さない
+  const rawMeetingRejected = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      practice_date: "2026-09-15",
+      practice_type: "通常練習",
+      practice_location: null,
+      meeting_place: "犬蔵中",
+      meeting_time: null,
+      outbound_transport: { type: "バス", person: null },
+      needs_confirmation: true,
+      uncertain_points: ["AI rawのmeeting_place=犬蔵中が集合かどうか確認が必要です。"]
+    }) as any,
+    "9/15\n19:00〜21:00\n犬蔵中練習"
+  );
+  assert.equal(rawMeetingRejected.meeting_place, null);
+  assert.equal(rawMeetingRejected.practice_location, "犬蔵中");
+  assert.ok(!rawMeetingRejected.uncertain_points.some((point: string) => /犬蔵中/.test(point)));
+
   // 行きが車ならバス集合fallbackを使わない
   const { env: contactEnvCar } = createTestEnv();
   await hooks.saveStructuredResultToD1(
@@ -2296,9 +2391,15 @@ async function main() {
           return_transport: { type: "車", person: "濱田さん" },
           return_dropoff_place: "二ケ領用水ファミマ",
           return_release_place: "二ケ領用水ファミマ",
-          payments: [{ type: "車同乗代", amount: 100, payee: "濱田さん", due_date: null, payment_method: null }]
+          payments: [{ type: "車同乗代", amount: 100, payee: "濱田さん", due_date: null, payment_method: null }],
+          needs_confirmation: true,
+          uncertain_points: [
+            "本文に「行き真舟号に乗ってください」とあるが配車表の行きがバスのため食い違いが確定できません。",
+            "「17:20にプラウド前集合」が渡辺塁向けか確定できません。",
+            "条件付きの見守り案内をbus_guideには反映していません。"
+          ]
         }) as any,
-        "9/13(日)\n18:00〜21:00\n白幡台小練習\n行き真舟号に乗ってください。\n17:20にプラウド前集合です。"
+        "9/13(日)\n18:00〜21:00\n白幡台小練習\n太郎くんは行き真舟号に乗ってください。\n花子ちゃんは17:20にプラウド前集合です。"
       )
     )
   );
@@ -2309,6 +2410,8 @@ async function main() {
   assert.match(sep13Readout, /帰り：濱田さんの車/);
   assert.match(sep13Readout, /解散：二ケ領用水ファミマ/);
   assert.ok(!sep13Readout.includes("プラウド前"));
+  assert.ok(!sep13Readout.includes("真舟号"));
+  assert.ok(!sep13Readout.includes("確認が必要："));
   assert.ok(!sep13Readout.includes("null"));
   assert.ok(!sep13Readout.includes("undefined"));
   assert.equal(
