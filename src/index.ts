@@ -3718,13 +3718,17 @@ const WEEKEND_BUS_MEETING_FALLBACK = "16:55 KSP（または17:20 溝の口南口
 const RUI_NAME_RE = /渡辺塁|渡辺くん|塁くん|ルイくん/;
 
 function canonicalizePracticeLocation(value: string): string {
-  const trimmed = value.replace(/\s+/g, "").replace(/練習$/, "").trim();
+  const trimmed = value
+    .replace(/\s+/g, "")
+    .replace(/練習$/, "")
+    .replace(/白旗台小/g, "白幡台小")
+    .trim();
   for (const venue of KNOWN_PRACTICE_VENUE_NAMES) {
     if (trimmed.includes(venue)) {
       return venue;
     }
   }
-  return value.trim();
+  return value.trim().replace(/白旗台小/g, "白幡台小");
 }
 
 function isKnownPracticeVenueName(value: string | null | undefined): boolean {
