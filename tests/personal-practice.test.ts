@@ -88,6 +88,7 @@ function createTestEnv() {
       return_person TEXT,
       bus_guide TEXT,
       practice_location TEXT,
+      practice_time TEXT,
       meeting_time TEXT,
       meeting_place TEXT,
       outbound_companions TEXT,
@@ -106,6 +107,7 @@ function createTestEnv() {
       return_priority INTEGER NOT NULL DEFAULT 0,
       bus_guide_priority INTEGER NOT NULL DEFAULT 0,
       practice_location_priority INTEGER NOT NULL DEFAULT 0,
+      practice_time_priority INTEGER NOT NULL DEFAULT 0,
       meeting_time_priority INTEGER NOT NULL DEFAULT 0,
       meeting_place_priority INTEGER NOT NULL DEFAULT 0,
       outbound_companions_priority INTEGER NOT NULL DEFAULT 0,
@@ -246,6 +248,7 @@ function baseResult(overrides: Record<string, unknown>) {
     return_transport: { type: "不明", person: null },
     bus_guide: null,
     practice_location: null,
+    practice_time: null,
     meeting_time: null,
     meeting_place: null,
     outbound_companions: null,
@@ -1693,7 +1696,9 @@ async function main() {
   assert.equal(carReturnMissingPlace.needs_confirmation, true);
   const carMissingFormatted = hooks.formatStructuredResultForLine("羽魂練習会", carReturnMissingPlace);
   assert.ok(carMissingFormatted.includes("確認が必要："));
-  assert.ok(!/解散：/.test(carMissingFormatted.split("確認が必要：")[0]));
+  assert.match(carMissingFormatted, /解散：不明/);
+  assert.ok(!carMissingFormatted.includes("null"));
+  assert.ok(!carMissingFormatted.includes("降りる場所"));
 
   // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
   const { env: contactEnvToday } = createTestEnv();
@@ -2271,22 +2276,105 @@ async function main() {
   assert.equal(practiceHours.meeting_time, null);
   assert.equal(practiceHours.practice_location, "白幡台小");
 
-  // 読み取り結果formatterは集合/練習場所を意図的に非表示
-  const formattedReadout = hooks.formatStructuredResultForLine(
+  // 読み取り結果: 最終採用値（練習場所/時間/集合）を表示。塁に連絡と共通resolver
+  const sep13Readout = hooks.formatStructuredResultForLine(
+    "R8年度保護者会",
+    hooks.applyReturnReleaseBusinessRules(
+      hooks.normalizePracticeLocationAndMeetingFields(
+        baseResult({
+          message_kind: "dispatch_confirmed",
+          practice_type: "通常練習",
+          practice_type_basis: "explicit",
+          practice_type_evidence: "通常練習",
+          practice_date: "2026-09-13",
+          attendance: "参加",
+          practice_location: null,
+          practice_time: null,
+          meeting_time: "17:20",
+          meeting_place: "プラウド前",
+          outbound_transport: { type: "バス", person: null },
+          return_transport: { type: "車", person: "濱田さん" },
+          return_dropoff_place: "二ケ領用水ファミマ",
+          return_release_place: "二ケ領用水ファミマ",
+          payments: [{ type: "車同乗代", amount: 100, payee: "濱田さん", due_date: null, payment_method: null }]
+        }) as any,
+        "9/13(日)\n18:00〜21:00\n白幡台小練習\n行き真舟号に乗ってください。\n17:20にプラウド前集合です。"
+      )
+    )
+  );
+  assert.match(sep13Readout, /練習場所：白幡台小/);
+  assert.match(sep13Readout, /練習時間：18:00〜21:00/);
+  assert.match(sep13Readout, /集合：16:55 KSP（または17:20 溝の口南口）/);
+  assert.match(sep13Readout, /行き：バス/);
+  assert.match(sep13Readout, /帰り：濱田さんの車/);
+  assert.match(sep13Readout, /解散：二ケ領用水ファミマ/);
+  assert.ok(!sep13Readout.includes("プラウド前"));
+  assert.ok(!sep13Readout.includes("null"));
+  assert.ok(!sep13Readout.includes("undefined"));
+  assert.equal(
+    hooks.resolveContactMeetingLabel(hooks.toPracticeRowForDisplay(
+      hooks.normalizePracticeLocationAndMeetingFields(
+        baseResult({
+          practice_date: "2026-09-13",
+          practice_type: "通常練習",
+          meeting_time: null,
+          meeting_place: null,
+          outbound_transport: { type: "バス", person: null }
+        }) as any,
+        "9/13 白幡台小練習 18:00〜21:00"
+      )
+    )),
+    "16:55 KSP（または17:20 溝の口南口）"
+  );
+
+  const weekdayReadout = hooks.formatStructuredResultForLine(
+    "羽魂練習会",
+    hooks.applyReturnReleaseBusinessRules(
+      hooks.normalizePracticeLocationAndMeetingFields(
+        baseResult({
+          message_kind: "dispatch_confirmed",
+          practice_type: "通常練習",
+          practice_date: "2026-09-15",
+          attendance: "参加",
+          practice_location: null,
+          practice_time: null,
+          meeting_place: "犬蔵中",
+          meeting_time: null,
+          outbound_transport: { type: "バス", person: null },
+          return_transport: { type: "バス", person: null },
+          bus_guide: "林さん",
+          return_release_place: null
+        }) as any,
+        "9/15\n19:00〜21:00\n犬蔵中練習"
+      )
+    )
+  );
+  assert.match(weekdayReadout, /練習場所：犬蔵中/);
+  assert.match(weekdayReadout, /練習時間：19:00〜21:00/);
+  assert.match(weekdayReadout, /集合：17:55ごろ KSP（または18:20 溝の口南口）/);
+  assert.ok(!/集合：犬蔵中/.test(weekdayReadout));
+  assert.match(weekdayReadout, /行き：バス/);
+  assert.match(weekdayReadout, /帰り：バス/);
+  assert.match(weekdayReadout, /バス引率：林さん/);
+  assert.match(weekdayReadout, /解散：溝の口南口/);
+  assert.ok(!/帰り：バス（/.test(weekdayReadout));
+
+  const unknownReadout = hooks.formatStructuredResultForLine(
     "羽魂練習会",
     baseResult({
-      practice_date: "2026-09-13",
-      practice_location: "白幡台小",
-      meeting_time: null,
-      meeting_place: null,
-      outbound_transport: { type: "バス", person: null },
-      return_transport: { type: "車", person: "濱田さん" },
-      return_release_place: "二ケ領用水ファミマ"
+      practice_date: "2026-09-16",
+      practice_type: "個人練習",
+      attendance: "不明",
+      outbound_transport: { type: "不明", person: null },
+      return_transport: { type: "不明", person: null }
     }) as any
   );
-  assert.ok(!formattedReadout.includes("集合："));
-  assert.ok(!formattedReadout.includes("練習場所："));
-  assert.match(formattedReadout, /行き：バス/);
+  assert.match(unknownReadout, /練習場所：不明/);
+  assert.match(unknownReadout, /練習時間：不明/);
+  assert.match(unknownReadout, /集合：不明/);
+  assert.match(unknownReadout, /行き：不明/);
+  assert.match(unknownReadout, /帰り：不明/);
+  assert.ok(!unknownReadout.includes("null"));
 
   // Requested Case A: 金曜日・種別明示なし・AI推測通常練習でも曜日ルール優先で個人練習
   const reqCaseA = await hooks.resolvePracticeContext(

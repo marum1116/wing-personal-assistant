@@ -395,6 +395,7 @@ type PracticeRow = {
   return_person: string | null;
   bus_guide: string | null;
   practice_location: string | null;
+  practice_time: string | null;
   meeting_time: string | null;
   meeting_place: string | null;
   outbound_companions: string | null;
@@ -411,6 +412,7 @@ type PracticeRow = {
   return_priority: number | null;
   bus_guide_priority: number | null;
   practice_location_priority: number | null;
+  practice_time_priority: number | null;
   meeting_time_priority: number | null;
   meeting_place_priority: number | null;
   outbound_companions_priority: number | null;
@@ -465,6 +467,7 @@ type StructuredLineResult = {
   return_transport: ParsedTransport;
   bus_guide: string | null;
   practice_location: string | null;
+  practice_time: string | null;
   meeting_time: string | null;
   meeting_place: string | null;
   outbound_companions: string | null;
@@ -597,6 +600,7 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     },
     bus_guide: { type: ["string", "null"] },
     practice_location: { type: ["string", "null"] },
+    practice_time: { type: ["string", "null"] },
     meeting_time: { type: ["string", "null"] },
     meeting_place: { type: ["string", "null"] },
     outbound_companions: { type: ["string", "null"] },
@@ -644,6 +648,7 @@ const STRUCTURED_OUTPUT_SCHEMA = {
     "return_transport",
     "bus_guide",
     "practice_location",
+    "practice_time",
     "meeting_time",
     "meeting_place",
     "outbound_companions",
@@ -3754,6 +3759,57 @@ function extractPracticeLocationFromText(inputText: string): string | null {
   return matched[1];
 }
 
+function normalizeClockToken(token: string): string {
+  const matched = /^(\d{1,2})[:：](\d{2})$/.exec(token.trim());
+  if (!matched) {
+    return token.trim();
+  }
+  return `${String(Number(matched[1])).padStart(2, "0")}:${matched[2]}`;
+}
+
+function canonicalizePracticeTimeRange(value: string): string | null {
+  const matched = /(\d{1,2}[:：]\d{2})\s*[〜~\-－–—]\s*(\d{1,2}[:：]\d{2})/.exec(value);
+  if (!matched?.[1] || !matched[2]) {
+    return null;
+  }
+  return `${normalizeClockToken(matched[1])}〜${normalizeClockToken(matched[2])}`;
+}
+
+function extractPracticeTimeFromText(inputText: string): string | null {
+  // 「18:00〜21:00」「19:00-21:00」など全体向け練習時間帯
+  const matches = [
+    ...inputText.matchAll(/(\d{1,2}[:：]\d{2})\s*[〜~\-－–—]\s*(\d{1,2}[:：]\d{2})/g)
+  ];
+  for (const match of matches) {
+    const raw = match[0] ?? "";
+    const window = textWindowAround(inputText, raw, 24) ?? raw;
+    // 集合文脈の時刻レンジは練習時間として採用しない
+    if (/集合/.test(window)) {
+      continue;
+    }
+    const canonical = canonicalizePracticeTimeRange(raw);
+    if (canonical) {
+      return canonical;
+    }
+  }
+  return null;
+}
+
+function defaultPracticeTimeForRegular(practiceDate: string, practiceType: PracticeType | null): string | null {
+  if (practiceType !== "通常練習") {
+    return null;
+  }
+  const parsed = parseYmdAsUtcDate(practiceDate);
+  if (!parsed) {
+    return null;
+  }
+  // 日曜通常練習は原則 18:00〜21:00（集合ではない）
+  if (parsed.getUTCDay() === 0) {
+    return "18:00〜21:00";
+  }
+  return null;
+}
+
 function textWindowAround(inputText: string, needle: string, radius = 48): string | null {
   const index = inputText.indexOf(needle);
   if (index < 0) {
@@ -3823,6 +3879,9 @@ function normalizePracticeLocationAndMeetingFields(
   let practiceLocation = isConcreteText(result.practice_location)
     ? canonicalizePracticeLocation(result.practice_location)
     : null;
+  let practiceTime = isConcreteText(result.practice_time)
+    ? canonicalizePracticeTimeRange(result.practice_time) ?? result.practice_time.trim()
+    : null;
   let meetingTime = result.meeting_time;
   let meetingPlace = result.meeting_place;
   const uncertainPoints = [...result.uncertain_points];
@@ -3831,6 +3890,17 @@ function normalizePracticeLocationAndMeetingFields(
   const extractedLocation = extractPracticeLocationFromText(inputText);
   if (!isConcreteText(practiceLocation) && extractedLocation) {
     practiceLocation = extractedLocation;
+  }
+
+  const extractedTime = extractPracticeTimeFromText(inputText);
+  if (!isConcreteText(practiceTime) && extractedTime) {
+    practiceTime = extractedTime;
+  }
+  if (
+    !isConcreteText(practiceTime) &&
+    isConcreteText(result.practice_date)
+  ) {
+    practiceTime = defaultPracticeTimeForRegular(result.practice_date, result.practice_type);
   }
 
   // 練習場所を集合場所へ推測コピーしているケースを戻す
@@ -3849,7 +3919,11 @@ function normalizePracticeLocationAndMeetingFields(
     }
   }
 
-  if (isPracticeTimeRangeLabel(meetingTime)) {
+  if (isConcreteText(meetingTime) && isPracticeTimeRangeLabel(meetingTime)) {
+    // 誤って meeting に入った練習時間帯は練習時間へ移し、集合からは外す
+    if (!isConcreteText(practiceTime)) {
+      practiceTime = canonicalizePracticeTimeRange(meetingTime) ?? meetingTime;
+    }
     meetingTime = null;
   }
 
@@ -3877,6 +3951,7 @@ function normalizePracticeLocationAndMeetingFields(
   return {
     ...result,
     practice_location: practiceLocation,
+    practice_time: practiceTime,
     meeting_time: meetingTime,
     meeting_place: meetingPlace,
     needs_confirmation: needsConfirmation,
@@ -3889,6 +3964,15 @@ function resolveContactPracticeLocation(practice: PracticeRow): string {
     return canonicalizePracticeLocation(practice.practice_location);
   }
   return defaultPracticeLocation(practice.practice_date, practice.practice_type) ?? "不明";
+}
+
+function resolvePracticeTimeLabel(practice: PracticeRow): string {
+  if (isConcreteText(practice.practice_time)) {
+    return canonicalizePracticeTimeRange(practice.practice_time) ?? practice.practice_time;
+  }
+  return (
+    defaultPracticeTimeForRegular(practice.practice_date, practice.practice_type) ?? "不明"
+  );
 }
 
 function resolveContactMeetingLabel(practice: PracticeRow): string {
@@ -3922,6 +4006,45 @@ function resolveContactMeetingLabel(practice: PracticeRow): string {
     }
   }
   return "不明";
+}
+
+/** 《読み取り結果》と `塁に連絡` で同じ集合/会場解決を使うためのスナップショット */
+function toPracticeRowForDisplay(result: StructuredLineResult): PracticeRow {
+  return {
+    practice_date: result.practice_date ?? "",
+    attendance: result.attendance,
+    outbound_type: result.outbound_transport.type,
+    outbound_person: result.outbound_transport.person,
+    return_type: result.return_transport.type,
+    return_person: result.return_transport.person,
+    bus_guide: result.bus_guide,
+    practice_location: result.practice_location,
+    practice_time: result.practice_time,
+    meeting_time: result.meeting_time,
+    meeting_place: result.meeting_place,
+    outbound_companions: result.outbound_companions,
+    return_dropoff_place: result.return_dropoff_place,
+    return_release_place: result.return_release_place,
+    same_grade_boys: null,
+    source: "",
+    notes: result.notes,
+    practice_type: result.practice_type,
+    practice_type_basis: result.practice_type_basis === "explicit" ? "explicit" : "unknown",
+    practice_type_priority: 0,
+    attendance_priority: 0,
+    outbound_priority: 0,
+    return_priority: 0,
+    bus_guide_priority: 0,
+    practice_location_priority: 0,
+    practice_time_priority: 0,
+    meeting_time_priority: 0,
+    meeting_place_priority: 0,
+    outbound_companions_priority: 0,
+    return_dropoff_place_priority: 0,
+    return_release_place_priority: 0,
+    same_grade_boys_priority: 0,
+    last_message_kind: result.message_kind
+  };
 }
 
 async function syncChouseisanSchedule(
@@ -5964,9 +6087,9 @@ async function getPracticeByDateAndSource(
   const row = await db
     .prepare(
       `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide,
-              practice_location, meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, same_grade_boys, source, notes,
+              practice_location, practice_time, meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, same_grade_boys, source, notes,
               practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
-              bus_guide_priority, practice_location_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
+              bus_guide_priority, practice_location_priority, practice_time_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
               same_grade_boys_priority,
               return_dropoff_place_priority, return_release_place_priority, last_message_kind
        FROM practices
@@ -6988,6 +7111,7 @@ function toPracticeRowForCalculation(practice: PracticeRow): StructuredLineResul
     },
     bus_guide: practice.bus_guide,
     practice_location: practice.practice_location,
+    practice_time: practice.practice_time,
     meeting_time: practice.meeting_time,
     meeting_place: practice.meeting_place,
     outbound_companions: practice.outbound_companions,
@@ -7005,9 +7129,9 @@ async function getPracticeByDate(db: D1Database, practiceDate: string): Promise<
   const row = await db
     .prepare(
       `SELECT practice_date, attendance, outbound_type, outbound_person, return_type, return_person, bus_guide,
-              practice_location, meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, same_grade_boys, source, notes,
+              practice_location, practice_time, meeting_time, meeting_place, outbound_companions, return_dropoff_place, return_release_place, same_grade_boys, source, notes,
               practice_type, practice_type_basis, practice_type_priority, attendance_priority, outbound_priority, return_priority,
-              bus_guide_priority, practice_location_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
+              bus_guide_priority, practice_location_priority, practice_time_priority, meeting_time_priority, meeting_place_priority, outbound_companions_priority,
               same_grade_boys_priority,
               return_dropoff_place_priority, return_release_place_priority, last_message_kind
        FROM practices
@@ -7087,6 +7211,7 @@ async function savePracticeToD1(
     return_person: null,
     bus_guide: null,
     practice_location: null,
+    practice_time: null,
     meeting_time: null,
     meeting_place: null,
     outbound_companions: null,
@@ -7103,6 +7228,7 @@ async function savePracticeToD1(
     return_priority: 0,
     bus_guide_priority: 0,
     practice_location_priority: 0,
+    practice_time_priority: 0,
     meeting_time_priority: 0,
     meeting_place_priority: 0,
     outbound_companions_priority: 0,
@@ -7124,6 +7250,8 @@ async function savePracticeToD1(
   let busGuidePriority = fallback.bus_guide_priority ?? 0;
   let practiceLocation = fallback.practice_location;
   let practiceLocationPriority = fallback.practice_location_priority ?? 0;
+  let practiceTime = fallback.practice_time;
+  let practiceTimePriority = fallback.practice_time_priority ?? 0;
   let meetingTime = fallback.meeting_time;
   let meetingTimePriority = fallback.meeting_time_priority ?? 0;
   let meetingPlace = fallback.meeting_place;
@@ -7194,6 +7322,10 @@ async function savePracticeToD1(
     practiceLocation = canonicalizePracticeLocation(result.practice_location);
     practiceLocationPriority = messagePriorityValue;
   }
+  if (isConcreteText(result.practice_time) && messagePriorityValue >= practiceTimePriority) {
+    practiceTime = canonicalizePracticeTimeRange(result.practice_time) ?? result.practice_time;
+    practiceTimePriority = messagePriorityValue;
+  }
 
   if (messagePriorityValue >= meetingTimePriority) {
     if (isConcreteText(result.meeting_time)) {
@@ -7249,6 +7381,7 @@ async function savePracticeToD1(
       return_person,
       bus_guide,
       practice_location,
+      practice_time,
       meeting_time,
       meeting_place,
       outbound_companions,
@@ -7265,6 +7398,7 @@ async function savePracticeToD1(
       return_priority,
       bus_guide_priority,
       practice_location_priority,
+      practice_time_priority,
       meeting_time_priority,
       meeting_place_priority,
       outbound_companions_priority,
@@ -7274,7 +7408,7 @@ async function savePracticeToD1(
       last_message_kind,
       created_at,
       updated_at
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?32)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?34)
     ON CONFLICT(practice_date) DO UPDATE SET
       attendance = excluded.attendance,
       outbound_type = excluded.outbound_type,
@@ -7283,6 +7417,7 @@ async function savePracticeToD1(
       return_person = excluded.return_person,
       bus_guide = excluded.bus_guide,
       practice_location = excluded.practice_location,
+      practice_time = excluded.practice_time,
       meeting_time = excluded.meeting_time,
       meeting_place = excluded.meeting_place,
       outbound_companions = excluded.outbound_companions,
@@ -7299,6 +7434,7 @@ async function savePracticeToD1(
       return_priority = excluded.return_priority,
       bus_guide_priority = excluded.bus_guide_priority,
       practice_location_priority = excluded.practice_location_priority,
+      practice_time_priority = excluded.practice_time_priority,
       meeting_time_priority = excluded.meeting_time_priority,
       meeting_place_priority = excluded.meeting_place_priority,
       outbound_companions_priority = excluded.outbound_companions_priority,
@@ -7317,6 +7453,7 @@ async function savePracticeToD1(
       returnPerson,
       busGuide,
       practiceLocation,
+      practiceTime,
       meetingTime,
       meetingPlace,
       outboundCompanions,
@@ -7333,6 +7470,7 @@ async function savePracticeToD1(
       returnPriority,
       busGuidePriority,
       practiceLocationPriority,
+      practiceTimePriority,
       meetingTimePriority,
       meetingPlacePriority,
       outboundCompanionsPriority,
@@ -8692,21 +8830,41 @@ async function getActiveUnpaidPersonalPracticePaymentsForPractice(
 
 function formatStructuredResultForLine(sourceLabel: string, result: StructuredLineResult): string {
   const lines: string[] = [];
+  const practiceView = toPracticeRowForDisplay(result);
 
   lines.push("読み取り結果", "", `情報源：${sourceLabel}`);
   if (result.practice_date) {
     lines.push(`対象日：${result.practice_date}`);
   }
   lines.push(`参加：${result.attendance}`);
-  lines.push(`行き：${transportToLineLabel(result.outbound_transport)}`);
-  lines.push(`帰り：${returnTransportLabelForLine(result.return_transport)}`);
+  lines.push(`練習場所：${resolveContactPracticeLocation(practiceView)}`);
+  lines.push(`練習時間：${resolvePracticeTimeLabel(practiceView)}`);
+  lines.push(`集合：${resolveContactMeetingLabel(practiceView)}`);
+
+  const outboundLabel = isConcreteTransportType(result.outbound_transport.type)
+    ? transportToLineLabel(result.outbound_transport)
+    : "不明";
+  lines.push(`行き：${outboundLabel}`);
+
+  const returnLabel = isConcreteTransportType(result.return_transport.type)
+    ? returnTransportLabelForLine(result.return_transport)
+    : "不明";
+  lines.push(`帰り：${returnLabel}`);
+
   if (result.return_transport.type === "バス" && isConcreteText(result.bus_guide)) {
     lines.push(`バス引率：${result.bus_guide}`);
   }
-  const releasePlace = resolveReleasePlaceForDisplay(result);
-  if (isConcreteText(releasePlace)) {
+
+  if (result.return_transport.type === "バス") {
+    const releasePlace = isConcreteText(result.return_release_place)
+      ? result.return_release_place
+      : DEFAULT_BUS_RELEASE_PLACE;
     lines.push(`解散：${releasePlace}`);
+  } else if (result.return_transport.type === "車") {
+    const releasePlace = resolveReleasePlaceForDisplay(result);
+    lines.push(`解散：${isConcreteText(releasePlace) ? releasePlace : "不明"}`);
   }
+
   lines.push("");
 
   if (result.payments.length === 0) {
@@ -8770,9 +8928,10 @@ async function callOpenAIForStructuredResult(
     "attendance/outbound_transport/return_transportは、渡辺塁本人について明示または文脈上の確定情報がある場合のみ設定し、" +
     "判断できなければ必ず不明にしてください。" +
     "practice_locationは練習会場（例: 犬蔵中 / 白幡台小）です。本文の『○○練習』など全体向け案内から抽出してください。" +
+    "practice_timeは練習時間帯（例: 18:00〜21:00 / 19:00〜21:00）です。集合時刻ではありません。" +
     "meeting_placeは集合場所（例: KSP / 溝の口南口 / 本人向けに明示された集合場所）です。practice_locationと同じ意味ではありません。" +
     "練習場所が犬蔵中だからといってmeeting_placeを犬蔵中にしないでください。会場集合が渡辺塁本人へ明示されている場合だけmeeting_placeに会場名を入れてください。" +
-    "meeting_timeは集合時刻です。練習時間帯（例: 18:00〜21:00）をmeeting_timeへ入れないでください。" +
+    "meeting_timeは集合時刻です。練習時間帯（例: 18:00〜21:00）をmeeting_timeへ入れないでください。練習時間帯はpractice_timeへ入れてください。" +
     "meeting_time/meeting_place/outbound_companions/return_dropoff_place/return_release_placeは、渡辺塁本人向けだと安全に判断できる場合のみ設定し、" +
     "根拠がなければ必ずnullにしてください。" +
     "本文中の『○○号に乗ってください』『○時○分に○○集合』など特定参加者向けの個別指示は、渡辺塁本人向けと確認できない限り本人項目へ入れないでください。" +
@@ -9832,8 +9991,12 @@ export const TEST_HOOKS = {
   applyKnownPracticeFallbackForSparseMessage,
   normalizePracticeLocationAndMeetingFields,
   resolveContactPracticeLocation,
+  resolvePracticeTimeLabel,
   resolveContactMeetingLabel,
   extractPracticeLocationFromText,
+  extractPracticeTimeFromText,
+  toPracticeRowForDisplay,
+  formatStructuredResultForLine,
   reconcileDateResolutionUncertainty,
   parseChouseisanSyncCommand,
   isMonthlyFeeCommand,
@@ -9873,7 +10036,6 @@ export const TEST_HOOKS = {
   resolvePracticeContext,
   saveRecentPracticeContext,
   loadRecentPracticeContext,
-  formatStructuredResultForLine,
   applyReturnReleaseBusinessRules,
   pruneResolvedUncertainPoints,
   returnTransportLabelForLine,
