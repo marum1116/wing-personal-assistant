@@ -4014,7 +4014,7 @@ function isRejectedMeetingCandidateUncertain(
 
 /**
  * attribution / normalization で渡辺塁へ非適用と確定した情報に関する uncertain を除外する。
- * 固有名詞の場当たり削除ではなく、本文cueの本人帰属結果を再利用する。
+ * 固有名詞の場当たり削除ではなく、本文cueの本人帰属結果と最終採用フィールドを再利用する。
  */
 function pruneNonApplicablePersonSpecificUncertainPoints(
   result: StructuredLineResult,
@@ -4039,17 +4039,33 @@ function pruneNonApplicablePersonSpecificUncertainPoints(
 
     const attributions = cues.map((cue) => findCueAttributionInText(inputText, cue));
     const hasRuiCue = attributions.some((value) => value === "rui");
-    const hasNonRuiCue = attributions.some((value) => value === "non_rui");
+    // 本人向けと確定したcueがある注記は残す（本人矛盾など）
+    if (hasRuiCue) {
+      return true;
+    }
 
-    // 本文cueが別人向けと確定しているのに、塁への適用可否として残っている注記
-    if (hasNonRuiCue && !hasRuiCue) {
-      if (
-        /(渡辺塁|本人行|本人向け|食い違|矛盾|確定できません|適用|反映|outbound|行き|集合)/.test(
-          point
-        )
-      ) {
-        return false;
-      }
+    const aboutRuiConflictOrApplicability =
+      /(渡辺塁|本人行|本人向け|本人の行き|食い違|矛盾|一致しない|確定できません|適用|反映|outbound|行き|集合|確認必要)/.test(
+        point
+      );
+    if (!aboutRuiConflictOrApplicability) {
+      return true;
+    }
+
+    const hasCarCue = cues.some((cue) => /号/.test(cue));
+    const meetingStyleCue = cues.some(
+      (cue) => /(前|集合|KSP|溝の口)/.test(cue) || /\d{1,2}[:：]\d{2}/.test(cue)
+    );
+
+    const carNotAppliedToRui = hasCarCue && result.outbound_transport.type === "バス";
+    const meetingNotAppliedToRui =
+      meetingStyleCue &&
+      !isConcreteText(result.meeting_place) &&
+      !isConcreteText(result.meeting_time);
+
+    // non_rui確定、または本文にcueが無くAIだけが挙げているが最終フィールドへ未採用
+    if (carNotAppliedToRui || meetingNotAppliedToRui) {
+      return false;
     }
     return true;
   });

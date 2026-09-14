@@ -2275,6 +2275,23 @@ async function main() {
   assert.ok(!sep13UncertainFormatted.includes("真舟号"));
   assert.ok(!sep13UncertainFormatted.includes("プラウド前"));
 
+  // AIが「一致しない」と書いた別人向け注記は、本文cue欠落時でも最終未採用なら除外
+  const aiMismatchAbsentCue = hooks.pruneNonApplicablePersonSpecificUncertainPoints(
+    baseResult({
+      practice_date: "2026-09-13",
+      outbound_transport: { type: "バス", person: null },
+      meeting_time: null,
+      meeting_place: null,
+      needs_confirmation: true,
+      uncertain_points: [
+        "本文の行き真舟号・17:20プラウド前集合と、配車表の渡辺塁本人行きバスが一致しないため、本人の行き配車を確認必要。"
+      ]
+    }) as any,
+    "9/13(日) 白幡台小練習 18:00〜21:00" // 本文に真舟号cueなし（画像由来想定）
+  );
+  assert.equal(aiMismatchAbsentCue.uncertain_points.length, 0);
+  assert.equal(aiMismatchAbsentCue.needs_confirmation, false);
+
   const ruiConflictKept = hooks.normalizePracticeLocationAndMeetingFields(
     baseResult({
       outbound_transport: { type: "バス", person: null },
