@@ -1010,11 +1010,59 @@ async function main() {
   assert.equal(personalSyncOk.created, 2);
   assert.equal(personalSyncOk.failed, 0);
   assert.equal(personalCreateBodies.length, 2);
+  const personalStarts = personalCreateBodies
+    .map((body) => String((body.start as { dateTime?: string } | undefined)?.dateTime ?? ""))
+    .sort();
+  assert.deepEqual(personalStarts, ["2026-10-11T11:00:00", "2026-10-16T18:00:00"]);
+  const personalEnds = personalCreateBodies
+    .map((body) => String((body.end as { dateTime?: string } | undefined)?.dateTime ?? ""))
+    .sort();
+  assert.deepEqual(personalEnds, ["2026-10-11T13:00:00", "2026-10-16T21:00:00"]);
   const personalMap11 = await personalCalEnv.STATE.get("rui_calendar_event:personal:2026-10-11");
   const personalMap16 = await personalCalEnv.STATE.get("rui_calendar_event:personal:2026-10-16");
   assert.ok(personalMap11 && personalMap11.includes("eventId"));
   assert.ok(personalMap16 && personalMap16.includes("eventId"));
   assert.equal(await personalCalEnv.STATE.get("rui_calendar_event:personal:2026-10-02"), null);
+
+  // 個人練習時間パース: 日付下の 11-13 / 18-21、および概要fallback
+  assert.deepEqual(hooks.parseChoiceDateTime("10/11(日) 11-13", 2026), {
+    start: "2026-10-11T11:00:00",
+    end: "2026-10-11T13:00:00",
+    timeSource: "hour_range"
+  });
+  assert.deepEqual(hooks.parseChoiceDateTime("10/16(金) 18-21", 2026), {
+    start: "2026-10-16T18:00:00",
+    end: "2026-10-16T21:00:00",
+    timeSource: "hour_range"
+  });
+  assert.deepEqual(hooks.parseChoiceDateTime("9/10(木) 19:00〜", 2026), {
+    start: "2026-09-10T19:00:00",
+    end: "2026-09-10T21:00:00",
+    timeSource: "colon"
+  });
+  const personalDetail = `4日（日）
+9-13時②コマ　、11-13時
+
+12日（月）祝日
+9-13時②コマ　、11-15時②コマ
+
+24日（土）
+9-12時　、11-13時`;
+  assert.deepEqual(hooks.parseChoiceDateTime("10/4(日) ", 2026, personalDetail), {
+    start: "2026-10-04T09:00:00",
+    end: "2026-10-04T13:00:00",
+    timeSource: "detail"
+  });
+  assert.deepEqual(hooks.parseChoiceDateTime("10/12(月) ", 2026, personalDetail), {
+    start: "2026-10-12T09:00:00",
+    end: "2026-10-12T13:00:00",
+    timeSource: "detail"
+  });
+  assert.deepEqual(hooks.inferTimeRangeFromChouseisanDetail(personalDetail, "2026-10-24"), {
+    startHour: 9,
+    endHour: 12,
+    source: "detail_multi"
+  });
 
   const { env: personalFailEnv } = createTestEnv();
   (personalFailEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;

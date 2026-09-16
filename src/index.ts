@@ -1822,7 +1822,92 @@ function normalizeRuiCalendarDays(
   };
 }
 
-function parseChoiceDateTime(choiceText: string, year: number): { start: string; end: string } | null {
+function formatLocalDateTime(year: number, month: number, day: number, hour: number, minute: number): string {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
+}
+
+function parseHourRangeFromText(text: string): { startHour: number; endHour: number } | null {
+  // 個人練習の「11-13」「18-21」「9-12時」など（日付の 10/11 は除外）
+  const matched = /(\d{1,2})\s*[-〜~～－–]\s*(\d{1,2})(?:\s*時)?/.exec(text);
+  if (!matched) {
+    return null;
+  }
+  const startHour = Number(matched[1]);
+  const endHour = Number(matched[2]);
+  if (!Number.isFinite(startHour) || !Number.isFinite(endHour)) {
+    return null;
+  }
+  if (startHour < 0 || startHour > 23 || endHour < 0 || endHour > 24) {
+    return null;
+  }
+  if (endHour <= startHour) {
+    return null;
+  }
+  return { startHour, endHour };
+}
+
+/**
+ * 個人調整さん概要（event.detail）から、日付下に時間がない日の練習時間を補完する。
+ * 例:
+ *  4日（日）
+ *  9-13時②コマ　、11-13時
+ */
+function inferTimeRangeFromChouseisanDetail(
+  detail: string | null | undefined,
+  practiceDate: string
+): { startHour: number; endHour: number; source: "detail_first" | "detail_multi" } | null {
+  if (!detail) {
+    return null;
+  }
+  const day = Number(practiceDate.slice(8, 10));
+  if (!Number.isFinite(day) || day < 1 || day > 31) {
+    return null;
+  }
+  const lines = detail
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  let collectingForDay = false;
+  const ranges: Array<{ startHour: number; endHour: number }> = [];
+  for (const line of lines) {
+    const dayMatched = /^(\d{1,2})\s*日/.exec(line);
+    if (dayMatched) {
+      collectingForDay = Number(dayMatched[1]) === day;
+      continue;
+    }
+    if (!collectingForDay) {
+      continue;
+    }
+    // 同一日付ブロック内の「9-13時」「11-13」などを収集
+    const rangeMatches = [...line.matchAll(/(\d{1,2})\s*[-〜~～－–]\s*(\d{1,2})(?:\s*時)?/g)];
+    for (const match of rangeMatches) {
+      const startHour = Number(match[1]);
+      const endHour = Number(match[2]);
+      if (!Number.isFinite(startHour) || !Number.isFinite(endHour)) {
+        continue;
+      }
+      if (startHour < 0 || startHour > 23 || endHour < 0 || endHour > 24 || endHour <= startHour) {
+        continue;
+      }
+      ranges.push({ startHour, endHour });
+    }
+  }
+  if (ranges.length === 0) {
+    return null;
+  }
+  const first = ranges[0]!;
+  return {
+    startHour: first.startHour,
+    endHour: first.endHour,
+    source: ranges.length > 1 ? "detail_multi" : "detail_first"
+  };
+}
+
+function parseChoiceDateTime(
+  choiceText: string,
+  year: number,
+  detail?: string | null
+): { start: string; end: string; timeSource: "colon" | "hour_range" | "detail" | "default" } | null {
   const dateMatched = /(\d{1,2})\/(\d{1,2})/.exec(choiceText);
   if (!dateMatched) {
     return null;
@@ -1833,38 +1918,62 @@ function parseChoiceDateTime(choiceText: string, year: number): { start: string;
   if (!parseYmdAsUtcDate(baseDate)) {
     return null;
   }
-  const timeMatches = [...choiceText.matchAll(/(\d{1,2}):(\d{2})/g)];
-  if (timeMatches.length === 0) {
+  const afterDate = choiceText.slice((dateMatched.index ?? 0) + dateMatched[0].length);
+
+  const colonMatches = [...afterDate.matchAll(/(\d{1,2}):(\d{2})/g)];
+  if (colonMatches.length > 0) {
+    const startHour = Number(colonMatches[0]?.[1] ?? "9");
+    const startMinute = Number(colonMatches[0]?.[2] ?? "0");
+    let endHour: number;
+    let endMinute: number;
+    if (colonMatches.length >= 2) {
+      endHour = Number(colonMatches[1]?.[1] ?? String(startHour + 2));
+      endMinute = Number(colonMatches[1]?.[2] ?? "0");
+      if (endHour < startHour || (endHour === startHour && endMinute <= startMinute)) {
+        endHour = startHour + 2;
+        endMinute = startMinute;
+      }
+    } else {
+      endHour = startHour + 2;
+      endMinute = startMinute;
+    }
     return {
-      start: `${baseDate}T09:00:00`,
-      end: `${baseDate}T11:00:00`
+      start: formatLocalDateTime(year, month, day, startHour, startMinute),
+      end: formatLocalDateTime(year, month, day, endHour, endMinute),
+      timeSource: "colon"
     };
   }
-  const startHour = Number(timeMatches[0]?.[1] ?? "9");
-  const startMinute = Number(timeMatches[0]?.[2] ?? "0");
-  const start = new Date(Date.UTC(year, month - 1, day, startHour, startMinute, 0));
-  let end: Date;
-  if (timeMatches.length >= 2) {
-    const endHour = Number(timeMatches[1]?.[1] ?? String(startHour + 2));
-    const endMinute = Number(timeMatches[1]?.[2] ?? "0");
-    end = new Date(Date.UTC(year, month - 1, day, endHour, endMinute, 0));
-    if (end.getTime() <= start.getTime()) {
-      end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
-    }
-  } else {
-    end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+
+  const hourRange = parseHourRangeFromText(afterDate);
+  if (hourRange) {
+    return {
+      start: formatLocalDateTime(year, month, day, hourRange.startHour, 0),
+      end: formatLocalDateTime(year, month, day, hourRange.endHour, 0),
+      timeSource: "hour_range"
+    };
   }
-  const toLocalIsoNoZ = (value: Date): string => {
-    const y = value.getUTCFullYear();
-    const m = String(value.getUTCMonth() + 1).padStart(2, "0");
-    const d = String(value.getUTCDate()).padStart(2, "0");
-    const hh = String(value.getUTCHours()).padStart(2, "0");
-    const mm = String(value.getUTCMinutes()).padStart(2, "0");
-    return `${y}-${m}-${d}T${hh}:${mm}:00`;
-  };
+
+  const fromDetail = inferTimeRangeFromChouseisanDetail(detail, baseDate);
+  if (fromDetail) {
+    if (fromDetail.source === "detail_multi") {
+      console.log({
+        stage: "chouseisan_time_from_detail_multi",
+        practice_date: baseDate,
+        chosen: `${fromDetail.startHour}-${fromDetail.endHour}`,
+        note: "detail_has_multiple_ranges_using_first"
+      });
+    }
+    return {
+      start: formatLocalDateTime(year, month, day, fromDetail.startHour, 0),
+      end: formatLocalDateTime(year, month, day, fromDetail.endHour, 0),
+      timeSource: "detail"
+    };
+  }
+
   return {
-    start: toLocalIsoNoZ(start),
-    end: toLocalIsoNoZ(end)
+    start: `${baseDate}T09:00:00`,
+    end: `${baseDate}T11:00:00`,
+    timeSource: "default"
   };
 }
 
@@ -2938,7 +3047,7 @@ async function syncRuiCalendarFromChouseisan(
       continue;
     }
 
-    const timing = parseChoiceDateTime(day.choiceText, year);
+    const timing = parseChoiceDateTime(day.choiceText, year, snapshot.event.detail);
     if (!timing) {
       skipped += 1;
       console.log({
@@ -2965,7 +3074,10 @@ async function syncRuiCalendarFromChouseisan(
       action: actionIntent,
       skip_reason: null,
       existing_event_id_present: existingEventIdPresent,
-      delete_if_exists: false
+      delete_if_exists: false,
+      time_source: timing.timeSource,
+      start: timing.start,
+      end: timing.end
     });
 
     const practiceType = kind === "regular" ? "通常練習" : "個人練習";
@@ -11320,6 +11432,8 @@ export const TEST_HOOKS = {
   extractChouseisanSnapshotFromAssignmentText,
   extractChouseisanEventObject,
   snapshotFromChouseisanEventObject,
+  parseChoiceDateTime,
+  inferTimeRangeFromChouseisanDetail,
   isRuiParticipantName,
   replyWithPushFallback,
   replyMessages,
