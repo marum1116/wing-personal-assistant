@@ -853,12 +853,19 @@ function inferYearFromChouseisan(snapshot: ChouseisanSnapshot, nowMs: number): n
 }
 
 function parseChoiceDateToYmd(choiceText: string, year: number): string | null {
-  const matched = /(\d{1,2})\/(\d{1,2})/.exec(choiceText);
-  if (!matched) {
+  const slashMatched = /(\d{1,2})\/(\d{1,2})/.exec(choiceText);
+  if (slashMatched) {
+    const month = Number(slashMatched[1]);
+    const day = Number(slashMatched[2]);
+    const ymd = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    return parseYmdAsUtcDate(ymd) ? ymd : null;
+  }
+  const jpMatched = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/.exec(choiceText);
+  if (!jpMatched) {
     return null;
   }
-  const month = Number(matched[1]);
-  const day = Number(matched[2]);
+  const month = Number(jpMatched[1]);
+  const day = Number(jpMatched[2]);
   const ymd = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
   return parseYmdAsUtcDate(ymd) ? ymd : null;
 }
@@ -866,6 +873,7 @@ function parseChoiceDateToYmd(choiceText: string, year: number): string | null {
 async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot> {
   let parsed: unknown | null = null;
   let fallbackSnapshot: ChouseisanSnapshot | null = null;
+  let parserMode: "primary_event" | "assignment_fallback" | "html_fallback" | null = null;
   let statusCode = 0;
   let lastDiag:
     | {
@@ -917,16 +925,19 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
     const parsedRoot = extractChouseisanRootObject(html);
     if (parsedRoot) {
       parsed = parsedRoot;
+      parserMode = "primary_event";
       break;
     }
     const assignmentFallback = extractChouseisanSnapshotFromAssignmentText(html, url);
     if (assignmentFallback) {
       fallbackSnapshot = assignmentFallback;
+      parserMode = "assignment_fallback";
       break;
     }
     const htmlFallback = extractChouseisanSnapshotFallback(html, url);
     if (htmlFallback) {
       fallbackSnapshot = htmlFallback;
+      parserMode = "html_fallback";
       break;
     }
     console.log({
@@ -953,32 +964,45 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
     throw new Error(`調整さんページに埋め込みデータが見つかりませんでした。(status=${statusCode}${diag})`);
   }
   if (!parsed && fallbackSnapshot) {
-    console.log({ stage: "chouseisan_fallback_used", url, choices: fallbackSnapshot.choices.length });
+    console.log({
+      stage: "chouseisan_fallback_used",
+      url,
+      parser_mode: parserMode,
+      choices: fallbackSnapshot.choices.length,
+      members: fallbackSnapshot.members.length
+    });
     return fallbackSnapshot;
   }
   if (
     typeof parsed !== "object" ||
     parsed === null ||
     typeof (parsed as Record<string, unknown>).event !== "object" ||
-    (parsed as Record<string, unknown>).event === null ||
-    !Array.isArray((parsed as Record<string, unknown>).choices)
+    (parsed as Record<string, unknown>).event === null
   ) {
     throw new Error("調整さんデータ形式が想定外です。");
   }
   const event = (parsed as Record<string, unknown>).event as Record<string, unknown>;
-  const choices = (parsed as Record<string, unknown>).choices as Array<Record<string, unknown>>;
+  const topLevelChoices = Array.isArray((parsed as Record<string, unknown>).choices)
+    ? ((parsed as Record<string, unknown>).choices as Array<Record<string, unknown>>)
+    : null;
+  const eventChoices = Array.isArray(event.choices) ? (event.choices as Array<Record<string, unknown>>) : null;
+  // event.choices を正本にする（top-level choices との二重取り込みを防ぐ）
+  const choicesRaw = eventChoices && eventChoices.length > 0 ? eventChoices : topLevelChoices;
+  if (!choicesRaw) {
+    throw new Error("調整さんデータ形式が想定外です。");
+  }
   if (typeof event.id !== "string" || typeof event.name !== "string") {
     throw new Error("調整さんイベント情報が不足しています。");
   }
   const membersRaw = Array.isArray(event.members) ? (event.members as Array<Record<string, unknown>>) : [];
-  return {
+  const snapshot: ChouseisanSnapshot = {
     event: {
       id: event.id,
       name: event.name,
       detail: typeof event.detail === "string" ? event.detail : null,
       upd_datetime: typeof event.upd_datetime === "string" ? event.upd_datetime : null
     },
-    choices: choices
+    choices: choicesRaw
       .filter((item) => typeof item.choice === "string")
       .map((item) => ({ choice: String(item.choice) })),
     members: membersRaw
@@ -989,6 +1013,16 @@ async function fetchChouseisanSnapshot(url: string): Promise<ChouseisanSnapshot>
         kouho: Array.isArray(item.kouho) ? normalizeKouhoValues(item.kouho) : null
       }))
   };
+  console.log({
+    stage: "chouseisan_parse_ok",
+    url,
+    parser_mode: parserMode ?? "primary_event",
+    choices: snapshot.choices.length,
+    members: snapshot.members.length,
+    used_event_choices: Boolean(eventChoices && eventChoices.length > 0),
+    top_level_choices: topLevelChoices?.length ?? 0
+  });
+  return snapshot;
 }
 
 function extractChouseisanSnapshotFallback(html: string, url: string): ChouseisanSnapshot | null {
@@ -997,10 +1031,11 @@ function extractChouseisanSnapshotFallback(html: string, url: string): Chouseisa
   const eventName = rawTitle.replace(/\s*\|\s*Chouseisan\s*$/i, "").trim();
   const detailMatch = html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([\s\S]*?)["'][^>]*>/i);
   const detail = detailMatch ? decodeHtmlBasicEntities(detailMatch[1] ?? "").trim() : null;
-  const dateRegex = /(^|[^\d])(\d{1,2})\/(\d{1,2})(?!\d)/g;
-  const choiceSet = new Set<string>();
+  // 表記揺れ（10/11 と 10月11日）を同一視するため、月日キーへ正規化して一意化する
+  const choiceByMonthDay = new Map<string, string>();
+  const slashRegex = /(^|[^\d])(\d{1,2})\/(\d{1,2})(?!\d)/g;
   let matched: RegExpExecArray | null = null;
-  while ((matched = dateRegex.exec(html)) !== null) {
+  while ((matched = slashRegex.exec(html)) !== null) {
     const month = Number(matched[2]);
     const day = Number(matched[3]);
     if (!Number.isFinite(month) || !Number.isFinite(day)) {
@@ -1009,9 +1044,27 @@ function extractChouseisanSnapshotFallback(html: string, url: string): Chouseisa
     if (month < 1 || month > 12 || day < 1 || day > 31) {
       continue;
     }
-    choiceSet.add(`${month}/${day}`);
+    const key = `${month}-${day}`;
+    if (!choiceByMonthDay.has(key)) {
+      choiceByMonthDay.set(key, `${month}/${day}`);
+    }
   }
-  if (choiceSet.size === 0) {
+  const jpRegex = /(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
+  while ((matched = jpRegex.exec(html)) !== null) {
+    const month = Number(matched[1]);
+    const day = Number(matched[2]);
+    if (!Number.isFinite(month) || !Number.isFinite(day)) {
+      continue;
+    }
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+      continue;
+    }
+    const key = `${month}-${day}`;
+    if (!choiceByMonthDay.has(key)) {
+      choiceByMonthDay.set(key, `${month}/${day}`);
+    }
+  }
+  if (choiceByMonthDay.size === 0) {
     return null;
   }
   const hashMatched = url.match(/[?&]h=([a-z0-9]+)/i);
@@ -1023,7 +1076,7 @@ function extractChouseisanSnapshotFallback(html: string, url: string): Chouseisa
       detail: detail || null,
       upd_datetime: null
     },
-    choices: [...choiceSet].map((choice) => ({ choice })),
+    choices: [...choiceByMonthDay.values()].map((choice) => ({ choice })),
     members: []
   };
 }
@@ -1052,7 +1105,140 @@ function decodeHtmlBasicEntities(value: string): string {
     });
 }
 
+function extractJsonObjectByBraceMatch(source: string, startBrace: number): string | null {
+  if (startBrace < 0 || startBrace >= source.length || source[startBrace] !== "{") {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  for (let i = startBrace; i < source.length; i += 1) {
+    const ch = source[i] ?? "";
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(startBrace, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 現行の調整さんHTMLでは window.Chouseisan 全体は UI 用フィールドを含み JSON.parse に失敗しうる。
+ * 出欠の正本は event オブジェクト側にあるため、event を brace-match して取得する。
+ */
+function extractChouseisanEventObject(html: string): Record<string, unknown> | null {
+  const assignMatched = /window\.Chouseisan\s*=\s*/i.exec(html);
+  const searchFrom =
+    assignMatched && typeof assignMatched.index === "number"
+      ? assignMatched.index + assignMatched[0].length
+      : 0;
+  const eventKeyMatched = /"event"\s*:\s*\{/.exec(html.slice(searchFrom));
+  if (!eventKeyMatched || typeof eventKeyMatched.index !== "number") {
+    return null;
+  }
+  const absoluteEventBrace =
+    searchFrom + eventKeyMatched.index + eventKeyMatched[0].lastIndexOf("{");
+  const eventText = extractJsonObjectByBraceMatch(html, absoluteEventBrace);
+  if (!eventText) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(eventText) as unknown;
+    if (typeof parsed !== "object" || parsed === null) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function choicesFromChouseisanEvent(event: Record<string, unknown>): Array<{ choice: string }> {
+  if (!Array.isArray(event.choices)) {
+    return [];
+  }
+  return event.choices
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    .filter((item) => typeof item.choice === "string")
+    .map((item) => ({ choice: String(item.choice) }));
+}
+
+function membersFromChouseisanEvent(
+  event: Record<string, unknown>
+): Array<{ name: string; attend: string | null; kouho: number[] | null }> {
+  const membersRaw = Array.isArray(event.members) ? (event.members as Array<Record<string, unknown>>) : [];
+  return membersRaw
+    .filter((item) => typeof item.name === "string")
+    .map((item) => ({
+      name: String(item.name),
+      attend: typeof item.attend === "string" ? item.attend : null,
+      kouho: Array.isArray(item.kouho) ? normalizeKouhoValues(item.kouho) : null
+    }));
+}
+
+function snapshotFromChouseisanEventObject(
+  event: Record<string, unknown>,
+  url: string
+): ChouseisanSnapshot | null {
+  if (typeof event.id !== "string" || typeof event.name !== "string") {
+    return null;
+  }
+  const choices = choicesFromChouseisanEvent(event);
+  if (choices.length === 0) {
+    return null;
+  }
+  const hashMatched = url.match(/[?&]h=([a-z0-9]+)/i);
+  return {
+    event: {
+      id: event.id || (hashMatched?.[1] ?? `fallback-${Date.now()}`),
+      name: event.name,
+      detail: typeof event.detail === "string" ? event.detail : null,
+      upd_datetime: typeof event.upd_datetime === "string" ? event.upd_datetime : null
+    },
+    choices,
+    members: membersFromChouseisanEvent(event)
+  };
+}
+
 function extractChouseisanRootObject(html: string): unknown | null {
+  // 1) event オブジェクト優先（現行HTMLで安定）
+  const eventObject = extractChouseisanEventObject(html);
+  if (eventObject) {
+    const choices = choicesFromChouseisanEvent(eventObject);
+    if (choices.length > 0) {
+      return {
+        event: eventObject,
+        choices
+      };
+    }
+  }
+
   const assignMatched = /window\.Chouseisan\s*=\s*/i.exec(html);
   if (!assignMatched || typeof assignMatched.index !== "number") {
     return extractJsonObjectByToken(html, "\"event\"") ?? extractJsonObjectByToken(html, "\"choices\"");
@@ -1077,15 +1263,55 @@ function extractChouseisanRootObject(html: string): unknown | null {
     }
   }
   const startBrace = html.indexOf("{", valueStart);
-  if (startBrace < 0) {
+  const objectText = extractJsonObjectByBraceMatch(html, startBrace);
+  if (!objectText) {
     return null;
   }
+  try {
+    return JSON.parse(objectText);
+  } catch {
+    return null;
+  }
+}
+
+function extractChouseisanSnapshotFromAssignmentText(html: string, url: string): ChouseisanSnapshot | null {
+  // event オブジェクトを直接使えば choices 二重抽出を避けられる
+  const eventObject = extractChouseisanEventObject(html);
+  if (eventObject) {
+    const fromEvent = snapshotFromChouseisanEventObject(eventObject, url);
+    if (fromEvent) {
+      return fromEvent;
+    }
+  }
+
+  // event JSON が壊れている場合のみ、event ブロック内テキストから choices/members を取り出す
+  const objectText = extractChouseisanAssignmentObjectText(html);
+  if (!objectText) {
+    return null;
+  }
+  const eventKey = /"event"\s*:\s*\{/.exec(objectText);
+  if (!eventKey || typeof eventKey.index !== "number") {
+    return null;
+  }
+  const eventBrace = eventKey.index + eventKey[0].lastIndexOf("{");
+  const eventText = extractJsonObjectByBraceMatch(objectText, eventBrace);
+  if (!eventText) {
+    return null;
+  }
+  // 全体への "choice" 正規表現は top-level choices と event.choices の二重カウントになるため使わない。
+  // event 内の choices 配列だけを JSON として取り出す。
+  const choicesKey = /"choices"\s*:\s*\[/.exec(eventText);
+  if (!choicesKey || typeof choicesKey.index !== "number") {
+    return null;
+  }
+  const arrayStart = choicesKey.index + choicesKey[0].lastIndexOf("[");
   let depth = 0;
   let inString = false;
   let stringQuote = "";
   let escaped = false;
-  for (let i = startBrace; i < html.length; i += 1) {
-    const ch = html[i] ?? "";
+  let arrayEnd = -1;
+  for (let i = arrayStart; i < eventText.length; i += 1) {
+    const ch = eventText[i] ?? "";
     if (inString) {
       if (escaped) {
         escaped = false;
@@ -1100,54 +1326,48 @@ function extractChouseisanRootObject(html: string): unknown | null {
       }
       continue;
     }
-    if (ch === '"' || ch === "'") {
+    if (ch === "\"" || ch === "'") {
       inString = true;
       stringQuote = ch;
       continue;
     }
-    if (ch === "{") {
+    if (ch === "[") {
       depth += 1;
       continue;
     }
-    if (ch === "}") {
+    if (ch === "]") {
       depth -= 1;
       if (depth === 0) {
-        const objectText = html.slice(startBrace, i + 1);
-        try {
-          return JSON.parse(objectText);
-        } catch {
-          return null;
-        }
+        arrayEnd = i;
+        break;
       }
     }
   }
-  return null;
-}
-
-function extractChouseisanSnapshotFromAssignmentText(html: string, url: string): ChouseisanSnapshot | null {
-  const objectText = extractChouseisanAssignmentObjectText(html);
-  if (!objectText) {
+  if (arrayEnd < 0) {
     return null;
   }
-  const eventName = extractJsonStringField(objectText, "name");
-  const eventDetail = extractJsonStringField(objectText, "detail");
-  const eventIdFromBody = extractJsonStringField(objectText, "id");
-  const eventIdFromUrl = (url.match(/[?&]h=([a-z0-9]+)/i) ?? [])[1] ?? null;
-  const eventId = eventIdFromBody ?? eventIdFromUrl ?? `fallback-${Date.now()}`;
-  const updDatetime = extractJsonStringField(objectText, "upd_datetime");
-  const choices: Array<{ choice: string }> = [];
-  const choiceRegex = /"choice"\s*:\s*"((?:\\.|[^"\\])*)"/g;
-  let matched: RegExpExecArray | null = null;
-  while ((matched = choiceRegex.exec(objectText)) !== null) {
-    const decoded = decodeEscapedJsonString(matched[1] ?? "");
-    if (decoded) {
-      choices.push({ choice: decoded });
+  let choices: Array<{ choice: string }> = [];
+  try {
+    const parsedChoices = JSON.parse(eventText.slice(arrayStart, arrayEnd + 1)) as unknown;
+    if (Array.isArray(parsedChoices)) {
+      choices = parsedChoices
+        .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+        .filter((item) => typeof item.choice === "string")
+        .map((item) => ({ choice: String(item.choice) }));
     }
+  } catch {
+    return null;
   }
   if (choices.length === 0) {
     return null;
   }
-  const members = extractChouseisanMembersFromAssignmentObjectText(objectText);
+  const eventName = extractJsonStringField(eventText, "name");
+  const eventDetail = extractJsonStringField(eventText, "detail");
+  const eventIdFromBody = extractJsonStringField(eventText, "id");
+  const eventIdFromUrl = (url.match(/[?&]h=([a-z0-9]+)/i) ?? [])[1] ?? null;
+  const eventId = eventIdFromBody ?? eventIdFromUrl ?? `fallback-${Date.now()}`;
+  const updDatetime = extractJsonStringField(eventText, "upd_datetime");
+  const members = extractChouseisanMembersFromAssignmentObjectText(eventText);
   return {
     event: {
       id: eventId,
@@ -1163,12 +1383,54 @@ function extractChouseisanSnapshotFromAssignmentText(html: string, url: string):
 function extractChouseisanMembersFromAssignmentObjectText(
   objectText: string
 ): Array<{ name: string; attend: string | null; kouho: number[] | null }> {
-  const membersMatch = objectText.match(/"members"\s*:\s*(\[[\s\S]*?\])\s*,\s*"choices"/);
-  if (!membersMatch || !membersMatch[1]) {
+  const membersKey = /"members"\s*:\s*\[/.exec(objectText);
+  if (!membersKey || typeof membersKey.index !== "number") {
+    return [];
+  }
+  const arrayStart = membersKey.index + membersKey[0].lastIndexOf("[");
+  let depth = 0;
+  let inString = false;
+  let stringQuote = "";
+  let escaped = false;
+  let arrayEnd = -1;
+  for (let i = arrayStart; i < objectText.length; i += 1) {
+    const ch = objectText[i] ?? "";
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === stringQuote) {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      inString = true;
+      stringQuote = ch;
+      continue;
+    }
+    if (ch === "[") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        arrayEnd = i;
+        break;
+      }
+    }
+  }
+  if (arrayEnd < 0) {
     return [];
   }
   try {
-    const parsed = JSON.parse(membersMatch[1]) as unknown;
+    const parsed = JSON.parse(objectText.slice(arrayStart, arrayEnd + 1)) as unknown;
     if (!Array.isArray(parsed)) {
       return [];
     }
@@ -1398,7 +1660,33 @@ function normalizeKouhoValues(values: unknown[]): number[] {
     .filter((value) => Number.isFinite(value));
 }
 
-function ruiStatusFromAttendMark(mark: number): "circle" | "triangle" | "cross" | "unknown" {
+type RuiAttendStatus = "circle" | "triangle" | "cross" | "unknown";
+
+type NormalizedRuiCalendarDay = {
+  practiceDate: string;
+  choiceText: string;
+  attendance: RuiAttendStatus;
+  conflict: boolean;
+  seenStatuses: RuiAttendStatus[];
+};
+
+type NormalizeRuiCalendarDaysResult = {
+  matched: boolean;
+  matchedName: string | null;
+  memberCount: number;
+  days: NormalizedRuiCalendarDay[];
+  invariants: {
+    rawChoiceCount: number;
+    attendanceMarkCount: number;
+    normalizedDateCount: number;
+    duplicateDateCount: number;
+    invalidDateCount: number;
+    conflictDateCount: number;
+    ruiMemberMatched: boolean;
+  };
+};
+
+function ruiStatusFromAttendMark(mark: number): RuiAttendStatus {
   if (mark === 1) {
     return "circle";
   }
@@ -1409,6 +1697,129 @@ function ruiStatusFromAttendMark(mark: number): "circle" | "triangle" | "cross" 
     return "cross";
   }
   return "unknown";
+}
+
+function isExplicitRuiAttendStatus(status: RuiAttendStatus): status is "circle" | "triangle" | "cross" {
+  return status === "circle" || status === "triangle" || status === "cross";
+}
+
+function mergeRuiAttendanceStatus(
+  current: RuiAttendStatus,
+  incoming: RuiAttendStatus
+): { attendance: RuiAttendStatus; conflict: boolean } {
+  if (current === "unknown") {
+    return { attendance: incoming, conflict: false };
+  }
+  if (incoming === "unknown") {
+    return { attendance: current, conflict: false };
+  }
+  if (current === incoming) {
+    return { attendance: current, conflict: false };
+  }
+  // 明示状態同士の矛盾は後勝ちしない
+  return { attendance: current, conflict: true };
+}
+
+/**
+ * Calendar副作用の直前に、1日付=1attendanceへ正規化する。
+ * - unknown は明示 ○/△/× を上書きしない
+ * - 明示同士の矛盾は conflict として破壊的処理を避ける
+ */
+function normalizeRuiCalendarDays(
+  snapshot: ChouseisanSnapshot,
+  year: number
+): NormalizeRuiCalendarDaysResult {
+  const memberCount = snapshot.members.length;
+  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name));
+  const rawChoiceCount = snapshot.choices.length;
+  if (!ruiMember) {
+    return {
+      matched: false,
+      matchedName: null,
+      memberCount,
+      days: [],
+      invariants: {
+        rawChoiceCount,
+        attendanceMarkCount: 0,
+        normalizedDateCount: 0,
+        duplicateDateCount: 0,
+        invalidDateCount: 0,
+        conflictDateCount: 0,
+        ruiMemberMatched: false
+      }
+    };
+  }
+  const marks = parseAttendMarks(ruiMember, rawChoiceCount);
+  const byDate = new Map<string, NormalizedRuiCalendarDay>();
+  let invalidDateCount = 0;
+  let duplicateDateCount = 0;
+  for (let i = 0; i < snapshot.choices.length; i += 1) {
+    const choice = snapshot.choices[i];
+    if (!choice) {
+      continue;
+    }
+    const practiceDate = parseChoiceDateToYmd(choice.choice, year);
+    if (!practiceDate) {
+      invalidDateCount += 1;
+      continue;
+    }
+    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
+    const existing = byDate.get(practiceDate);
+    if (!existing) {
+      byDate.set(practiceDate, {
+        practiceDate,
+        choiceText: choice.choice,
+        attendance: status,
+        conflict: false,
+        seenStatuses: [status]
+      });
+      continue;
+    }
+    duplicateDateCount += 1;
+    existing.seenStatuses.push(status);
+    const merged = mergeRuiAttendanceStatus(existing.attendance, status);
+    if (existing.attendance === "unknown" && isExplicitRuiAttendStatus(status)) {
+      existing.choiceText = choice.choice;
+    }
+    existing.attendance = merged.attendance;
+    existing.conflict = existing.conflict || merged.conflict;
+  }
+  const days = [...byDate.values()].sort((a, b) => a.practiceDate.localeCompare(b.practiceDate));
+  const conflictDateCount = days.filter((day) => day.conflict).length;
+  const invariants = {
+    rawChoiceCount,
+    attendanceMarkCount: marks.length,
+    normalizedDateCount: days.length,
+    duplicateDateCount,
+    invalidDateCount,
+    conflictDateCount,
+    ruiMemberMatched: true
+  };
+  console.log({
+    stage: "chouseisan_normalize_days",
+    event_name: snapshot.event.name,
+    ...invariants,
+    conflict_dates: days.filter((day) => day.conflict).map((day) => day.practiceDate)
+  });
+  if (
+    duplicateDateCount > 0 ||
+    invalidDateCount > 0 ||
+    conflictDateCount > 0 ||
+    (marks.length > 0 && marks.length !== rawChoiceCount && rawChoiceCount !== days.length)
+  ) {
+    console.log({
+      stage: "chouseisan_normalize_invariant_warning",
+      event_name: snapshot.event.name,
+      ...invariants
+    });
+  }
+  return {
+    matched: true,
+    matchedName: ruiMember.name,
+    memberCount,
+    days,
+    invariants
+  };
 }
 
 function parseChoiceDateTime(choiceText: string, year: number): { start: string; end: string } | null {
@@ -1985,6 +2396,68 @@ function categorizeCalendarHttpFailure(httpStatus: number | null, bodySummary: s
   return `calendar_http_${httpStatus}`;
 }
 
+function buildRuiAttendanceSummaryFromNormalized(
+  normalized: NormalizeRuiCalendarDaysResult
+): {
+  matched: boolean;
+  matchedName: string | null;
+  memberCount: number;
+  circleDates: string[];
+  triangleDates: string[];
+  crossDates: string[];
+  unknownDates: string[];
+  conflictDates: string[];
+  normalizedDateCount: number;
+  duplicateDateCount: number;
+} {
+  if (!normalized.matched) {
+    return {
+      matched: false,
+      matchedName: null,
+      memberCount: normalized.memberCount,
+      circleDates: [],
+      triangleDates: [],
+      crossDates: [],
+      unknownDates: [],
+      conflictDates: [],
+      normalizedDateCount: 0,
+      duplicateDateCount: normalized.invariants.duplicateDateCount
+    };
+  }
+  const circleDates: string[] = [];
+  const triangleDates: string[] = [];
+  const crossDates: string[] = [];
+  const unknownDates: string[] = [];
+  const conflictDates: string[] = [];
+  for (const day of normalized.days) {
+    if (day.conflict) {
+      conflictDates.push(day.practiceDate);
+      continue;
+    }
+    if (day.attendance === "circle") {
+      circleDates.push(day.practiceDate);
+    } else if (day.attendance === "triangle") {
+      triangleDates.push(day.practiceDate);
+    } else if (day.attendance === "cross") {
+      crossDates.push(day.practiceDate);
+    } else {
+      unknownDates.push(day.practiceDate);
+    }
+  }
+  return {
+    matched: true,
+    matchedName: normalized.matchedName,
+    memberCount: normalized.memberCount,
+    circleDates,
+    triangleDates,
+    crossDates,
+    unknownDates,
+    conflictDates,
+    normalizedDateCount: normalized.invariants.normalizedDateCount,
+    duplicateDateCount: normalized.invariants.duplicateDateCount
+  };
+}
+
 function buildRuiAttendanceSummary(
   snapshot: ChouseisanSnapshot,
   year: number
@@ -1996,54 +2469,11 @@ function buildRuiAttendanceSummary(
   triangleDates: string[];
   crossDates: string[];
   unknownDates: string[];
+  conflictDates: string[];
+  normalizedDateCount: number;
+  duplicateDateCount: number;
 } {
-  const memberCount = snapshot.members.length;
-  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name));
-  if (!ruiMember) {
-    return {
-      matched: false,
-      matchedName: null,
-      memberCount,
-      circleDates: [],
-      triangleDates: [],
-      crossDates: [],
-      unknownDates: []
-    };
-  }
-  const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
-  const circleDates: string[] = [];
-  const triangleDates: string[] = [];
-  const crossDates: string[] = [];
-  const unknownDates: string[] = [];
-  for (let i = 0; i < snapshot.choices.length; i += 1) {
-    const choice = snapshot.choices[i];
-    if (!choice) {
-      continue;
-    }
-    const practiceDate = parseChoiceDateToYmd(choice.choice, year);
-    if (!practiceDate) {
-      continue;
-    }
-    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
-    if (status === "circle") {
-      circleDates.push(practiceDate);
-    } else if (status === "triangle") {
-      triangleDates.push(practiceDate);
-    } else if (status === "cross") {
-      crossDates.push(practiceDate);
-    } else {
-      unknownDates.push(practiceDate);
-    }
-  }
-  return {
-    matched: true,
-    matchedName: ruiMember.name,
-    memberCount,
-    circleDates,
-    triangleDates,
-    crossDates,
-    unknownDates
-  };
+  return buildRuiAttendanceSummaryFromNormalized(normalizeRuiCalendarDays(snapshot, year));
 }
 
 async function upsertGoogleCalendarEvent(
@@ -2384,19 +2814,26 @@ async function syncRuiCalendarFromChouseisan(
   snapshot: ChouseisanSnapshot,
   year: number
 ): Promise<ChouseisanCalendarSyncResult> {
-  const attendance = buildRuiAttendanceSummary(snapshot, year);
+  const normalized = normalizeRuiCalendarDays(snapshot, year);
+  const attendance = buildRuiAttendanceSummaryFromNormalized(normalized);
   console.log({
     stage: "chouseisan_calendar_sync_start",
     kind,
     event_name: snapshot.event.name,
     parsed_date_count: snapshot.choices.length,
+    normalized_date_count: normalized.invariants.normalizedDateCount,
+    duplicate_date_count: normalized.invariants.duplicateDateCount,
+    invalid_date_count: normalized.invariants.invalidDateCount,
+    conflict_date_count: normalized.invariants.conflictDateCount,
+    attendance_mark_count: normalized.invariants.attendanceMarkCount,
     rui_participant_found: attendance.matched,
     rui_participant_name: attendance.matchedName,
     rui_attendance_summary: {
       circle: attendance.circleDates.length,
       triangle: attendance.triangleDates.length,
       cross: attendance.crossDates.length,
-      unknown: attendance.unknownDates.length
+      unknown: attendance.unknownDates.length,
+      conflict: attendance.conflictDates.length
     },
     calendar_target: resolveGoogleCalendarId(env)
   });
@@ -2406,12 +2843,14 @@ async function syncRuiCalendarFromChouseisan(
     matched_name: attendance.matchedName,
     member_count: attendance.memberCount,
     attendance_entries: snapshot.choices.length,
+    normalized_date_count: normalized.invariants.normalizedDateCount,
     circle_dates: attendance.circleDates,
     triangle_dates: attendance.triangleDates,
-    cross_dates: attendance.crossDates
+    cross_dates: attendance.crossDates,
+    conflict_dates: attendance.conflictDates
   });
 
-  if (!attendance.matched) {
+  if (!normalized.matched) {
     console.log({
       stage: "chouseisan_calendar_sync_complete",
       kind,
@@ -2433,8 +2872,6 @@ async function syncRuiCalendarFromChouseisan(
     };
   }
 
-  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name))!;
-  const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
   let created = 0;
   let updated = 0;
   let deleted = 0;
@@ -2442,44 +2879,57 @@ async function syncRuiCalendarFromChouseisan(
   let failed = 0;
   const failedDates: string[] = [];
 
-  for (let i = 0; i < snapshot.choices.length; i += 1) {
-    const choice = snapshot.choices[i];
-    if (!choice) {
-      continue;
-    }
-    const practiceDate = parseChoiceDateToYmd(choice.choice, year);
-    if (!practiceDate) {
+  for (const day of normalized.days) {
+    const mappingRaw = await env.STATE.get(ruiCalendarEventKey(kind, day.practiceDate));
+    const existingEventIdPresent = Boolean(mappingRaw && mappingRaw.includes("eventId"));
+
+    if (day.conflict) {
       skipped += 1;
       console.log({
         stage: "calendar_sync_decision",
-        date: null,
-        choice: choice.choice,
+        date: day.practiceDate,
+        kind,
+        attendance: "conflict",
+        seen_statuses: day.seenStatuses,
+        should_sync: false,
+        action: "skip",
+        skip_reason: "attendance_conflict",
+        existing_event_id_present: existingEventIdPresent,
+        delete_if_exists: false,
+        needs_review: true
+      });
+      continue;
+    }
+
+    if (day.attendance === "unknown") {
+      skipped += 1;
+      console.log({
+        stage: "calendar_sync_decision",
+        date: day.practiceDate,
         kind,
         attendance: "unknown",
         should_sync: false,
         action: "skip",
-        skip_reason: "unparsable_date",
-        existing_event_id_present: false
+        skip_reason: "attendance_unknown",
+        existing_event_id_present: existingEventIdPresent,
+        delete_if_exists: false
       });
       continue;
     }
-    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
-    const mappingRaw = await env.STATE.get(ruiCalendarEventKey(kind, practiceDate));
-    const existingEventIdPresent = Boolean(mappingRaw && mappingRaw.includes("eventId"));
 
-    if (status === "cross" || status === "unknown") {
+    if (day.attendance === "cross") {
       console.log({
         stage: "calendar_sync_decision",
-        date: practiceDate,
+        date: day.practiceDate,
         kind,
-        attendance: status === "cross" ? "cross" : "unknown",
+        attendance: "cross",
         should_sync: false,
         action: "skip",
-        skip_reason: status === "cross" ? "attendance_cross" : "attendance_unknown",
+        skip_reason: "attendance_cross",
         existing_event_id_present: existingEventIdPresent,
         delete_if_exists: true
       });
-      const deletedResult = await deleteGoogleCalendarEventIfExists(env, kind, practiceDate);
+      const deletedResult = await deleteGoogleCalendarEventIfExists(env, kind, day.practiceDate);
       if (deletedResult === "deleted") {
         deleted += 1;
       } else {
@@ -2488,18 +2938,19 @@ async function syncRuiCalendarFromChouseisan(
       continue;
     }
 
-    const timing = parseChoiceDateTime(choice.choice, year);
+    const timing = parseChoiceDateTime(day.choiceText, year);
     if (!timing) {
       skipped += 1;
       console.log({
         stage: "calendar_sync_decision",
-        date: practiceDate,
+        date: day.practiceDate,
         kind,
-        attendance: status === "circle" ? "circle" : "triangle",
+        attendance: day.attendance === "circle" ? "circle" : "triangle",
         should_sync: true,
         action: "skip",
         skip_reason: "timing_parse_failed",
-        existing_event_id_present: existingEventIdPresent
+        existing_event_id_present: existingEventIdPresent,
+        delete_if_exists: false
       });
       continue;
     }
@@ -2507,33 +2958,34 @@ async function syncRuiCalendarFromChouseisan(
     const actionIntent = existingEventIdPresent ? "patch" : "create";
     console.log({
       stage: "calendar_sync_decision",
-      date: practiceDate,
+      date: day.practiceDate,
       kind,
-      attendance: status === "circle" ? "circle" : "triangle",
+      attendance: day.attendance === "circle" ? "circle" : "triangle",
       should_sync: true,
       action: actionIntent,
       skip_reason: null,
-      existing_event_id_present: existingEventIdPresent
+      existing_event_id_present: existingEventIdPresent,
+      delete_if_exists: false
     });
 
     const practiceType = kind === "regular" ? "通常練習" : "個人練習";
     const location =
-      inferLocationFromChouseisanDetail(snapshot.event.detail, practiceDate) ??
-      defaultPracticeLocation(practiceDate, practiceType) ??
+      inferLocationFromChouseisanDetail(snapshot.event.detail, day.practiceDate) ??
+      defaultPracticeLocation(day.practiceDate, practiceType) ??
       null;
-    const title = status === "circle" ? WING_EVENT_TITLE : WING_EVENT_TENTATIVE_TITLE;
+    const title = day.attendance === "circle" ? WING_EVENT_TITLE : WING_EVENT_TENTATIVE_TITLE;
     const syncOutcome = await upsertGoogleCalendarEvent(
       env,
       kind,
-      practiceDate,
+      day.practiceDate,
       {
         summary: title,
-        description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${status === "circle" ? "○" : "△"}）`,
+        description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${day.attendance === "circle" ? "○" : "△"}）`,
         location,
         start: timing.start,
         end: timing.end
       },
-      { preserveCircleMarker: kind === "regular" && status === "circle" }
+      { preserveCircleMarker: kind === "regular" && day.attendance === "circle" }
     );
     if (syncOutcome.status === "created") {
       created += 1;
@@ -2541,7 +2993,7 @@ async function syncRuiCalendarFromChouseisan(
       updated += 1;
     } else if (syncOutcome.status === "failed") {
       failed += 1;
-      failedDates.push(practiceDate);
+      failedDates.push(day.practiceDate);
     } else {
       skipped += 1;
     }
@@ -10863,6 +11315,11 @@ export const TEST_HOOKS = {
   calculateMonthlyFeeFromRegularSnapshot,
   syncRuiCalendarFromChouseisan,
   buildRuiAttendanceSummary,
+  normalizeRuiCalendarDays,
+  extractChouseisanRootObject,
+  extractChouseisanSnapshotFromAssignmentText,
+  extractChouseisanEventObject,
+  snapshotFromChouseisanEventObject,
   isRuiParticipantName,
   replyWithPushFallback,
   replyMessages,

@@ -1098,6 +1098,386 @@ async function main() {
   assert.equal(replyCalls, 1);
   assert.equal(pushCalls, 0);
 
+  // --- Chouseisan parser / normalize / Calendar safety ---
+  const personalChoices17 = [
+    { choice: "10/2(金) 18-21" },
+    { choice: "10/3(土) 9-12" },
+    { choice: "10/4(日) " },
+    { choice: "10/7(水) 18-21" },
+    { choice: "10/9(金) 18-21" },
+    { choice: "10/10(土) 9-12" },
+    { choice: "10/11(日) 11-13" },
+    { choice: "10/12(月) " },
+    { choice: "10/14(水) 18-21" },
+    { choice: "10/16(金) 18-21" },
+    { choice: "10/21(水) 18-21" },
+    { choice: "10/23(金) 18-21" },
+    { choice: "10/24(土) " },
+    { choice: "10/25(日) 9-12" },
+    { choice: "10/28(水) 18-21" },
+    { choice: "10/30(金) 18-21" },
+    { choice: "10/31(土) 9-12①面" }
+  ];
+  const ruiKouho17 = [3, 3, 3, 3, 3, 3, 1, 3, 3, 1, 3, 3, 3, 3, 3, 3, 3];
+  const duplicateHtml = `<!DOCTYPE html><html><body><script>
+window.Chouseisan = {
+  "event": {"id":"e5a30ed670784e27b894e56b999fc5a5","name":"10月個別練習　日程調整","detail":null,"upd_datetime":"2026-09-15T22:41:12.000000Z","members":[{"name":"1年渡辺塁","attend":"3,3,3,3,3,3,1,3,3,1,3,3,3,3,3,3,3","kouho":[3,3,3,3,3,3,1,3,3,1,3,3,3,3,3,3,3]}],"choices":${JSON.stringify(personalChoices17)}},
+  "choices":${JSON.stringify(personalChoices17)},
+  "ui": {"label":"x",},
+};
+</script></body></html>`;
+  const rootFromDuplicate = hooks.extractChouseisanRootObject(duplicateHtml) as any;
+  assert.ok(rootFromDuplicate);
+  assert.equal(rootFromDuplicate.choices.length, 17);
+  assert.equal(rootFromDuplicate.event.choices.length, 17);
+  const assignmentFromDuplicate = hooks.extractChouseisanSnapshotFromAssignmentText(
+    duplicateHtml,
+    "https://chouseisan.com/s?h=e5a30ed670784e27b894e56b999fc5a5"
+  );
+  assert.ok(assignmentFromDuplicate);
+  assert.equal(assignmentFromDuplicate!.choices.length, 17);
+  assert.equal(assignmentFromDuplicate!.members.length, 1);
+  assert.equal(assignmentFromDuplicate!.members[0]?.kouho?.length, 17);
+  const datesFromAssignment = assignmentFromDuplicate!.choices.map((c: { choice: string }) =>
+    c.choice.match(/(\d{1,2}\/\d{1,2})/)?.[1]
+  );
+  assert.equal(new Set(datesFromAssignment).size, 17);
+
+  // ○ + unknown 同一日付 → ○採用、Calendarは1回だけ、create後deleteしない
+  const circleUnknownSnapshot = {
+    event: { id: "dup", name: "個人", detail: null, upd_datetime: null },
+    choices: [
+      { choice: "10/11(日) 11-13" },
+      { choice: "10/16(金) 18-21" },
+      { choice: "10/11(日) 11-13" },
+      { choice: "10/16(金) 18-21" }
+    ],
+    members: [{ name: "1年渡辺塁", attend: "1,1,0,0", kouho: [1, 1, 0, 0] }]
+  } as any;
+  const circleUnknownNorm = hooks.normalizeRuiCalendarDays(circleUnknownSnapshot, 2026);
+  assert.equal(circleUnknownNorm.invariants.normalizedDateCount, 2);
+  assert.equal(circleUnknownNorm.invariants.duplicateDateCount, 2);
+  const day11 = circleUnknownNorm.days.find((d: any) => d.practiceDate === "2026-10-11");
+  const day16 = circleUnknownNorm.days.find((d: any) => d.practiceDate === "2026-10-16");
+  assert.equal(day11?.attendance, "circle");
+  assert.equal(day16?.attendance, "circle");
+  assert.equal(day11?.conflict, false);
+  const { env: circleUnknownEnv } = createTestEnv();
+  (circleUnknownEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (circleUnknownEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  const circleUnknownCreates: string[] = [];
+  let circleUnknownDeletes = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { start?: { dateTime?: string } };
+      circleUnknownCreates.push(body.start?.dateTime?.slice(0, 10) ?? "");
+      return new Response(JSON.stringify({ id: `cu-${circleUnknownCreates.length}` }), { status: 200 });
+    }
+    if (init?.method === "DELETE") {
+      circleUnknownDeletes += 1;
+      return new Response(null, { status: 204 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const circleUnknownSync = await hooks.syncRuiCalendarFromChouseisan(
+    circleUnknownEnv as any,
+    "personal",
+    circleUnknownSnapshot,
+    2026
+  );
+  assert.equal(circleUnknownSync.created, 2);
+  assert.equal(circleUnknownSync.deleted, 0);
+  assert.equal(circleUnknownCreates.length, 2);
+  assert.equal(circleUnknownCreates.sort().join(","), ["2026-10-11", "2026-10-16"].join(","));
+  assert.equal(circleUnknownDeletes, 0);
+  assert.ok(await circleUnknownEnv.STATE.get("rui_calendar_event:personal:2026-10-11"));
+  assert.ok(await circleUnknownEnv.STATE.get("rui_calendar_event:personal:2026-10-16"));
+
+  // × + unknown → ×採用、既存event delete
+  const crossUnknownSnapshot = {
+    event: { id: "cross-unk", name: "個人", detail: null, upd_datetime: null },
+    choices: [{ choice: "10/2(金) 18-21" }, { choice: "10/2(金) 18-21" }],
+    members: [{ name: "1年渡辺塁", attend: "3,0", kouho: [3, 0] }]
+  } as any;
+  const crossUnknownNorm = hooks.normalizeRuiCalendarDays(crossUnknownSnapshot, 2026);
+  assert.equal(crossUnknownNorm.days[0]?.attendance, "cross");
+  assert.equal(crossUnknownNorm.days[0]?.conflict, false);
+  const { env: crossUnknownEnv } = createTestEnv();
+  (crossUnknownEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (crossUnknownEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await crossUnknownEnv.STATE.put(
+    "rui_calendar_event:personal:2026-10-02",
+    JSON.stringify({ eventId: "ev-cross-02", status: "circle" })
+  );
+  let crossUnknownDeleteCount = 0;
+  let crossUnknownCreateCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events/ev-cross-02") && init?.method === "DELETE") {
+      crossUnknownDeleteCount += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      crossUnknownCreateCount += 1;
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const crossUnknownSync = await hooks.syncRuiCalendarFromChouseisan(
+    crossUnknownEnv as any,
+    "personal",
+    crossUnknownSnapshot,
+    2026
+  );
+  assert.equal(crossUnknownSync.deleted, 1);
+  assert.equal(crossUnknownDeleteCount, 1);
+  assert.equal(crossUnknownCreateCount, 0);
+  assert.equal(await crossUnknownEnv.STATE.get("rui_calendar_event:personal:2026-10-02"), null);
+
+  // unknown only → createしない / deleteしない / 既存保持
+  const unknownOnlySnapshot = {
+    event: { id: "unk-only", name: "個人", detail: null, upd_datetime: null },
+    choices: [{ choice: "10/3(土) 9-12" }],
+    members: [{ name: "1年渡辺塁", attend: "0", kouho: [0] }]
+  } as any;
+  const { env: unknownOnlyEnv } = createTestEnv();
+  (unknownOnlyEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (unknownOnlyEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await unknownOnlyEnv.STATE.put(
+    "rui_calendar_event:personal:2026-10-03",
+    JSON.stringify({ eventId: "ev-keep-03", status: "circle" })
+  );
+  let unknownOnlyDeleteCount = 0;
+  let unknownOnlyCreateCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (init?.method === "DELETE") {
+      unknownOnlyDeleteCount += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      unknownOnlyCreateCount += 1;
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const unknownOnlySync = await hooks.syncRuiCalendarFromChouseisan(
+    unknownOnlyEnv as any,
+    "personal",
+    unknownOnlySnapshot,
+    2026
+  );
+  assert.equal(unknownOnlySync.created, 0);
+  assert.equal(unknownOnlySync.deleted, 0);
+  assert.equal(unknownOnlyDeleteCount, 0);
+  assert.equal(unknownOnlyCreateCount, 0);
+  assert.ok(await unknownOnlyEnv.STATE.get("rui_calendar_event:personal:2026-10-03"));
+
+  // ○ / × conflict → 後勝ちしない・破壊的処理しない
+  const conflictSnapshot = {
+    event: { id: "conflict", name: "個人", detail: null, upd_datetime: null },
+    choices: [{ choice: "10/11(日) 11-13" }, { choice: "10/11(日) 11-13" }],
+    members: [{ name: "1年渡辺塁", attend: "1,3", kouho: [1, 3] }]
+  } as any;
+  const conflictNorm = hooks.normalizeRuiCalendarDays(conflictSnapshot, 2026);
+  assert.equal(conflictNorm.days[0]?.conflict, true);
+  assert.equal(conflictNorm.invariants.conflictDateCount, 1);
+  const { env: conflictEnv } = createTestEnv();
+  (conflictEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (conflictEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await conflictEnv.STATE.put(
+    "rui_calendar_event:personal:2026-10-11",
+    JSON.stringify({ eventId: "ev-conflict-11", status: "circle" })
+  );
+  let conflictDeleteCount = 0;
+  let conflictCreateCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (init?.method === "DELETE") {
+      conflictDeleteCount += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      conflictCreateCount += 1;
+      return new Response(JSON.stringify({ id: "unexpected" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const conflictSync = await hooks.syncRuiCalendarFromChouseisan(
+    conflictEnv as any,
+    "personal",
+    conflictSnapshot,
+    2026
+  );
+  assert.equal(conflictSync.created, 0);
+  assert.equal(conflictSync.deleted, 0);
+  assert.equal(conflictDeleteCount, 0);
+  assert.equal(conflictCreateCount, 0);
+  assert.ok(await conflictEnv.STATE.get("rui_calendar_event:personal:2026-10-11"));
+
+  // regular 回帰: ○ create / 既存 PATCH / × delete / unknown preserve
+  const { env: regularSafetyEnv } = createTestEnv();
+  (regularSafetyEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (regularSafetyEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await regularSafetyEnv.STATE.put(
+    "rui_calendar_event:regular:2026-09-10",
+    JSON.stringify({ eventId: "reg-patch", status: "circle" })
+  );
+  await regularSafetyEnv.STATE.put(
+    "rui_calendar_event:regular:2026-09-11",
+    JSON.stringify({ eventId: "reg-del", status: "circle" })
+  );
+  await regularSafetyEnv.STATE.put(
+    "rui_calendar_event:regular:2026-09-12",
+    JSON.stringify({ eventId: "reg-keep", status: "circle" })
+  );
+  let regularCreateCount = 0;
+  let regularPatchCount = 0;
+  let regularDeleteCount = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events/reg-patch?fields=id,summary,start,end")) {
+      return new Response(
+        JSON.stringify({
+          id: "reg-patch",
+          summary: "wing練習",
+          start: { dateTime: "2026-09-10T19:00:00+09:00" },
+          end: { dateTime: "2026-09-10T21:00:00+09:00" }
+        }),
+        { status: 200 }
+      );
+    }
+    if (url.includes("/events/reg-patch") && init?.method === "PATCH") {
+      regularPatchCount += 1;
+      return new Response(JSON.stringify({ id: "reg-patch" }), { status: 200 });
+    }
+    if (url.includes("/events/reg-del") && init?.method === "DELETE") {
+      regularDeleteCount += 1;
+      return new Response(null, { status: 204 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      regularCreateCount += 1;
+      return new Response(JSON.stringify({ id: `reg-new-${regularCreateCount}` }), { status: 200 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const regularSafetySync = await hooks.syncRuiCalendarFromChouseisan(
+    regularSafetyEnv as any,
+    "regular",
+    {
+      event: { id: "reg", name: "9月通常", detail: null, upd_datetime: null },
+      choices: [
+        { choice: "9/9(水) 19:00〜" },
+        { choice: "9/10(木) 19:00〜" },
+        { choice: "9/11(金) 19:00〜" },
+        { choice: "9/12(土) 10:00〜" }
+      ],
+      members: [{ name: "渡辺塁", attend: "1,1,3,0", kouho: [1, 1, 3, 0] }]
+    } as any,
+    2026
+  );
+  assert.equal(regularSafetySync.created, 1);
+  assert.equal(regularSafetySync.updated, 1);
+  assert.equal(regularSafetySync.deleted, 1);
+  assert.equal(regularCreateCount, 1);
+  assert.equal(regularPatchCount, 1);
+  assert.equal(regularDeleteCount, 1);
+  assert.ok(await regularSafetyEnv.STATE.get("rui_calendar_event:regular:2026-09-12"));
+
+  // 個人 10/11・10/16 ○ → create + KV残存（34件重複模擬でも）
+  const duplicatedPersonalSnapshot = {
+    event: {
+      id: "e5a30ed670784e27b894e56b999fc5a5",
+      name: "10月個別練習　日程調整",
+      detail: null,
+      upd_datetime: "2026-09-15T22:41:12.000000Z"
+    },
+    choices: [...personalChoices17, ...personalChoices17],
+    members: [
+      {
+        name: "1年渡辺塁",
+        attend: `${ruiKouho17.join(",")},${Array(17).fill(0).join(",")}`,
+        kouho: [...ruiKouho17, ...Array(17).fill(0)]
+      }
+    ]
+  } as any;
+  assert.equal(duplicatedPersonalSnapshot.choices.length, 34);
+  const dupNorm = hooks.normalizeRuiCalendarDays(duplicatedPersonalSnapshot, 2026);
+  assert.equal(dupNorm.invariants.normalizedDateCount, 17);
+  assert.equal(dupNorm.invariants.duplicateDateCount, 17);
+  assert.deepEqual(
+    dupNorm.days.filter((d: any) => d.attendance === "circle").map((d: any) => d.practiceDate),
+    ["2026-10-11", "2026-10-16"]
+  );
+  const { env: dupPersonalEnv } = createTestEnv();
+  (dupPersonalEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (dupPersonalEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  const dupCreates: string[] = [];
+  let dupDeletes = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { start?: { dateTime?: string } };
+      dupCreates.push(body.start?.dateTime?.slice(0, 10) ?? "");
+      return new Response(JSON.stringify({ id: `dup-${dupCreates.length}` }), { status: 200 });
+    }
+    if (init?.method === "DELETE") {
+      dupDeletes += 1;
+      return new Response(null, { status: 204 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const dupSync = await hooks.syncRuiCalendarFromChouseisan(
+    dupPersonalEnv as any,
+    "personal",
+    duplicatedPersonalSnapshot,
+    2026
+  );
+  assert.equal(dupSync.created, 2);
+  assert.equal(dupSync.deleted, 0);
+  assert.equal(dupDeletes, 0);
+  assert.deepEqual(dupCreates.sort(), ["2026-10-11", "2026-10-16"]);
+  assert.ok(await dupPersonalEnv.STATE.get("rui_calendar_event:personal:2026-10-11"));
+  assert.ok(await dupPersonalEnv.STATE.get("rui_calendar_event:personal:2026-10-16"));
+  // re-sync should not delete the created maps via unknown
+  const dupSync2 = await hooks.syncRuiCalendarFromChouseisan(
+    dupPersonalEnv as any,
+    "personal",
+    duplicatedPersonalSnapshot,
+    2026
+  );
+  assert.equal(dupSync2.deleted, 0);
+  assert.ok(await dupPersonalEnv.STATE.get("rui_calendar_event:personal:2026-10-11"));
+  assert.ok(await dupPersonalEnv.STATE.get("rui_calendar_event:personal:2026-10-16"));
+
   // 個人練習の○は引率候補に含めない
   globalThis.fetch = async (input: RequestInfo | URL) => {
     const url = String(input);
