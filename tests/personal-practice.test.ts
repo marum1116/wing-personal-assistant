@@ -939,6 +939,165 @@ async function main() {
   assert.equal(syncFailCreateCount, 0);
   assert.equal(Object.prototype.hasOwnProperty.call(syncFailBodies[0] ?? {}, "summary"), false);
 
+  // personal: 1年渡辺塁 match / ○日判定 / Calendar 4xxはfailedとして返す / reply失敗時push
+  const personalSnapshot = {
+    event: {
+      id: "e5a30ed670784e27b894e56b999fc5a5",
+      name: "10月個別練習　日程調整",
+      detail: null,
+      upd_datetime: "2026-09-15T22:41:12.000000Z"
+    },
+    choices: [
+      { choice: "10/2(金) 18-21" },
+      { choice: "10/3(土) 9-12" },
+      { choice: "10/4(日) " },
+      { choice: "10/7(水) 18-21" },
+      { choice: "10/9(金) 18-21" },
+      { choice: "10/10(土) 9-12" },
+      { choice: "10/11(日) 11-13" },
+      { choice: "10/12(月) " },
+      { choice: "10/14(水) 18-21" },
+      { choice: "10/16(金) 18-21" },
+      { choice: "10/21(水) 18-21" },
+      { choice: "10/23(金) 18-21" },
+      { choice: "10/24(土) " },
+      { choice: "10/25(日) 9-12" },
+      { choice: "10/28(水) 18-21" },
+      { choice: "10/30(金) 18-21" },
+      { choice: "10/31(土) 9-12①面" }
+    ],
+    members: [
+      { name: "1年　中村詠太", attend: "3,3,1,1,3,3,3,1,3,1,3,1,3,1,3,1,1", kouho: null },
+      {
+        name: "1年渡辺塁",
+        attend: "3,3,3,3,3,3,1,3,3,1,3,3,3,3,3,3,3",
+        kouho: [3, 3, 3, 3, 3, 3, 1, 3, 3, 1, 3, 3, 3, 3, 3, 3, 3]
+      }
+    ]
+  } as any;
+  assert.equal(hooks.isRuiParticipantName("1年渡辺塁"), true);
+  const ruiSummary = hooks.buildRuiAttendanceSummary(personalSnapshot, 2026);
+  assert.equal(ruiSummary.matched, true);
+  assert.equal(ruiSummary.matchedName, "1年渡辺塁");
+  assert.deepEqual(ruiSummary.circleDates, ["2026-10-11", "2026-10-16"]);
+  assert.ok(ruiSummary.crossDates.includes("2026-10-02"));
+  assert.ok(!ruiSummary.circleDates.includes("2026-10-02"));
+
+  const { env: personalCalEnv } = createTestEnv();
+  (personalCalEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (personalCalEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  const personalCreateBodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      personalCreateBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({ id: `created-${personalCreateBodies.length}` }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const personalSyncOk = await hooks.syncRuiCalendarFromChouseisan(
+    personalCalEnv as any,
+    "personal",
+    personalSnapshot,
+    2026
+  );
+  assert.equal(personalSyncOk.created, 2);
+  assert.equal(personalSyncOk.failed, 0);
+  assert.equal(personalCreateBodies.length, 2);
+  const personalMap11 = await personalCalEnv.STATE.get("rui_calendar_event:personal:2026-10-11");
+  const personalMap16 = await personalCalEnv.STATE.get("rui_calendar_event:personal:2026-10-16");
+  assert.ok(personalMap11 && personalMap11.includes("eventId"));
+  assert.ok(personalMap16 && personalMap16.includes("eventId"));
+  assert.equal(await personalCalEnv.STATE.get("rui_calendar_event:personal:2026-10-02"), null);
+
+  const { env: personalFailEnv } = createTestEnv();
+  (personalFailEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (personalFailEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      return new Response(JSON.stringify({ error: { message: "invalid event" } }), { status: 400 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const personalSyncFail = await hooks.syncRuiCalendarFromChouseisan(
+    personalFailEnv as any,
+    "personal",
+    personalSnapshot,
+    2026
+  );
+  assert.equal(personalSyncFail.created, 0);
+  assert.equal(personalSyncFail.failed, 2);
+  assert.deepEqual(personalSyncFail.failedDates, ["2026-10-11", "2026-10-16"]);
+
+  let replyCalls = 0;
+  let pushCalls = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replyCalls += 1;
+      return new Response(JSON.stringify({ message: "Invalid reply token" }), { status: 400 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/push") {
+      pushCalls += 1;
+      const body = JSON.parse(String(init?.body)) as { to?: string; messages?: unknown[] };
+      assert.equal(body.to, "U-test-user");
+      assert.equal(body.messages?.length, 1);
+      return new Response("{}", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const fallback = await hooks.replyWithPushFallback({
+    replyToken: "dummy-token",
+    userId: "U-test-user",
+    messages: [{ type: "text", text: "調整さん予定の同期結果" }],
+    accessToken: "dummy-access",
+    startedAtMs: Date.now() - 5000
+  });
+  assert.equal(fallback.replySuccess, false);
+  assert.equal(fallback.pushAttempted, true);
+  assert.equal(fallback.pushSuccess, true);
+  assert.equal(replyCalls, 1);
+  assert.equal(pushCalls, 1);
+
+  replyCalls = 0;
+  pushCalls = 0;
+  globalThis.fetch = async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replyCalls += 1;
+      return new Response("{}", { status: 200 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/push") {
+      pushCalls += 1;
+      return new Response("{}", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const noFallback = await hooks.replyWithPushFallback({
+    replyToken: "dummy-token",
+    userId: "U-test-user",
+    messages: [{ type: "text", text: "ok" }],
+    accessToken: "dummy-access",
+    startedAtMs: Date.now()
+  });
+  assert.equal(noFallback.replySuccess, true);
+  assert.equal(noFallback.pushAttempted, false);
+  assert.equal(replyCalls, 1);
+  assert.equal(pushCalls, 0);
+
   // 個人練習の○は引率候補に含めない
   globalThis.fetch = async (input: RequestInfo | URL) => {
     const url = String(input);

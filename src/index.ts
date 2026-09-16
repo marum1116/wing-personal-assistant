@@ -1506,6 +1506,33 @@ type GoogleCalendarEventPayload = {
   end: string;
 };
 
+type CalendarUpsertResult = {
+  status: "created" | "updated" | "skipped" | "failed";
+  action: "create" | "patch" | "skip";
+  httpStatus: number | null;
+  eventId: string | null;
+  errorCategory: string | null;
+  responseSummary: string | null;
+  kvSaveAttempted: boolean;
+  kvSaveSuccess: boolean | null;
+};
+
+type ChouseisanCalendarSyncResult = {
+  created: number;
+  updated: number;
+  deleted: number;
+  skipped: number;
+  failed: number;
+  failedDates: string[];
+};
+
+type LineOutboundResult = {
+  success: boolean;
+  httpStatus: number | null;
+  responseSummary: string | null;
+  errorCategory: string | null;
+};
+
 function normalizeGoogleServiceAccountPrivateKeyPem(privateKeyRaw: string): string | null {
   let normalized = privateKeyRaw.trim();
   if (
@@ -1910,16 +1937,148 @@ async function patchGoogleCalendarEventSummary(
   return response.ok ? "updated" : "skipped";
 }
 
+function summarizeHttpBodyForLog(text: string, maxLen = 240): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLen) {
+    return compact;
+  }
+  return `${compact.slice(0, maxLen)}…`;
+}
+
+function categorizeLineReplyFailure(httpStatus: number | null, bodySummary: string | null): string {
+  const body = (bodySummary ?? "").toLowerCase();
+  if (httpStatus === 400 && /invalid reply token|expired/.test(body)) {
+    return "reply_token_invalid_or_expired";
+  }
+  if (httpStatus === 400) {
+    return "line_reply_bad_request";
+  }
+  if (httpStatus === 401 || httpStatus === 403) {
+    return "line_auth_error";
+  }
+  if (httpStatus !== null && httpStatus >= 500) {
+    return "line_server_error";
+  }
+  if (httpStatus === null) {
+    return "line_network_or_unknown";
+  }
+  return `line_http_${httpStatus}`;
+}
+
+function categorizeCalendarHttpFailure(httpStatus: number | null, bodySummary: string | null): string {
+  const body = (bodySummary ?? "").toLowerCase();
+  if (httpStatus === 401 || httpStatus === 403 || /insufficient|permission|auth/.test(body)) {
+    return "calendar_auth_or_permission";
+  }
+  if (httpStatus === 400) {
+    return "calendar_bad_request";
+  }
+  if (httpStatus === 404) {
+    return "calendar_not_found";
+  }
+  if (httpStatus !== null && httpStatus >= 500) {
+    return "calendar_server_error";
+  }
+  if (httpStatus === null) {
+    return "calendar_network_or_unknown";
+  }
+  return `calendar_http_${httpStatus}`;
+}
+
+function buildRuiAttendanceSummary(
+  snapshot: ChouseisanSnapshot,
+  year: number
+): {
+  matched: boolean;
+  matchedName: string | null;
+  memberCount: number;
+  circleDates: string[];
+  triangleDates: string[];
+  crossDates: string[];
+  unknownDates: string[];
+} {
+  const memberCount = snapshot.members.length;
+  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name));
+  if (!ruiMember) {
+    return {
+      matched: false,
+      matchedName: null,
+      memberCount,
+      circleDates: [],
+      triangleDates: [],
+      crossDates: [],
+      unknownDates: []
+    };
+  }
+  const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
+  const circleDates: string[] = [];
+  const triangleDates: string[] = [];
+  const crossDates: string[] = [];
+  const unknownDates: string[] = [];
+  for (let i = 0; i < snapshot.choices.length; i += 1) {
+    const choice = snapshot.choices[i];
+    if (!choice) {
+      continue;
+    }
+    const practiceDate = parseChoiceDateToYmd(choice.choice, year);
+    if (!practiceDate) {
+      continue;
+    }
+    const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
+    if (status === "circle") {
+      circleDates.push(practiceDate);
+    } else if (status === "triangle") {
+      triangleDates.push(practiceDate);
+    } else if (status === "cross") {
+      crossDates.push(practiceDate);
+    } else {
+      unknownDates.push(practiceDate);
+    }
+  }
+  return {
+    matched: true,
+    matchedName: ruiMember.name,
+    memberCount,
+    circleDates,
+    triangleDates,
+    crossDates,
+    unknownDates
+  };
+}
+
 async function upsertGoogleCalendarEvent(
   env: Env,
   practiceKind: ChouseisanSyncKind,
   practiceDate: string,
   payload: GoogleCalendarEventPayload,
   options?: { preserveCircleMarker?: boolean }
-): Promise<"created" | "updated" | "skipped"> {
+): Promise<CalendarUpsertResult> {
   const accessToken = await getGoogleCalendarAccessToken(env);
   if (!accessToken) {
-    return "skipped";
+    const result: CalendarUpsertResult = {
+      status: "failed",
+      action: "skip",
+      httpStatus: null,
+      eventId: null,
+      errorCategory: "calendar_auth_missing",
+      responseSummary: null,
+      kvSaveAttempted: false,
+      kvSaveSuccess: null
+    };
+    console.log({
+      stage: "calendar_upsert_result",
+      date: practiceDate,
+      kind: practiceKind,
+      action: result.action,
+      success: false,
+      http_status: result.httpStatus,
+      response_summary: result.responseSummary,
+      event_id_present: false,
+      error_category: result.errorCategory,
+      kv_save_attempted: false,
+      kv_save_success: null
+    });
+    return result;
   }
   const calendarId = encodedGoogleCalendarId(env);
   const timeZone = env.GOOGLE_CALENDAR_TIMEZONE ?? "Asia/Tokyo";
@@ -1953,6 +2112,61 @@ async function upsertGoogleCalendarEvent(
       }
     }
   };
+
+  const saveMapping = async (eventId: string, status: "circle" | "triangle"): Promise<boolean> => {
+    console.log({
+      stage: "calendar_event_id_kv_save_attempt",
+      date: practiceDate,
+      kind: practiceKind,
+      mapping_key: mappingKey,
+      event_id_present: true
+    });
+    try {
+      await env.STATE.put(
+        mappingKey,
+        JSON.stringify({ eventId, status }),
+        { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+      );
+      console.log({
+        stage: "calendar_event_id_kv_save_result",
+        date: practiceDate,
+        kind: practiceKind,
+        success: true,
+        mapping_key: mappingKey
+      });
+      return true;
+    } catch (error) {
+      const errorType = error instanceof Error ? error.name : "unknown";
+      console.log({
+        stage: "calendar_event_id_kv_save_result",
+        date: practiceDate,
+        kind: practiceKind,
+        success: false,
+        mapping_key: mappingKey,
+        error_category: errorType
+      });
+      return false;
+    }
+  };
+
+  const logUpsert = (result: CalendarUpsertResult): CalendarUpsertResult => {
+    console.log({
+      stage: "calendar_upsert_result",
+      date: practiceDate,
+      kind: practiceKind,
+      action: result.action,
+      success: result.status === "created" || result.status === "updated",
+      http_status: result.httpStatus,
+      response_summary: result.responseSummary,
+      event_id_present: Boolean(result.eventId),
+      error_category: result.errorCategory,
+      kv_save_attempted: result.kvSaveAttempted,
+      kv_save_success: result.kvSaveSuccess,
+      outcome: result.status
+    });
+    return result;
+  };
+
   if (existing?.eventId) {
     const updateRes = await fetch(
       `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(existing.eventId)}`,
@@ -1965,20 +2179,51 @@ async function upsertGoogleCalendarEvent(
         body: JSON.stringify(body)
       }
     );
+    const updateBodyText = await updateRes.text().catch(() => "");
     if (updateRes.ok) {
-      await env.STATE.put(
-        mappingKey,
-        JSON.stringify({
-          eventId: existing.eventId,
-          status: includeSummary ? mappedStatus : existing.status ?? "circle"
-        }),
-        { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+      const kvSaveSuccess = await saveMapping(
+        existing.eventId,
+        includeSummary ? mappedStatus : existing.status ?? "circle"
       );
-      return "updated";
+      return logUpsert({
+        status: "updated",
+        action: "patch",
+        httpStatus: updateRes.status,
+        eventId: existing.eventId,
+        errorCategory: null,
+        responseSummary: summarizeHttpBodyForLog(updateBodyText),
+        kvSaveAttempted: true,
+        kvSaveSuccess
+      });
     }
     if (!includeSummary) {
-      return "skipped";
+      return logUpsert({
+        status: "skipped",
+        action: "patch",
+        httpStatus: updateRes.status,
+        eventId: existing.eventId,
+        errorCategory: "preserve_marker_without_summary",
+        responseSummary: summarizeHttpBodyForLog(updateBodyText),
+        kvSaveAttempted: false,
+        kvSaveSuccess: null
+      });
     }
+    console.log({
+      stage: "calendar_upsert_result",
+      date: practiceDate,
+      kind: practiceKind,
+      action: "patch",
+      success: false,
+      http_status: updateRes.status,
+      response_summary: summarizeHttpBodyForLog(updateBodyText),
+      event_id_present: true,
+      error_category: categorizeCalendarHttpFailure(
+        updateRes.status,
+        summarizeHttpBodyForLog(updateBodyText)
+      ),
+      note: "existing_patch_failed_falling_through_to_create"
+    });
+    // fall through to discover/create (existing behavior)
   }
 
   // KV mapが無い場合でも、当日のwing練習が1件だけなら新規作成せず再利用する
@@ -2002,14 +2247,35 @@ async function upsertGoogleCalendarEvent(
             body: JSON.stringify(body)
           }
         );
+        const reuseBodyText = await reuseRes.text().catch(() => "");
         if (reuseRes.ok) {
-          await env.STATE.put(
-            mappingKey,
-            JSON.stringify({ eventId: discovered.id, status: mappedStatus }),
-            { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
-          );
-          return "updated";
+          const kvSaveSuccess = await saveMapping(discovered.id, mappedStatus);
+          return logUpsert({
+            status: "updated",
+            action: "patch",
+            httpStatus: reuseRes.status,
+            eventId: discovered.id,
+            errorCategory: null,
+            responseSummary: summarizeHttpBodyForLog(reuseBodyText),
+            kvSaveAttempted: true,
+            kvSaveSuccess
+          });
         }
+        console.log({
+          stage: "calendar_upsert_result",
+          date: practiceDate,
+          kind: practiceKind,
+          action: "patch",
+          success: false,
+          http_status: reuseRes.status,
+          response_summary: summarizeHttpBodyForLog(reuseBodyText),
+          event_id_present: true,
+          error_category: categorizeCalendarHttpFailure(
+            reuseRes.status,
+            summarizeHttpBodyForLog(reuseBodyText)
+          ),
+          note: "reuse_patch_failed_falling_through_to_create"
+        });
       }
     }
   }
@@ -2022,19 +2288,55 @@ async function upsertGoogleCalendarEvent(
     },
     body: JSON.stringify(body)
   });
+  const createBodyText = await createRes.text().catch(() => "");
   if (!createRes.ok) {
-    return "skipped";
+    return logUpsert({
+      status: "failed",
+      action: "create",
+      httpStatus: createRes.status,
+      eventId: null,
+      errorCategory: categorizeCalendarHttpFailure(
+        createRes.status,
+        summarizeHttpBodyForLog(createBodyText)
+      ),
+      responseSummary: summarizeHttpBodyForLog(createBodyText),
+      kvSaveAttempted: false,
+      kvSaveSuccess: null
+    });
   }
-  const created = (await createRes.json()) as { id?: string };
-  if (typeof created.id === "string") {
-    await env.STATE.put(
-      mappingKey,
-      JSON.stringify({ eventId: created.id, status: summary.includes("仮）") ? "triangle" : "circle" }),
-      { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+  let createdId: string | null = null;
+  try {
+    const created = JSON.parse(createBodyText) as { id?: string };
+    createdId = typeof created.id === "string" ? created.id : null;
+  } catch {
+    createdId = null;
+  }
+  if (createdId) {
+    const kvSaveSuccess = await saveMapping(
+      createdId,
+      summary.includes("仮）") ? "triangle" : "circle"
     );
-    return "created";
+    return logUpsert({
+      status: "created",
+      action: "create",
+      httpStatus: createRes.status,
+      eventId: createdId,
+      errorCategory: null,
+      responseSummary: summarizeHttpBodyForLog(createBodyText),
+      kvSaveAttempted: true,
+      kvSaveSuccess
+    });
   }
-  return "skipped";
+  return logUpsert({
+    status: "failed",
+    action: "create",
+    httpStatus: createRes.status,
+    eventId: null,
+    errorCategory: "calendar_create_missing_event_id",
+    responseSummary: summarizeHttpBodyForLog(createBodyText),
+    kvSaveAttempted: false,
+    kvSaveSuccess: null
+  });
 }
 
 async function deleteGoogleCalendarEventIfExists(
@@ -2081,16 +2383,65 @@ async function syncRuiCalendarFromChouseisan(
   kind: ChouseisanSyncKind,
   snapshot: ChouseisanSnapshot,
   year: number
-): Promise<{ created: number; updated: number; deleted: number; skipped: number }> {
-  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name));
-  if (!ruiMember) {
-    return { created: 0, updated: 0, deleted: 0, skipped: snapshot.choices.length };
+): Promise<ChouseisanCalendarSyncResult> {
+  const attendance = buildRuiAttendanceSummary(snapshot, year);
+  console.log({
+    stage: "chouseisan_calendar_sync_start",
+    kind,
+    event_name: snapshot.event.name,
+    parsed_date_count: snapshot.choices.length,
+    rui_participant_found: attendance.matched,
+    rui_participant_name: attendance.matchedName,
+    rui_attendance_summary: {
+      circle: attendance.circleDates.length,
+      triangle: attendance.triangleDates.length,
+      cross: attendance.crossDates.length,
+      unknown: attendance.unknownDates.length
+    },
+    calendar_target: resolveGoogleCalendarId(env)
+  });
+  console.log({
+    stage: "chouseisan_rui_match",
+    matched: attendance.matched,
+    matched_name: attendance.matchedName,
+    member_count: attendance.memberCount,
+    attendance_entries: snapshot.choices.length,
+    circle_dates: attendance.circleDates,
+    triangle_dates: attendance.triangleDates,
+    cross_dates: attendance.crossDates
+  });
+
+  if (!attendance.matched) {
+    console.log({
+      stage: "chouseisan_calendar_sync_complete",
+      kind,
+      created: 0,
+      updated: 0,
+      deleted: 0,
+      skipped: snapshot.choices.length,
+      failed: 0,
+      failed_dates: [],
+      skip_reason: "rui_member_not_found"
+    });
+    return {
+      created: 0,
+      updated: 0,
+      deleted: 0,
+      skipped: snapshot.choices.length,
+      failed: 0,
+      failedDates: []
+    };
   }
+
+  const ruiMember = snapshot.members.find((member) => isRuiParticipantName(member.name))!;
   const marks = parseAttendMarks(ruiMember, snapshot.choices.length);
   let created = 0;
   let updated = 0;
   let deleted = 0;
   let skipped = 0;
+  let failed = 0;
+  const failedDates: string[] = [];
+
   for (let i = 0; i < snapshot.choices.length; i += 1) {
     const choice = snapshot.choices[i];
     if (!choice) {
@@ -2099,10 +2450,35 @@ async function syncRuiCalendarFromChouseisan(
     const practiceDate = parseChoiceDateToYmd(choice.choice, year);
     if (!practiceDate) {
       skipped += 1;
+      console.log({
+        stage: "calendar_sync_decision",
+        date: null,
+        choice: choice.choice,
+        kind,
+        attendance: "unknown",
+        should_sync: false,
+        action: "skip",
+        skip_reason: "unparsable_date",
+        existing_event_id_present: false
+      });
       continue;
     }
     const status = ruiStatusFromAttendMark(marks[i] ?? Number.NaN);
+    const mappingRaw = await env.STATE.get(ruiCalendarEventKey(kind, practiceDate));
+    const existingEventIdPresent = Boolean(mappingRaw && mappingRaw.includes("eventId"));
+
     if (status === "cross" || status === "unknown") {
+      console.log({
+        stage: "calendar_sync_decision",
+        date: practiceDate,
+        kind,
+        attendance: status === "cross" ? "cross" : "unknown",
+        should_sync: false,
+        action: "skip",
+        skip_reason: status === "cross" ? "attendance_cross" : "attendance_unknown",
+        existing_event_id_present: existingEventIdPresent,
+        delete_if_exists: true
+      });
       const deletedResult = await deleteGoogleCalendarEventIfExists(env, kind, practiceDate);
       if (deletedResult === "deleted") {
         deleted += 1;
@@ -2111,33 +2487,77 @@ async function syncRuiCalendarFromChouseisan(
       }
       continue;
     }
+
     const timing = parseChoiceDateTime(choice.choice, year);
     if (!timing) {
       skipped += 1;
+      console.log({
+        stage: "calendar_sync_decision",
+        date: practiceDate,
+        kind,
+        attendance: status === "circle" ? "circle" : "triangle",
+        should_sync: true,
+        action: "skip",
+        skip_reason: "timing_parse_failed",
+        existing_event_id_present: existingEventIdPresent
+      });
       continue;
     }
+
+    const actionIntent = existingEventIdPresent ? "patch" : "create";
+    console.log({
+      stage: "calendar_sync_decision",
+      date: practiceDate,
+      kind,
+      attendance: status === "circle" ? "circle" : "triangle",
+      should_sync: true,
+      action: actionIntent,
+      skip_reason: null,
+      existing_event_id_present: existingEventIdPresent
+    });
+
     const practiceType = kind === "regular" ? "通常練習" : "個人練習";
     const location =
       inferLocationFromChouseisanDetail(snapshot.event.detail, practiceDate) ??
       defaultPracticeLocation(practiceDate, practiceType) ??
       null;
     const title = status === "circle" ? WING_EVENT_TITLE : WING_EVENT_TENTATIVE_TITLE;
-    const syncOutcome = await upsertGoogleCalendarEvent(env, kind, practiceDate, {
-      summary: title,
-      description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${status === "circle" ? "○" : "△"}）`,
-      location,
-      start: timing.start,
-      end: timing.end
-    }, { preserveCircleMarker: kind === "regular" && status === "circle" });
-    if (syncOutcome === "created") {
+    const syncOutcome = await upsertGoogleCalendarEvent(
+      env,
+      kind,
+      practiceDate,
+      {
+        summary: title,
+        description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${status === "circle" ? "○" : "△"}）`,
+        location,
+        start: timing.start,
+        end: timing.end
+      },
+      { preserveCircleMarker: kind === "regular" && status === "circle" }
+    );
+    if (syncOutcome.status === "created") {
       created += 1;
-    } else if (syncOutcome === "updated") {
+    } else if (syncOutcome.status === "updated") {
       updated += 1;
+    } else if (syncOutcome.status === "failed") {
+      failed += 1;
+      failedDates.push(practiceDate);
     } else {
       skipped += 1;
     }
   }
-  return { created, updated, deleted, skipped };
+
+  console.log({
+    stage: "chouseisan_calendar_sync_complete",
+    kind,
+    created,
+    updated,
+    deleted,
+    skipped,
+    failed,
+    failed_dates: failedDates
+  });
+  return { created, updated, deleted, skipped, failed, failedDates };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -4267,11 +4687,29 @@ async function syncChouseisanSchedule(
   addedOrUpdated: number;
   removed: number;
   conflictCount: number;
-  calendarSync: { created: number; updated: number; deleted: number; skipped: number };
+  calendarSync: ChouseisanCalendarSyncResult;
 }> {
+  const syncStartedAt = Date.now();
+  console.log({
+    stage: "chouseisan_schedule_sync_start",
+    kind,
+    elapsed_ms_from_caller: 0
+  });
   const snapshot = prefetched?.snapshot ?? (await fetchChouseisanSnapshot(url));
+  console.log({
+    stage: "chouseisan_fetch_complete",
+    kind,
+    event_name: snapshot.event.name,
+    elapsed_ms: Date.now() - syncStartedAt
+  });
   const year = prefetched?.year ?? inferYearFromChouseisan(snapshot, nowMs);
   const nextDates = [...new Set(snapshot.choices.map((choice) => parseChoiceDateToYmd(choice.choice, year)).filter((value): value is string => !!value))];
+  console.log({
+    stage: "chouseisan_parse_complete",
+    kind,
+    date_count: nextDates.length,
+    elapsed_ms: Date.now() - syncStartedAt
+  });
   const nextDateSet = new Set(nextDates);
   const previousDates = await loadPracticeTypeHintIndex(env, kind);
   const nowIso = new Date(nowMs).toISOString();
@@ -4341,7 +4779,25 @@ async function syncChouseisanSchedule(
   }
 
   await savePracticeTypeHintIndex(env, kind, nextDates);
+  console.log({
+    stage: "chouseisan_hint_kv_save_complete",
+    kind,
+    added_or_updated: addedOrUpdated,
+    removed,
+    elapsed_ms: Date.now() - syncStartedAt
+  });
   const calendarSync = await syncRuiCalendarFromChouseisan(env, kind, snapshot, year);
+  console.log({
+    stage: "chouseisan_calendar_sync_stage_complete",
+    kind,
+    created: calendarSync.created,
+    updated: calendarSync.updated,
+    deleted: calendarSync.deleted,
+    skipped: calendarSync.skipped,
+    failed: calendarSync.failed,
+    failed_dates: calendarSync.failedDates,
+    elapsed_ms: Date.now() - syncStartedAt
+  });
   return {
     eventName: snapshot.event.name,
     eventId: snapshot.event.id,
@@ -4352,6 +4808,14 @@ async function syncChouseisanSchedule(
   };
 }
 
+function formatCalendarSyncLine(label: string, calendarSync: ChouseisanCalendarSyncResult): string {
+  const base = `・Googleカレンダー(${label}): 作成${calendarSync.created} / 更新${calendarSync.updated} / 削除${calendarSync.deleted} / 保留${calendarSync.skipped}`;
+  if (calendarSync.failed > 0) {
+    return `${base} / 失敗${calendarSync.failed}${calendarSync.failedDates.length > 0 ? `（${calendarSync.failedDates.join(", ")}）` : ""}`;
+  }
+  return base;
+}
+
 async function handleChouseisanSyncCommand(
   event: LineWebhookEvent,
   env: Env,
@@ -4360,8 +4824,15 @@ async function handleChouseisanSyncCommand(
   if (!event.replyToken) {
     return;
   }
+  const startedAtMs = Date.now();
+  const webhookEventMs = typeof event.timestamp === "number" ? event.timestamp : startedAtMs;
   const nowMs = event.timestamp ?? Date.now();
   const lines: string[] = ["調整さん予定の同期結果"];
+  console.log({
+    stage: "chouseisan_sync_command_start",
+    target: command.target,
+    elapsed_ms_from_webhook_event: startedAtMs - webhookEventMs
+  });
   try {
     const resolveUrl = async (kind: ChouseisanSyncKind, directUrl: string | null): Promise<string | null> => {
       if (directUrl) {
@@ -4379,6 +4850,12 @@ async function handleChouseisanSyncCommand(
         throw new Error("調整さんURLが必要です。");
       }
       const snapshot = await fetchChouseisanSnapshot(autoUrl);
+      console.log({
+        stage: "chouseisan_fetch_complete",
+        kind: "auto",
+        event_name: snapshot.event.name,
+        elapsed_ms: Date.now() - startedAtMs
+      });
       const inferredKind = inferChouseisanKindFromSnapshot(snapshot);
       if (!inferredKind) {
         throw new Error(
@@ -4394,9 +4871,7 @@ async function handleChouseisanSyncCommand(
       });
       const label = inferredKind === "regular" ? "通常練習" : "個別練習";
       lines.push(`・${label}: ${syncResult.addedOrUpdated}日を同期（削除${syncResult.removed}日）`);
-      lines.push(
-        `・Googleカレンダー(${label === "通常練習" ? "通常" : "個別"}): 作成${syncResult.calendarSync.created} / 更新${syncResult.calendarSync.updated} / 削除${syncResult.calendarSync.deleted} / 保留${syncResult.calendarSync.skipped}`
-      );
+      lines.push(formatCalendarSyncLine(label === "通常練習" ? "通常" : "個別", syncResult.calendarSync));
       if (syncResult.conflictCount > 0) {
         lines.push(`・同日競合: ${syncResult.conflictCount}日（通常練習を優先して確定）`);
       }
@@ -4412,8 +4887,8 @@ async function handleChouseisanSyncCommand(
       lines.push(
         `・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`,
         `・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`,
-        `・Googleカレンダー(通常): 作成${regular.calendarSync.created} / 更新${regular.calendarSync.updated} / 削除${regular.calendarSync.deleted} / 保留${regular.calendarSync.skipped}`,
-        `・Googleカレンダー(個別): 作成${personal.calendarSync.created} / 更新${personal.calendarSync.updated} / 削除${personal.calendarSync.deleted} / 保留${personal.calendarSync.skipped}`
+        formatCalendarSyncLine("通常", regular.calendarSync),
+        formatCalendarSyncLine("個別", personal.calendarSync)
       );
       const conflictCount = Math.max(regular.conflictCount, personal.conflictCount);
       if (conflictCount > 0) {
@@ -4426,9 +4901,7 @@ async function handleChouseisanSyncCommand(
       }
       const regular = await syncChouseisanSchedule(env, "regular", regularUrl, nowMs);
       lines.push(`・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`);
-      lines.push(
-        `・Googleカレンダー(通常): 作成${regular.calendarSync.created} / 更新${regular.calendarSync.updated} / 削除${regular.calendarSync.deleted} / 保留${regular.calendarSync.skipped}`
-      );
+      lines.push(formatCalendarSyncLine("通常", regular.calendarSync));
       if (regular.conflictCount > 0) {
         lines.push(`・同日競合: ${regular.conflictCount}日（通常練習を優先して確定）`);
       }
@@ -4439,9 +4912,7 @@ async function handleChouseisanSyncCommand(
       }
       const personal = await syncChouseisanSchedule(env, "personal", personalUrl, nowMs);
       lines.push(`・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`);
-      lines.push(
-        `・Googleカレンダー(個別): 作成${personal.calendarSync.created} / 更新${personal.calendarSync.updated} / 削除${personal.calendarSync.deleted} / 保留${personal.calendarSync.skipped}`
-      );
+      lines.push(formatCalendarSyncLine("個別", personal.calendarSync));
       if (personal.conflictCount > 0) {
         lines.push(`・同日競合: ${personal.conflictCount}日（通常練習を優先して確定）`);
       }
@@ -4452,16 +4923,20 @@ async function handleChouseisanSyncCommand(
     lines.push("調整さん予定の同期に失敗しました。", `理由: ${message}`);
   }
 
-  console.log({ stage: "line_reply_start" });
-  const lineStatus = await replyMessages(
-    event.replyToken,
-    [{ type: "text", text: lines.join("\n") }],
-    env.LINE_CHANNEL_ACCESS_TOKEN
-  );
-  if (typeof lineStatus === "number") {
-    console.log({ stage: "line_reply_success", status: lineStatus });
-    console.log({ stage: "background_processing_complete" });
-  }
+  const replyStartedAt = Date.now();
+  console.log({
+    stage: "line_reply_start",
+    elapsed_ms: replyStartedAt - startedAtMs,
+    elapsed_ms_from_webhook_event: replyStartedAt - webhookEventMs
+  });
+  await replyWithPushFallback({
+    replyToken: event.replyToken,
+    userId: event.source?.userId ?? null,
+    messages: [{ type: "text", text: lines.join("\n") }],
+    accessToken: env.LINE_CHANNEL_ACCESS_TOKEN,
+    startedAtMs
+  });
+  console.log({ stage: "background_processing_complete" });
 }
 
 function parseRuiContactCommand(inputText: string, nowMs: number): RuiContactCommandParseResult | null {
@@ -9286,26 +9761,158 @@ async function callOpenAIForStructuredResult(
 async function replyMessages(
   replyToken: string,
   messages: LineReplyMessage[],
-  accessToken: string
+  accessToken: string,
+  options?: { startedAtMs?: number }
 ): Promise<number | undefined> {
-  const response = await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${accessToken}`
-    },
-    body: JSON.stringify({
-      replyToken,
-      messages
-    })
-  });
-
-  if (!response.ok) {
-    console.error("LINE reply API request failed", { status: response.status });
+  const startedAtMs = options?.startedAtMs ?? Date.now();
+  let response: Response;
+  try {
+    response = await fetch("https://api.line.me/v2/bot/message/reply", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({
+        replyToken,
+        messages
+      })
+    });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    console.log({
+      stage: "line_reply_result",
+      success: false,
+      http_status: null,
+      response_summary: null,
+      error_category: "line_network_or_unknown",
+      error_type: errorType,
+      elapsed_ms: Date.now() - startedAtMs
+    });
     return undefined;
   }
 
+  const bodyText = await response.text().catch(() => "");
+  const responseSummary = summarizeHttpBodyForLog(bodyText);
+  if (!response.ok) {
+    const errorCategory = categorizeLineReplyFailure(response.status, responseSummary);
+    console.log({
+      stage: "line_reply_result",
+      success: false,
+      http_status: response.status,
+      response_summary: responseSummary,
+      error_category: errorCategory,
+      elapsed_ms: Date.now() - startedAtMs
+    });
+    console.error("LINE reply API request failed", { status: response.status, errorCategory });
+    return undefined;
+  }
+
+  console.log({
+    stage: "line_reply_result",
+    success: true,
+    http_status: response.status,
+    response_summary: responseSummary || null,
+    error_category: null,
+    elapsed_ms: Date.now() - startedAtMs
+  });
   return response.status;
+}
+
+async function pushMessages(
+  userId: string,
+  messages: LineReplyMessage[],
+  accessToken: string
+): Promise<LineOutboundResult> {
+  let response: Response;
+  try {
+    response = await fetch("https://api.line.me/v2/bot/message/push", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({
+        to: userId,
+        messages
+      })
+    });
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    return {
+      success: false,
+      httpStatus: null,
+      responseSummary: null,
+      errorCategory: errorType
+    };
+  }
+  const bodyText = await response.text().catch(() => "");
+  const responseSummary = summarizeHttpBodyForLog(bodyText);
+  if (!response.ok) {
+    return {
+      success: false,
+      httpStatus: response.status,
+      responseSummary,
+      errorCategory: categorizeLineReplyFailure(response.status, responseSummary)
+    };
+  }
+  return {
+    success: true,
+    httpStatus: response.status,
+    responseSummary: responseSummary || null,
+    errorCategory: null
+  };
+}
+
+async function replyWithPushFallback(input: {
+  replyToken: string;
+  userId: string | null;
+  messages: LineReplyMessage[];
+  accessToken: string;
+  startedAtMs: number;
+}): Promise<{ replySuccess: boolean; pushAttempted: boolean; pushSuccess: boolean | null }> {
+  const replyStatus = await replyMessages(input.replyToken, input.messages, input.accessToken, {
+    startedAtMs: input.startedAtMs
+  });
+  if (typeof replyStatus === "number") {
+    console.log({
+      stage: "line_push_fallback_result",
+      attempted: false,
+      success: null,
+      http_status: null,
+      error_category: null,
+      reason: "reply_succeeded"
+    });
+    return { replySuccess: true, pushAttempted: false, pushSuccess: null };
+  }
+
+  if (!input.userId) {
+    console.log({
+      stage: "line_push_fallback_result",
+      attempted: false,
+      success: false,
+      http_status: null,
+      error_category: "missing_user_id",
+      reason: "reply_failed_no_user_id"
+    });
+    return { replySuccess: false, pushAttempted: false, pushSuccess: null };
+  }
+
+  const pushResult = await pushMessages(input.userId, input.messages, input.accessToken);
+  console.log({
+    stage: "line_push_fallback_result",
+    attempted: true,
+    success: pushResult.success,
+    http_status: pushResult.httpStatus,
+    response_summary: pushResult.responseSummary,
+    error_category: pushResult.errorCategory,
+    reason: "reply_failed"
+  });
+  return {
+    replySuccess: false,
+    pushAttempted: true,
+    pushSuccess: pushResult.success
+  };
 }
 
 async function replyUnpaidList(
@@ -10255,6 +10862,11 @@ export const TEST_HOOKS = {
   buildLeadCheckReplyText,
   calculateMonthlyFeeFromRegularSnapshot,
   syncRuiCalendarFromChouseisan,
+  buildRuiAttendanceSummary,
+  isRuiParticipantName,
+  replyWithPushFallback,
+  replyMessages,
+  pushMessages,
   finalizeMonthlyFeeFromNotice,
   buildMonthlyFeeReplyText,
   parseRuiContactCommand,
