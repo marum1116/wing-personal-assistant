@@ -2287,7 +2287,7 @@ window.Chouseisan = {
   assert.ok(!carMissingFormatted.includes("null"));
   assert.ok(!carMissingFormatted.includes("降りる場所"));
 
-  // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）
+  // 塁に連絡 Case: 今日だけ練習あり（行きバス/帰りバス）→ 1吹き出し（明日なしは出さない）
   const { env: contactEnvToday } = createTestEnv();
   await hooks.saveStructuredResultToD1(
     contactEnvToday,
@@ -2309,22 +2309,24 @@ window.Chouseisan = {
     "explicit",
     300
   );
-  const contactTodayText = await hooks.buildRuiContactMessage(
+  const contactTodayMessages = await hooks.buildRuiContactMessages(
     contactEnvToday.DB as any,
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
-  assert.match(contactTodayText, /【今日 8\/20（木）】/);
-  assert.match(contactTodayText, /練習場所：白幡台小/);
-  assert.match(contactTodayText, /集合：17:55ごろ KSP/);
-  assert.match(contactTodayText, /行き：バス/);
-  assert.match(contactTodayText, /帰り：バス/);
-  assert.match(contactTodayText, /バス引率：山田さん・遠山さん/);
-  assert.match(contactTodayText, /解散：溝の口南口/);
-  assert.ok(!contactTodayText.includes("一緒："));
-  assert.match(contactTodayText, /【明日 8\/21（金）】\n練習情報なし/);
+  assert.equal(contactTodayMessages.length, 1);
+  assert.match(contactTodayMessages[0] ?? "", /【今日 8\/20（木）】/);
+  assert.match(contactTodayMessages[0] ?? "", /練習場所：白幡台小/);
+  assert.match(contactTodayMessages[0] ?? "", /集合：17:55ごろ KSP/);
+  assert.match(contactTodayMessages[0] ?? "", /行き：バス/);
+  assert.match(contactTodayMessages[0] ?? "", /帰り：バス/);
+  assert.match(contactTodayMessages[0] ?? "", /バス引率：山田さん・遠山さん/);
+  assert.match(contactTodayMessages[0] ?? "", /解散：溝の口南口/);
+  assert.ok(!(contactTodayMessages[0] ?? "").includes("一緒："));
+  assert.ok(!(contactTodayMessages[0] ?? "").includes("明日"));
+  assert.ok(!(contactTodayMessages[0] ?? "").includes("練習情報なし"));
 
-  // 塁に連絡 Case: 明日だけ練習あり（帰り車 + 降車場所）
+  // 塁に連絡 Case: 明日だけ練習あり（帰り車 + 降車場所）→ 1吹き出し（今日なしは出さない）
   const { env: contactEnvTomorrow } = createTestEnv();
   await hooks.saveStructuredResultToD1(
     contactEnvTomorrow,
@@ -2344,21 +2346,22 @@ window.Chouseisan = {
     "explicit",
     300
   );
-  const contactTomorrowText = await hooks.buildRuiContactMessage(
+  const contactTomorrowMessages = await hooks.buildRuiContactMessages(
     contactEnvTomorrow.DB as any,
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
-  assert.match(contactTomorrowText, /【今日 8\/20（木）】\n練習情報なし/);
-  assert.match(contactTomorrowText, /【明日 8\/21（金）】/);
-  assert.match(contactTomorrowText, /練習場所：不明/);
-  assert.match(contactTomorrowText, /集合：18:20 志村さん宅/);
-  assert.match(contactTomorrowText, /行き：志村さんの車/);
-  assert.match(contactTomorrowText, /帰り：志村さんの車/);
-  assert.match(contactTomorrowText, /解散：溝の口駅前/);
-  assert.ok(!contactTomorrowText.includes("一緒："));
+  assert.equal(contactTomorrowMessages.length, 1);
+  assert.match(contactTomorrowMessages[0] ?? "", /【明日 8\/21（金）】/);
+  assert.match(contactTomorrowMessages[0] ?? "", /練習場所：不明/);
+  assert.match(contactTomorrowMessages[0] ?? "", /集合：18:20 志村さん宅/);
+  assert.match(contactTomorrowMessages[0] ?? "", /行き：志村さんの車/);
+  assert.match(contactTomorrowMessages[0] ?? "", /帰り：志村さんの車/);
+  assert.match(contactTomorrowMessages[0] ?? "", /解散：溝の口駅前/);
+  assert.ok(!(contactTomorrowMessages[0] ?? "").includes("一緒："));
+  assert.ok(!(contactTomorrowMessages[0] ?? "").includes("今日"));
 
-  // 塁に連絡 Case: 今日・明日両方あり
+  // 塁に連絡 Case: 今日・明日両方あり → 2吹き出し（1本文へ連結しない）
   const { env: contactEnvBoth } = createTestEnv();
   await hooks.saveStructuredResultToD1(
     contactEnvBoth,
@@ -2393,23 +2396,68 @@ window.Chouseisan = {
     "explicit",
     300
   );
-  const contactBothText = await hooks.buildRuiContactMessage(
+  const contactBothMessages = await hooks.buildRuiContactMessages(
     contactEnvBoth.DB as any,
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
-  assert.match(contactBothText, /【今日 8\/20（木）】/);
-  assert.match(contactBothText, /【明日 8\/21（金）】/);
+  assert.equal(contactBothMessages.length, 2);
+  assert.match(contactBothMessages[0] ?? "", /【今日 8\/20（木）】/);
+  assert.match(contactBothMessages[0] ?? "", /行き：バス/);
+  assert.ok(!(contactBothMessages[0] ?? "").includes("明日"));
+  assert.match(contactBothMessages[1] ?? "", /【明日 8\/21（金）】/);
+  assert.match(contactBothMessages[1] ?? "", /行き：志村さんの車/);
+  assert.ok(!(contactBothMessages[1] ?? "").includes("今日"));
+  assert.ok(!contactBothMessages.some((text: string) => text.includes("\n\n【")));
 
-  // 塁に連絡 Case: 今日・明日両方なし
+  // 塁に連絡 Case: 今日・明日両方なし → 予定なし1吹き出し
   const { env: contactEnvNone } = createTestEnv();
-  const contactNoneText = await hooks.buildRuiContactMessage(
+  const contactNoneMessages = await hooks.buildRuiContactMessages(
     contactEnvNone.DB as any,
     ["2026-08-20", "2026-08-21"],
     ["今日 8/20（木）", "明日 8/21（金）"]
   );
-  assert.match(contactNoneText, /【今日 8\/20（木）】\n練習情報なし/);
-  assert.match(contactNoneText, /【明日 8\/21（金）】\n練習情報なし/);
+  assert.equal(contactNoneMessages.length, 1);
+  assert.equal(contactNoneMessages[0], "今日・明日の練習予定はありません。");
+
+  // 塁に連絡 Case: 日付指定は従来どおり1日1吹き出し（予定なしも従来文言）
+  const contactSingleMessages = await hooks.buildRuiContactMessages(
+    contactEnvNone.DB as any,
+    ["2026-08-24"],
+    ["8/24（月）"]
+  );
+  assert.equal(contactSingleMessages.length, 1);
+  assert.equal(contactSingleMessages[0], "【8/24（月）】\n練習情報なし");
+
+  // 塁に連絡: reply失敗時のpush fallbackでも2吹き出し構成を維持
+  let contactReplyBody: { messages?: Array<{ type?: string; text?: string }> } | null = null;
+  let contactPushBody: { messages?: Array<{ type?: string; text?: string }> } | null = null;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      contactReplyBody = JSON.parse(String(init?.body)) as typeof contactReplyBody;
+      return new Response(JSON.stringify({ message: "Invalid reply token" }), { status: 400 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/push") {
+      contactPushBody = JSON.parse(String(init?.body)) as typeof contactPushBody;
+      return new Response("{}", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const contactFallback = await hooks.replyWithPushFallback({
+    replyToken: "dummy-token",
+    userId: "U-test-user",
+    messages: contactBothMessages.map((text: string) => ({ type: "text", text })),
+    accessToken: "dummy-access",
+    startedAtMs: Date.now()
+  });
+  assert.equal(contactFallback.replySuccess, false);
+  assert.equal(contactFallback.pushAttempted, true);
+  assert.equal(contactFallback.pushSuccess, true);
+  assert.equal(contactReplyBody?.messages?.length, 2);
+  assert.equal(contactPushBody?.messages?.length, 2);
+  assert.equal(contactPushBody?.messages?.[0]?.text, contactBothMessages[0]);
+  assert.equal(contactPushBody?.messages?.[1]?.text, contactBothMessages[1]);
 
   // 塁に連絡 Case: 当日変更が確定配車より優先される
   const { env: contactEnvPriority } = createTestEnv();

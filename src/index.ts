@@ -7392,19 +7392,41 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
   return lines;
 }
 
+async function buildRuiContactMessages(
+  db: D1Database,
+  dates: string[],
+  labels: string[]
+): Promise<string[]> {
+  const dayBlocks: Array<{ practice: PracticeRow | null; text: string }> = [];
+  for (let i = 0; i < dates.length; i += 1) {
+    const practiceDate = dates[i];
+    const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
+    const practice = await getPracticeForRuiContact(db, practiceDate);
+    dayBlocks.push({
+      practice,
+      text: buildRuiContactPracticeBlock(headerLabel, practice).join("\n")
+    });
+  }
+
+  // 日付指定（1日）は従来どおり1吹き出し（予定なしも含む）
+  if (dates.length <= 1) {
+    return dayBlocks.map((block) => block.text);
+  }
+
+  // 日付指定なし（今日＋明日）: 予定がある日だけ別吹き出し。両方なしは1メッセージ。
+  const withPractice = dayBlocks.filter((block) => block.practice !== null);
+  if (withPractice.length === 0) {
+    return ["今日・明日の練習予定はありません。"];
+  }
+  return withPractice.map((block) => block.text);
+}
+
 async function buildRuiContactMessage(
   db: D1Database,
   dates: string[],
   labels: string[]
 ): Promise<string> {
-  const sections: string[] = [];
-  for (let i = 0; i < dates.length; i += 1) {
-    const practiceDate = dates[i];
-    const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
-    const practice = await getPracticeForRuiContact(db, practiceDate);
-    sections.push(buildRuiContactPracticeBlock(headerLabel, practice).join("\n"));
-  }
-  return sections.join("\n\n");
+  return (await buildRuiContactMessages(db, dates, labels)).join("\n\n");
 }
 
 async function getPracticeForRuiContact(db: D1Database, practiceDate: string): Promise<PracticeRow | null> {
@@ -10900,21 +10922,28 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   const contactCommand = parseRuiContactCommand(inputText, event.timestamp ?? Date.now());
   if (contactCommand) {
     // 塁に連絡は情報源選択と無関係。日付の確定practiceを決定論生成する。
-    const contactText = await buildRuiContactMessage(
+    // 日付指定なし（今日＋明日）は予定がある日ごとに別吹き出し。
+    const contactStartedAtMs = Date.now();
+    const contactTexts = await buildRuiContactMessages(
       env.DB,
       contactCommand.dates,
       contactCommand.labels
     );
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [{ type: "text", text: contactText }],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
-    }
+    const contactMessages: LineReplyMessage[] = contactTexts.map((text) => ({ type: "text", text }));
+    console.log({
+      stage: "line_reply_start",
+      command: "rui_contact",
+      message_count: contactMessages.length,
+      dates: contactCommand.dates
+    });
+    await replyWithPushFallback({
+      replyToken: event.replyToken,
+      userId: event.source?.userId ?? null,
+      messages: contactMessages,
+      accessToken: env.LINE_CHANNEL_ACCESS_TOKEN,
+      startedAtMs: contactStartedAtMs
+    });
+    console.log({ stage: "background_processing_complete" });
     return;
   }
 
@@ -11442,6 +11471,7 @@ export const TEST_HOOKS = {
   buildMonthlyFeeReplyText,
   parseRuiContactCommand,
   buildRuiContactMessage,
+  buildRuiContactMessages,
   resolvePairedImageDataUrlForTextEvent,
   resolvePracticeContext,
   saveRecentPracticeContext,
