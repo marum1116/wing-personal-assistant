@@ -25,3 +25,13 @@ class_name = "PairingSession"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PairingSession"]
+
+[[queues.producers]]
+queue = "chouseisan-calendar-sync"
+binding = "CALENDAR_SYNC_QUEUE"
+
+[[queues.consumers]]
+queue = "chouseisan-calendar-sync"
+max_batch_size = 1
+max_retries = 5
+dead_letter_queue = "chouseisan-calendar-sync-dlq"

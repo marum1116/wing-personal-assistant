@@ -75,6 +75,19 @@ class MockKvNamespace {
   }
 }
 
+class MockQueue {
+  readonly messages: unknown[] = [];
+  failNextSend = false;
+
+  async send(body: unknown): Promise<void> {
+    if (this.failNextSend) {
+      this.failNextSend = false;
+      throw new Error("queue_send_failed");
+    }
+    this.messages.push(body);
+  }
+}
+
 function createTestEnv() {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(`
@@ -229,7 +242,9 @@ function createTestEnv() {
     env: {
       DB: new MockD1Database(sqlite),
       STATE: new MockKvNamespace(),
-      LINE_CHANNEL_SECRET: "test-lead-check-secret"
+      LINE_CHANNEL_SECRET: "test-lead-check-secret",
+      LINE_CHANNEL_ACCESS_TOKEN: "test-line-token",
+      CALENDAR_SYNC_QUEUE: new MockQueue()
     } as any
   };
 }
@@ -5124,6 +5139,366 @@ window.Chouseisan = {
   assert.equal(paidResult.outcome, "updated");
   const monthlyFeePayTargetsAfterPaid = await hooks.getMonthlyFeePaymentReminderTargets(env.DB as any, "2026-09-05");
   assert.equal(monthlyFeePayTargetsAfterPaid.length, 0);
+
+  // --- Calendar Queue 分離 ---
+  const regular13Choices = [
+    "10/1(木) 19:00〜",
+    "10/3(土) 18:00〜",
+    "10/5(月) 19:00〜",
+    "10/8(木) 19:00〜",
+    "10/12(月) 19:00〜",
+    "10/13(火) 19:00〜",
+    "10/15(木) 19:00〜",
+    "10/17(土) 18:00〜",
+    "10/19(月) 19:00〜",
+    "10/20(火) 19:00〜",
+    "10/22(木) 19:00〜",
+    "10/24(土) 18:00〜",
+    "10/26(月) 19:00〜",
+    "10/27(火) 19:00〜",
+    "10/29(木) 19:00〜"
+  ];
+  const regular13Snapshot = {
+    event: { id: "b8277ca180a540c3afe7adbf2b8e2da4", name: "10月羽魂〈ウイングソウル〉練習日", detail: null, upd_datetime: "2026-09-25T03:00:00.000Z" },
+    choices: regular13Choices.map((choice) => ({ choice })),
+    members: [{ name: "1年渡辺塁", attend: "1,1,1,1,1,1,1,3,1,1,1,3,1,1,1", kouho: [1, 1, 1, 1, 1, 1, 1, 3, 1, 1, 1, 3, 1, 1, 1] }]
+  } as any;
+  const regular13Html = `<!DOCTYPE html><html><body><script>window.Chouseisan = ${JSON.stringify({
+    event: { ...regular13Snapshot.event, members: regular13Snapshot.members, choices: regular13Snapshot.choices },
+    choices: regular13Snapshot.choices
+  })};</script></body></html>`;
+
+  const { env: queueWebhookEnv } = createTestEnv();
+  (queueWebhookEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (queueWebhookEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  let webhookCalendarCalls = 0;
+  let webhookReplyCalls = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith("https://chouseisan.com/")) {
+      return new Response(regular13Html, { status: 200, headers: { "content-type": "text/html" } });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      webhookReplyCalls += 1;
+      const body = JSON.parse(String(init?.body)) as { messages?: Array<{ text?: string }> };
+      assert.match(body.messages?.[0]?.text ?? "", /通常調整さんを読み取りました。カレンダー同期を開始します。/);
+      return new Response("{}", { status: 200 });
+    }
+    if (url.includes("/calendar/v3/")) {
+      webhookCalendarCalls += 1;
+      return new Response("should not be called from webhook", { status: 500 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  await hooks.handleChouseisanSyncCommand(
+    { type: "message", replyToken: "rt", timestamp: Date.UTC(2026, 8, 25, 3, 6, 35), source: { userId: "U-queue" }, message: { type: "text", text: "https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4" } } as any,
+    queueWebhookEnv as any,
+    hooks.parseChouseisanSyncCommand("https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4")
+  );
+  const queued = (queueWebhookEnv as any).CALENDAR_SYNC_QUEUE.messages as any[];
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].kind, "regular");
+  assert.equal(queued[0].entries.length, 15);
+  assert.equal(queued[0].entries.filter((e: any) => e.attendance === "circle").length, 13);
+  assert.equal(webhookCalendarCalls, 0);
+  assert.equal(webhookReplyCalls, 1);
+  assert.ok(await queueWebhookEnv.STATE.get("practice_type_hint:2026-10-01"));
+  assert.ok(await queueWebhookEnv.STATE.get("chouseisan_calendar_sync_rev:regular"));
+
+  // consumer: 13○ + existing 10/1・10/3 PATCH + 残りCREATE、完了push 1回
+  const { env: queueConsumerEnv } = createTestEnv();
+  (queueConsumerEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (queueConsumerEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await queueConsumerEnv.STATE.put("rui_calendar_event:regular:2026-10-01", JSON.stringify({ eventId: "exist-1001", status: "circle" }));
+  await queueConsumerEnv.STATE.put("rui_calendar_event:regular:2026-10-03", JSON.stringify({ eventId: "exist-1003", status: "circle" }));
+  const createdIds: string[] = [];
+  const patchedIds: string[] = [];
+  let completionPushes = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/push") {
+      completionPushes += 1;
+      const body = JSON.parse(String(init?.body)) as { messages?: Array<{ text?: string }> };
+      assert.match(body.messages?.[0]?.text ?? "", /通常調整さんのカレンダー同期が完了しました/);
+      return new Response("{}", { status: 200 });
+    }
+    if (url.includes("/events/") && init?.method === "PATCH") {
+      if (url.includes("exist-1001")) patchedIds.push("2026-10-01");
+      if (url.includes("exist-1003")) patchedIds.push("2026-10-03");
+      return new Response(JSON.stringify({ id: "patched" }), { status: 200 });
+    }
+    if (url.includes("/events/") && (!init || init.method === "GET") && !url.includes("/events?")) {
+      if (url.includes("exist-1001") || url.includes("exist-1003")) {
+        const id = url.includes("exist-1001") ? "exist-1001" : "exist-1003";
+        return new Response(JSON.stringify({ id, summary: "wing練習" }), { status: 200 });
+      }
+      return new Response("missing", { status: 404 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      const body = JSON.parse(String(init.body)) as { start?: { dateTime?: string }; id?: string };
+      createdIds.push(body.start?.dateTime?.slice(0, 10) ?? "");
+      return new Response(JSON.stringify({ id: body.id ?? `new-${createdIds.length}` }), { status: 200 });
+    }
+    if (init?.method === "DELETE") {
+      return new Response(null, { status: 204 });
+    }
+    if (url.includes("/events/reg") && (!init || init.method === "GET")) {
+      return new Response("missing", { status: 404 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const job13 = hooks.buildChouseisanCalendarSyncJob(
+    regular13Snapshot,
+    2026,
+    "regular",
+    "https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4",
+    "U-queue",
+    "sync-13",
+    100
+  );
+  await queueConsumerEnv.STATE.put("chouseisan_calendar_sync_rev:regular", JSON.stringify({ revision: 100, syncId: "sync-13", updatedAt: "t" }));
+  const consumer1 = await hooks.handleChouseisanCalendarSyncQueueMessage(queueConsumerEnv as any, job13);
+  assert.equal(consumer1.stale, false);
+  assert.equal(consumer1.result?.created, 11);
+  assert.equal(consumer1.result?.updated, 2);
+  assert.deepEqual(patchedIds.sort(), ["2026-10-01", "2026-10-03"]);
+  assert.equal(createdIds.length, 11);
+  assert.ok(!createdIds.includes("2026-10-01"));
+  assert.ok(!createdIds.includes("2026-10-03"));
+  assert.equal(completionPushes, 1);
+  const regularMaps = [
+    "2026-10-01", "2026-10-03", "2026-10-05", "2026-10-08", "2026-10-12", "2026-10-13",
+    "2026-10-15", "2026-10-19", "2026-10-20", "2026-10-22", "2026-10-26", "2026-10-27", "2026-10-29"
+  ];
+  for (const date of regularMaps) {
+    assert.ok(await queueConsumerEnv.STATE.get(`rui_calendar_event:regular:${date}`), date);
+  }
+
+  const consumerRetry = await hooks.handleChouseisanCalendarSyncQueueMessage(queueConsumerEnv as any, job13);
+  assert.equal(consumerRetry.stale, false);
+  assert.equal(completionPushes, 1);
+  assert.equal(createdIds.length, 11);
+
+  // stale job
+  const staleJob = { ...job13, syncId: "sync-old", revision: 50 };
+  const stale = await hooks.handleChouseisanCalendarSyncQueueMessage(queueConsumerEnv as any, staleJob);
+  assert.equal(stale.stale, true);
+  assert.equal(hooks.isLatestChouseisanCalendarSyncJob(staleJob, { revision: 100, syncId: "sync-13", updatedAt: "t" }), false);
+
+  // create成功→KV保存前クラッシュ→retryでduplicateなし
+  const { env: crashEnv } = createTestEnv();
+  (crashEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (crashEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  const crashState = crashEnv.STATE as MockKvNamespace;
+  const originalPut = crashState.put.bind(crashState);
+  let failMappingOnce = true;
+  crashState.put = async (key: string, value: string, options?: { expirationTtl?: number }) => {
+    if (failMappingOnce && key.startsWith("rui_calendar_event:")) {
+      failMappingOnce = false;
+      throw new Error("kv_save_interrupted");
+    }
+    return originalPut(key, value, options);
+  };
+  let crashCreates = 0;
+  let crashPatches = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events/reg20261005") && init?.method === "PATCH") {
+      crashPatches += 1;
+      return new Response(JSON.stringify({ id: "reg20261005" }), { status: 200 });
+    }
+    if (url.includes("/events/reg20261005") && (!init || init.method === "GET")) {
+      if (crashCreates === 0) {
+        return new Response("missing", { status: 404 });
+      }
+      return new Response(JSON.stringify({ id: "reg20261005", summary: "wing練習" }), { status: 200 });
+    }
+    if (url.includes("/calendar/v3/calendars/") && url.includes("/events?") && (!init || !init.method || init.method === "GET")) {
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }
+    if (url.endsWith("/events") && init?.method === "POST") {
+      crashCreates += 1;
+      return new Response(JSON.stringify({ id: "reg20261005" }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const crashSnap = {
+    event: { id: "x", name: "通常", detail: null, upd_datetime: null },
+    choices: [{ choice: "10/5(月) 19:00〜" }],
+    members: [{ name: "渡辺塁", attend: "1", kouho: [1] }]
+  } as any;
+  await hooks.syncRuiCalendarFromChouseisan(crashEnv as any, "regular", crashSnap, 2026);
+  assert.equal(crashCreates, 1);
+  assert.equal(await crashEnv.STATE.get("rui_calendar_event:regular:2026-10-05"), null);
+  await hooks.syncRuiCalendarFromChouseisan(crashEnv as any, "regular", crashSnap, 2026);
+  assert.equal(crashCreates, 1);
+  assert.equal(crashPatches, 1);
+  assert.ok(await crashEnv.STATE.get("rui_calendar_event:regular:2026-10-05"));
+  assert.equal(hooks.deterministicCalendarEventId("regular", "2026-10-05"), "reg20261005");
+
+  // enqueue失敗は開始返信にしない
+  const { env: enqueueFailEnv } = createTestEnv();
+  (enqueueFailEnv as any).CALENDAR_SYNC_QUEUE.failNextSend = true;
+  let failReplyText = "";
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith("https://chouseisan.com/")) {
+      return new Response(regular13Html, { status: 200 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      failReplyText = JSON.parse(String(init?.body)).messages?.[0]?.text ?? "";
+      return new Response("{}", { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  await hooks.handleChouseisanSyncCommand(
+    { type: "message", replyToken: "rt2", timestamp: Date.now(), source: { userId: "U-fail" }, message: { type: "text", text: "https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4" } } as any,
+    enqueueFailEnv as any,
+    hooks.parseChouseisanSyncCommand("https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4")
+  );
+  assert.match(failReplyText, /カレンダー同期の開始に失敗しました/);
+
+  // personal job times
+  const personalJob = hooks.buildChouseisanCalendarSyncJob(
+    {
+      event: { id: "p", name: "10月個別練習　日程調整", detail: null, upd_datetime: null },
+      choices: [{ choice: "10/11(日) 11-13" }, { choice: "10/16(金) 18-21" }],
+      members: [{ name: "1年渡辺塁", attend: "1,1", kouho: [1, 1] }]
+    } as any,
+    2026,
+    "personal",
+    "https://chouseisan.com/s?h=personal",
+    "U-p",
+    "sync-p",
+    1
+  );
+  assert.equal(personalJob.kind, "personal");
+  assert.deepEqual(
+    personalJob.entries.map((e: any) => ({ date: e.practiceDate, start: e.start, end: e.end })),
+    [
+      { date: "2026-10-11", start: "2026-10-11T11:00:00", end: "2026-10-11T13:00:00" },
+      { date: "2026-10-16", start: "2026-10-16T18:00:00", end: "2026-10-16T21:00:00" }
+    ]
+  );
+
+  const personalHtml = `<!DOCTYPE html><html><body><script>window.Chouseisan = ${JSON.stringify({
+    event: { id: "p", name: "10月個別練習　日程調整", detail: null, upd_datetime: null, members: [{ name: "1年渡辺塁", attend: "1,1", kouho: [1, 1] }], choices: [{ choice: "10/11(日) 11-13" }, { choice: "10/16(金) 18-21" }] },
+    choices: [{ choice: "10/11(日) 11-13" }, { choice: "10/16(金) 18-21" }]
+  })};</script></body></html>`;
+  const { env: personalWebhookEnv } = createTestEnv();
+  let personalWebhookCalendarCalls = 0;
+  let personalWebhookReplyCalls = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith("https://chouseisan.com/")) {
+      return new Response(personalHtml, { status: 200 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      personalWebhookReplyCalls += 1;
+      const body = JSON.parse(String(init?.body)) as { messages?: Array<{ text?: string }> };
+      assert.match(body.messages?.[0]?.text ?? "", /個人調整さんを読み取りました。カレンダー同期を開始します。/);
+      return new Response("{}", { status: 200 });
+    }
+    if (url.includes("/calendar/v3/")) {
+      personalWebhookCalendarCalls += 1;
+      return new Response("should not be called", { status: 500 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  await hooks.handleChouseisanSyncCommand(
+    { type: "message", replyToken: "rt-p", timestamp: Date.UTC(2026, 8, 25, 3, 6, 35), source: { userId: "U-p" }, message: { type: "text", text: "https://chouseisan.com/s?h=personal" } } as any,
+    personalWebhookEnv as any,
+    hooks.parseChouseisanSyncCommand("https://chouseisan.com/s?h=personal")
+  );
+  const personalQueued = (personalWebhookEnv as any).CALENDAR_SYNC_QUEUE.messages as any[];
+  assert.equal(personalQueued.length, 1);
+  assert.equal(personalQueued[0].kind, "personal");
+  assert.equal(personalQueued[0].entries.length, 2);
+  assert.equal(personalWebhookCalendarCalls, 0);
+  assert.equal(personalWebhookReplyCalls, 1);
+
+  // enqueue成功後のreply失敗は既存push fallback（完了pushとは別）
+  const { env: replyFailEnv } = createTestEnv();
+  let replyFailReplyCalls = 0;
+  let replyFailPushCalls = 0;
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.startsWith("https://chouseisan.com/")) {
+      return new Response(regular13Html, { status: 200 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/reply") {
+      replyFailReplyCalls += 1;
+      return new Response("reply failed", { status: 500 });
+    }
+    if (url === "https://api.line.me/v2/bot/message/push") {
+      replyFailPushCalls += 1;
+      const body = JSON.parse(String(init?.body)) as { messages?: Array<{ text?: string }> };
+      assert.match(body.messages?.[0]?.text ?? "", /カレンダー同期を開始します/);
+      assert.ok(!(body.messages?.[0]?.text ?? "").includes("完了しました"));
+      return new Response("{}", { status: 200 });
+    }
+    if (url.includes("/calendar/v3/")) {
+      throw new Error("calendar should not be called from webhook");
+    }
+    return new Response("not found", { status: 404 });
+  };
+  await hooks.handleChouseisanSyncCommand(
+    { type: "message", replyToken: "rt-fail", timestamp: Date.now(), source: { userId: "U-reply-fail" }, message: { type: "text", text: "https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4" } } as any,
+    replyFailEnv as any,
+    hooks.parseChouseisanSyncCommand("https://chouseisan.com/s?h=b8277ca180a540c3afe7adbf2b8e2da4")
+  );
+  assert.equal(replyFailReplyCalls, 1);
+  assert.equal(replyFailPushCalls, 1);
+  assert.equal((replyFailEnv as any).CALENDAR_SYNC_QUEUE.messages.length, 1);
+
+  // Queue再同期でも引率済み◯wing練習を消さない
+  const { env: markerEnv } = createTestEnv();
+  (markerEnv as any).GOOGLE_SERVICE_ACCOUNT_EMAIL = googleCreds.email;
+  (markerEnv as any).GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY = googleCreds.privateKeyPem;
+  await markerEnv.STATE.put("rui_calendar_event:regular:2026-10-01", JSON.stringify({ eventId: "marked-1001", status: "circle" }));
+  await markerEnv.STATE.put("chouseisan_calendar_sync_rev:regular", JSON.stringify({ revision: 7, syncId: "sync-marker", updatedAt: "t" }));
+  const markerPatchedSummaries: string[] = [];
+  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(JSON.stringify({ access_token: "token" }), { status: 200 });
+    }
+    if (url.includes("/events/marked-1001") && (!init || init.method === "GET")) {
+      return new Response(JSON.stringify({ id: "marked-1001", summary: "◯wing練習" }), { status: 200 });
+    }
+    if (url.includes("/events/marked-1001") && init?.method === "PATCH") {
+      const body = JSON.parse(String(init.body)) as { summary?: string };
+      markerPatchedSummaries.push(body.summary ?? "");
+      return new Response(JSON.stringify({ id: "marked-1001", summary: body.summary }), { status: 200 });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  const markerJob = hooks.buildChouseisanCalendarSyncJob(
+    {
+      event: { id: "m", name: "10月羽魂〈ウイングソウル〉練習日", detail: null, upd_datetime: null },
+      choices: [{ choice: "10/1(木) 19:00〜" }],
+      members: [{ name: "1年渡辺塁", attend: "1", kouho: [1] }]
+    } as any,
+    2026,
+    "regular",
+    "https://chouseisan.com/s?h=marker",
+    null,
+    "sync-marker",
+    7
+  );
+  const markerResult = await hooks.handleChouseisanCalendarSyncQueueMessage(markerEnv as any, markerJob);
+  assert.equal(markerResult.stale, false);
+  assert.equal(markerResult.result?.updated, 1);
+  assert.deepEqual(markerPatchedSummaries, ["◯wing練習"]);
 
   console.log("personal-practice test: all cases passed");
 }

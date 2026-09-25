@@ -12,6 +12,7 @@ interface Env {
   DB: D1Database;
   STATE: KVNamespace;
   PAIRING: DurableObjectNamespace;
+  CALENDAR_SYNC_QUEUE: Queue<ChouseisanCalendarSyncJob>;
 }
 
 type SourceId = "wing" | "parents_r8" | "first_grade" | "tange";
@@ -2046,6 +2047,35 @@ type ChouseisanCalendarSyncResult = {
   failedDates: string[];
 };
 
+type ChouseisanCalendarSyncEntry = {
+  practiceDate: string;
+  choiceText: string;
+  attendance: RuiAttendStatus;
+  conflict: boolean;
+  start: string | null;
+  end: string | null;
+  location: string | null;
+};
+
+type ChouseisanCalendarSyncJob = {
+  syncId: string;
+  revision: number;
+  kind: ChouseisanSyncKind;
+  sourceUrl: string;
+  eventName: string;
+  eventDetail: string | null;
+  userId: string | null;
+  createdAt: string;
+  year: number;
+  entries: ChouseisanCalendarSyncEntry[];
+};
+
+type ChouseisanCalendarSyncRevisionRecord = {
+  revision: number;
+  syncId: string;
+  updatedAt: string;
+};
+
 type LineOutboundResult = {
   success: boolean;
   httpStatus: number | null;
@@ -2172,6 +2202,23 @@ async function getGoogleCalendarAccessToken(env: Env): Promise<string | null> {
 
 function ruiCalendarEventKey(kind: ChouseisanSyncKind, practiceDate: string): string {
   return `rui_calendar_event:${kind}:${practiceDate}`;
+}
+
+function chouseisanCalendarSyncRevisionKey(kind: ChouseisanSyncKind): string {
+  return `chouseisan_calendar_sync_rev:${kind}`;
+}
+
+function chouseisanCalendarSyncNotifyKey(syncId: string): string {
+  return `chouseisan_calendar_sync_notify:${syncId}`;
+}
+
+/**
+ * Google Calendar event ID は base32hex（0-9 / a-v）のみ。
+ * create成功後にKV保存前クラッシュしても、同じIDで再createせずGET/PATCHできる。
+ */
+function deterministicCalendarEventId(kind: ChouseisanSyncKind, practiceDate: string): string {
+  const compact = practiceDate.replace(/-/g, "");
+  return `${kind === "regular" ? "reg" : "per"}${compact}`;
 }
 
 function isGoogleCalendarConfigured(env: Env): boolean {
@@ -2765,8 +2812,60 @@ async function upsertGoogleCalendarEvent(
     // fall through to discover/create (existing behavior)
   }
 
-  // KV mapが無い場合でも、当日のwing練習が1件だけなら新規作成せず再利用する
+  // KV mapが無い場合: deterministic ID → 当日の一意wing予定 の順で再利用する
   if (!existing?.eventId) {
+    const deterministicId = deterministicCalendarEventId(practiceKind, practiceDate);
+    const byDeterministicId = await fetchGoogleCalendarEventById(env, deterministicId);
+    if (byDeterministicId.ok) {
+      if (
+        options?.preserveCircleMarker &&
+        summary === WING_EVENT_TITLE &&
+        byDeterministicId.event.summary === WING_EVENT_MARKED_TITLE
+      ) {
+        summary = WING_EVENT_MARKED_TITLE;
+        body.summary = summary;
+      }
+      const reuseDetRes = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(deterministicId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify(body)
+        }
+      );
+      const reuseDetBody = await reuseDetRes.text().catch(() => "");
+      if (reuseDetRes.ok) {
+        const kvSaveSuccess = await saveMapping(deterministicId, mappedStatus);
+        return logUpsert({
+          status: "updated",
+          action: "patch",
+          httpStatus: reuseDetRes.status,
+          eventId: deterministicId,
+          errorCategory: null,
+          responseSummary: summarizeHttpBodyForLog(reuseDetBody),
+          kvSaveAttempted: true,
+          kvSaveSuccess
+        });
+      }
+      console.log({
+        stage: "calendar_upsert_result",
+        date: practiceDate,
+        kind: practiceKind,
+        action: "patch",
+        success: false,
+        http_status: reuseDetRes.status,
+        response_summary: summarizeHttpBodyForLog(reuseDetBody),
+        event_id_present: true,
+        error_category: categorizeCalendarHttpFailure(
+          reuseDetRes.status,
+          summarizeHttpBodyForLog(reuseDetBody)
+        ),
+        note: "deterministic_id_patch_failed_falling_through"
+      });
+    }
     const dayEvents = await listGoogleCalendarEventsOnDate(env, practiceDate);
     if (dayEvents.ok) {
       const discovered = findUniqueSafeWingEvent(dayEvents.events);
@@ -2819,15 +2918,46 @@ async function upsertGoogleCalendarEvent(
     }
   }
 
+  const deterministicId = deterministicCalendarEventId(practiceKind, practiceDate);
   const createRes = await fetch(`https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${accessToken}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ ...body, id: deterministicId })
   });
   const createBodyText = await createRes.text().catch(() => "");
+  if (createRes.status === 409) {
+    const existed = await fetchGoogleCalendarEventById(env, deterministicId);
+    if (existed.ok) {
+      const conflictPatch = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events/${encodeURIComponent(deterministicId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify(body)
+        }
+      );
+      const conflictBody = await conflictPatch.text().catch(() => "");
+      if (conflictPatch.ok) {
+        const kvSaveSuccess = await saveMapping(deterministicId, mappedStatus);
+        return logUpsert({
+          status: "updated",
+          action: "patch",
+          httpStatus: conflictPatch.status,
+          eventId: deterministicId,
+          errorCategory: null,
+          responseSummary: summarizeHttpBodyForLog(conflictBody),
+          kvSaveAttempted: true,
+          kvSaveSuccess
+        });
+      }
+    }
+  }
   if (!createRes.ok) {
     return logUpsert({
       status: "failed",
@@ -2917,69 +3047,73 @@ async function deleteGoogleCalendarEventIfExists(
   return "skipped";
 }
 
-async function syncRuiCalendarFromChouseisan(
-  env: Env,
-  kind: ChouseisanSyncKind,
+function buildChouseisanCalendarSyncJob(
   snapshot: ChouseisanSnapshot,
-  year: number
-): Promise<ChouseisanCalendarSyncResult> {
+  year: number,
+  kind: ChouseisanSyncKind,
+  sourceUrl: string,
+  userId: string | null,
+  syncId: string,
+  revision: number
+): ChouseisanCalendarSyncJob {
   const normalized = normalizeRuiCalendarDays(snapshot, year);
-  const attendance = buildRuiAttendanceSummaryFromNormalized(normalized);
+  const practiceType = kind === "regular" ? "通常練習" : "個人練習";
+  const entries: ChouseisanCalendarSyncEntry[] = normalized.days.map((day) => {
+    const timing =
+      !day.conflict && (day.attendance === "circle" || day.attendance === "triangle")
+        ? parseChoiceDateTime(day.choiceText, year, snapshot.event.detail)
+        : null;
+    const location =
+      inferLocationFromChouseisanDetail(snapshot.event.detail, day.practiceDate) ??
+      defaultPracticeLocation(day.practiceDate, practiceType) ??
+      null;
+    return {
+      practiceDate: day.practiceDate,
+      choiceText: day.choiceText,
+      attendance: day.attendance,
+      conflict: day.conflict,
+      start: timing?.start ?? null,
+      end: timing?.end ?? null,
+      location
+    };
+  });
+  return {
+    syncId,
+    revision,
+    kind,
+    sourceUrl,
+    eventName: snapshot.event.name,
+    eventDetail: snapshot.event.detail ?? null,
+    userId,
+    createdAt: new Date().toISOString(),
+    year,
+    entries
+  };
+}
+
+async function applyNormalizedCalendarSyncEntries(
+  env: Env,
+  job: ChouseisanCalendarSyncJob
+): Promise<ChouseisanCalendarSyncResult> {
+  const startedAt = Date.now();
+  const attendance = {
+    circle: job.entries.filter((entry) => !entry.conflict && entry.attendance === "circle").length,
+    triangle: job.entries.filter((entry) => !entry.conflict && entry.attendance === "triangle").length,
+    cross: job.entries.filter((entry) => !entry.conflict && entry.attendance === "cross").length,
+    unknown: job.entries.filter((entry) => !entry.conflict && entry.attendance === "unknown").length,
+    conflict: job.entries.filter((entry) => entry.conflict).length
+  };
   console.log({
     stage: "chouseisan_calendar_sync_start",
-    kind,
-    event_name: snapshot.event.name,
-    parsed_date_count: snapshot.choices.length,
-    normalized_date_count: normalized.invariants.normalizedDateCount,
-    duplicate_date_count: normalized.invariants.duplicateDateCount,
-    invalid_date_count: normalized.invariants.invalidDateCount,
-    conflict_date_count: normalized.invariants.conflictDateCount,
-    attendance_mark_count: normalized.invariants.attendanceMarkCount,
-    rui_participant_found: attendance.matched,
-    rui_participant_name: attendance.matchedName,
-    rui_attendance_summary: {
-      circle: attendance.circleDates.length,
-      triangle: attendance.triangleDates.length,
-      cross: attendance.crossDates.length,
-      unknown: attendance.unknownDates.length,
-      conflict: attendance.conflictDates.length
-    },
+    kind: job.kind,
+    sync_id: job.syncId,
+    revision: job.revision,
+    event_name: job.eventName,
+    parsed_date_count: job.entries.length,
+    normalized_date_count: job.entries.length,
+    rui_attendance_summary: attendance,
     calendar_target: resolveGoogleCalendarId(env)
   });
-  console.log({
-    stage: "chouseisan_rui_match",
-    matched: attendance.matched,
-    matched_name: attendance.matchedName,
-    member_count: attendance.memberCount,
-    attendance_entries: snapshot.choices.length,
-    normalized_date_count: normalized.invariants.normalizedDateCount,
-    circle_dates: attendance.circleDates,
-    triangle_dates: attendance.triangleDates,
-    cross_dates: attendance.crossDates,
-    conflict_dates: attendance.conflictDates
-  });
-
-  if (!normalized.matched) {
-    console.log({
-      stage: "chouseisan_calendar_sync_complete",
-      kind,
-      created: 0,
-      updated: 0,
-      deleted: 0,
-      skipped: snapshot.choices.length,
-      failed: 0,
-      failed_dates: [],
-      skip_reason: "rui_member_not_found"
-    });
-    return {
-      created: 0,
-      updated: 0,
-      deleted: 0,
-      skipped: snapshot.choices.length,
-      failed: 0,
-      failedDates: []
-    };
-  }
 
   let created = 0;
   let updated = 0;
@@ -2988,18 +3122,27 @@ async function syncRuiCalendarFromChouseisan(
   let failed = 0;
   const failedDates: string[] = [];
 
-  for (const day of normalized.days) {
-    const mappingRaw = await env.STATE.get(ruiCalendarEventKey(kind, day.practiceDate));
+  for (let index = 0; index < job.entries.length; index += 1) {
+    const day = job.entries[index]!;
+    const mappingRaw = await env.STATE.get(ruiCalendarEventKey(job.kind, day.practiceDate));
     const existingEventIdPresent = Boolean(mappingRaw && mappingRaw.includes("eventId"));
+    console.log({
+      stage: "calendar_sync_progress",
+      sync_id: job.syncId,
+      kind: job.kind,
+      index,
+      entry_count: job.entries.length,
+      date: day.practiceDate,
+      elapsed_ms: Date.now() - startedAt
+    });
 
     if (day.conflict) {
       skipped += 1;
       console.log({
         stage: "calendar_sync_decision",
         date: day.practiceDate,
-        kind,
+        kind: job.kind,
         attendance: "conflict",
-        seen_statuses: day.seenStatuses,
         should_sync: false,
         action: "skip",
         skip_reason: "attendance_conflict",
@@ -3015,7 +3158,7 @@ async function syncRuiCalendarFromChouseisan(
       console.log({
         stage: "calendar_sync_decision",
         date: day.practiceDate,
-        kind,
+        kind: job.kind,
         attendance: "unknown",
         should_sync: false,
         action: "skip",
@@ -3030,7 +3173,7 @@ async function syncRuiCalendarFromChouseisan(
       console.log({
         stage: "calendar_sync_decision",
         date: day.practiceDate,
-        kind,
+        kind: job.kind,
         attendance: "cross",
         should_sync: false,
         action: "skip",
@@ -3038,7 +3181,7 @@ async function syncRuiCalendarFromChouseisan(
         existing_event_id_present: existingEventIdPresent,
         delete_if_exists: true
       });
-      const deletedResult = await deleteGoogleCalendarEventIfExists(env, kind, day.practiceDate);
+      const deletedResult = await deleteGoogleCalendarEventIfExists(env, job.kind, day.practiceDate);
       if (deletedResult === "deleted") {
         deleted += 1;
       } else {
@@ -3047,13 +3190,12 @@ async function syncRuiCalendarFromChouseisan(
       continue;
     }
 
-    const timing = parseChoiceDateTime(day.choiceText, year, snapshot.event.detail);
-    if (!timing) {
+    if (!day.start || !day.end) {
       skipped += 1;
       console.log({
         stage: "calendar_sync_decision",
         date: day.practiceDate,
-        kind,
+        kind: job.kind,
         attendance: day.attendance === "circle" ? "circle" : "triangle",
         should_sync: true,
         action: "skip",
@@ -3068,36 +3210,30 @@ async function syncRuiCalendarFromChouseisan(
     console.log({
       stage: "calendar_sync_decision",
       date: day.practiceDate,
-      kind,
+      kind: job.kind,
       attendance: day.attendance === "circle" ? "circle" : "triangle",
       should_sync: true,
       action: actionIntent,
       skip_reason: null,
       existing_event_id_present: existingEventIdPresent,
       delete_if_exists: false,
-      time_source: timing.timeSource,
-      start: timing.start,
-      end: timing.end
+      start: day.start,
+      end: day.end
     });
 
-    const practiceType = kind === "regular" ? "通常練習" : "個人練習";
-    const location =
-      inferLocationFromChouseisanDetail(snapshot.event.detail, day.practiceDate) ??
-      defaultPracticeLocation(day.practiceDate, practiceType) ??
-      null;
     const title = day.attendance === "circle" ? WING_EVENT_TITLE : WING_EVENT_TENTATIVE_TITLE;
     const syncOutcome = await upsertGoogleCalendarEvent(
       env,
-      kind,
+      job.kind,
       day.practiceDate,
       {
         summary: title,
-        description: `羽魂メモから自動同期（${kind === "regular" ? "通常練習" : "個別練習"}・${day.attendance === "circle" ? "○" : "△"}）`,
-        location,
-        start: timing.start,
-        end: timing.end
+        description: `羽魂メモから自動同期（${job.kind === "regular" ? "通常練習" : "個別練習"}・${day.attendance === "circle" ? "○" : "△"}）`,
+        location: day.location,
+        start: day.start,
+        end: day.end
       },
-      { preserveCircleMarker: kind === "regular" && day.attendance === "circle" }
+      { preserveCircleMarker: job.kind === "regular" && day.attendance === "circle" }
     );
     if (syncOutcome.status === "created") {
       created += 1;
@@ -3113,15 +3249,262 @@ async function syncRuiCalendarFromChouseisan(
 
   console.log({
     stage: "chouseisan_calendar_sync_complete",
-    kind,
+    kind: job.kind,
+    sync_id: job.syncId,
     created,
     updated,
     deleted,
     skipped,
     failed,
-    failed_dates: failedDates
+    failed_dates: failedDates,
+    elapsed_ms: Date.now() - startedAt
   });
   return { created, updated, deleted, skipped, failed, failedDates };
+}
+
+async function syncRuiCalendarFromChouseisan(
+  env: Env,
+  kind: ChouseisanSyncKind,
+  snapshot: ChouseisanSnapshot,
+  year: number
+): Promise<ChouseisanCalendarSyncResult> {
+  const attendance = buildRuiAttendanceSummary(snapshot, year);
+  console.log({
+    stage: "chouseisan_rui_match",
+    matched: attendance.matched,
+    matched_name: attendance.matchedName,
+    member_count: attendance.memberCount,
+    attendance_entries: snapshot.choices.length,
+    normalized_date_count: attendance.normalizedDateCount,
+    circle_dates: attendance.circleDates,
+    triangle_dates: attendance.triangleDates,
+    cross_dates: attendance.crossDates,
+    conflict_dates: attendance.conflictDates
+  });
+  const job = buildChouseisanCalendarSyncJob(
+    snapshot,
+    year,
+    kind,
+    "",
+    null,
+    "inline-test",
+    Date.now()
+  );
+  return applyNormalizedCalendarSyncEntries(env, job);
+}
+
+async function loadChouseisanCalendarSyncRevision(
+  env: Env,
+  kind: ChouseisanSyncKind
+): Promise<ChouseisanCalendarSyncRevisionRecord | null> {
+  const raw = await env.STATE.get(chouseisanCalendarSyncRevisionKey(kind));
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as ChouseisanCalendarSyncRevisionRecord;
+    if (typeof parsed.revision !== "number" || typeof parsed.syncId !== "string") {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isLatestChouseisanCalendarSyncJob(
+  job: ChouseisanCalendarSyncJob,
+  latest: ChouseisanCalendarSyncRevisionRecord | null
+): boolean {
+  if (!latest) {
+    return true;
+  }
+  return latest.syncId === job.syncId && latest.revision === job.revision;
+}
+
+async function enqueueChouseisanCalendarSync(
+  env: Env,
+  snapshot: ChouseisanSnapshot,
+  year: number,
+  kind: ChouseisanSyncKind,
+  sourceUrl: string,
+  userId: string | null
+): Promise<{ ok: true; job: ChouseisanCalendarSyncJob } | { ok: false; error: string }> {
+  const revision = Date.now();
+  const syncId = crypto.randomUUID();
+  const job = buildChouseisanCalendarSyncJob(snapshot, year, kind, sourceUrl, userId, syncId, revision);
+  const attendance = buildRuiAttendanceSummary(snapshot, year);
+  console.log({
+    stage: "chouseisan_rui_match",
+    matched: attendance.matched,
+    matched_name: attendance.matchedName,
+    member_count: attendance.memberCount,
+    attendance_entries: snapshot.choices.length,
+    normalized_date_count: attendance.normalizedDateCount,
+    circle_dates: attendance.circleDates,
+    triangle_dates: attendance.triangleDates,
+    cross_dates: attendance.crossDates,
+    conflict_dates: attendance.conflictDates
+  });
+  const record: ChouseisanCalendarSyncRevisionRecord = {
+    revision,
+    syncId,
+    updatedAt: job.createdAt
+  };
+  await env.STATE.put(chouseisanCalendarSyncRevisionKey(kind), JSON.stringify(record), {
+    expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
+  });
+  try {
+    await env.CALENDAR_SYNC_QUEUE.send(job);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "queue_send_failed";
+    console.log({
+      stage: "queue_enqueue",
+      success: false,
+      sync_id: syncId,
+      kind,
+      revision,
+      entry_count: job.entries.length,
+      error_category: message
+    });
+    return { ok: false, error: "カレンダー同期の開始に失敗しました。" };
+  }
+  console.log({
+    stage: "queue_enqueue",
+    success: true,
+    sync_id: syncId,
+    kind,
+    revision,
+    entry_count: job.entries.length,
+    source_url_present: sourceUrl.length > 0,
+    user_id_present: Boolean(userId)
+  });
+  return { ok: true, job };
+}
+
+function buildChouseisanCalendarSyncStartedReply(kinds: ChouseisanSyncKind[]): string {
+  if (kinds.length === 2) {
+    return "通常調整さんと個人調整さんを読み取りました。カレンダー同期を開始します。";
+  }
+  if (kinds[0] === "personal") {
+    return "個人調整さんを読み取りました。カレンダー同期を開始します。";
+  }
+  return "通常調整さんを読み取りました。カレンダー同期を開始します。";
+}
+
+function buildChouseisanCalendarSyncCompletedPush(
+  kind: ChouseisanSyncKind,
+  result: ChouseisanCalendarSyncResult
+): string {
+  const applied = result.created + result.updated + result.deleted;
+  const label = kind === "regular" ? "通常" : "個人";
+  if (result.failed > 0) {
+    return `${label}調整さんのカレンダー同期が完了しました（${applied}件反映、失敗${result.failed}件）。`;
+  }
+  return `${label}調整さんのカレンダー同期が完了しました（${applied}件反映）。`;
+}
+
+async function handleChouseisanCalendarSyncQueueMessage(
+  env: Env,
+  job: ChouseisanCalendarSyncJob
+): Promise<{ stale: boolean; result: ChouseisanCalendarSyncResult | null; pushed: boolean }> {
+  const startedAt = Date.now();
+  console.log({
+    stage: "queue_consumer_start",
+    sync_id: job.syncId,
+    kind: job.kind,
+    revision: job.revision,
+    entry_count: job.entries.length
+  });
+  const latest = await loadChouseisanCalendarSyncRevision(env, job.kind);
+  if (!isLatestChouseisanCalendarSyncJob(job, latest)) {
+    console.log({
+      stage: "calendar_sync_stale_skip",
+      sync_id: job.syncId,
+      kind: job.kind,
+      revision: job.revision,
+      latest_sync_id: latest?.syncId ?? null,
+      latest_revision: latest?.revision ?? null
+    });
+    return { stale: true, result: null, pushed: false };
+  }
+
+  const result = await applyNormalizedCalendarSyncEntries(env, job);
+  if (result.failed > 0) {
+    console.log({
+      stage: "queue_consumer_retryable_failure",
+      sync_id: job.syncId,
+      kind: job.kind,
+      failed: result.failed,
+      failed_dates: result.failedDates,
+      elapsed_ms: Date.now() - startedAt
+    });
+    throw new Error(`calendar_sync_partial_failure:${result.failedDates.join(",")}`);
+  }
+
+  const notifyKey = chouseisanCalendarSyncNotifyKey(job.syncId);
+  const alreadyNotified = await env.STATE.get(notifyKey);
+  let pushed = false;
+  if (alreadyNotified) {
+    console.log({
+      stage: "calendar_sync_completion_push",
+      sync_id: job.syncId,
+      kind: job.kind,
+      success: null,
+      skipped: true,
+      skip_reason: "already_notified"
+    });
+  } else {
+    // retryで完了pushが重複しないよう、送信前に予約する
+    await env.STATE.put(
+      notifyKey,
+      JSON.stringify({ reservedAt: new Date().toISOString(), pushed: false }),
+      { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+    );
+    if (job.userId) {
+      const pushResult = await pushMessages(
+        job.userId,
+        [{ type: "text", text: buildChouseisanCalendarSyncCompletedPush(job.kind, result) }],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      pushed = pushResult.success;
+      console.log({
+        stage: "calendar_sync_completion_push",
+        sync_id: job.syncId,
+        kind: job.kind,
+        success: pushResult.success,
+        http_status: pushResult.httpStatus,
+        error_category: pushResult.errorCategory
+      });
+      await env.STATE.put(
+        notifyKey,
+        JSON.stringify({ reservedAt: new Date().toISOString(), pushedAt: new Date().toISOString(), pushed }),
+        { expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS }
+      );
+    } else {
+      console.log({
+        stage: "calendar_sync_completion_push",
+        sync_id: job.syncId,
+        kind: job.kind,
+        success: null,
+        skipped: true,
+        skip_reason: "missing_user_id"
+      });
+    }
+  }
+  console.log({
+    stage: "queue_consumer_complete",
+    sync_id: job.syncId,
+    kind: job.kind,
+    revision: job.revision,
+    created: result.created,
+    updated: result.updated,
+    deleted: result.deleted,
+    skipped: result.skipped,
+    failed: result.failed,
+    elapsed_ms: Date.now() - startedAt
+  });
+  return { stale: false, result, pushed };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -5251,7 +5634,8 @@ async function syncChouseisanSchedule(
   addedOrUpdated: number;
   removed: number;
   conflictCount: number;
-  calendarSync: ChouseisanCalendarSyncResult;
+  snapshot: ChouseisanSnapshot;
+  year: number;
 }> {
   const syncStartedAt = Date.now();
   console.log({
@@ -5350,25 +5734,14 @@ async function syncChouseisanSchedule(
     removed,
     elapsed_ms: Date.now() - syncStartedAt
   });
-  const calendarSync = await syncRuiCalendarFromChouseisan(env, kind, snapshot, year);
-  console.log({
-    stage: "chouseisan_calendar_sync_stage_complete",
-    kind,
-    created: calendarSync.created,
-    updated: calendarSync.updated,
-    deleted: calendarSync.deleted,
-    skipped: calendarSync.skipped,
-    failed: calendarSync.failed,
-    failed_dates: calendarSync.failedDates,
-    elapsed_ms: Date.now() - syncStartedAt
-  });
   return {
     eventName: snapshot.event.name,
     eventId: snapshot.event.id,
     addedOrUpdated,
     removed,
     conflictCount,
-    calendarSync
+    snapshot,
+    year
   };
 }
 
@@ -5391,7 +5764,8 @@ async function handleChouseisanSyncCommand(
   const startedAtMs = Date.now();
   const webhookEventMs = typeof event.timestamp === "number" ? event.timestamp : startedAtMs;
   const nowMs = event.timestamp ?? Date.now();
-  const lines: string[] = ["調整さん予定の同期結果"];
+  const userId = event.source?.userId ?? null;
+  const lines: string[] = [];
   console.log({
     stage: "chouseisan_sync_command_start",
     target: command.target,
@@ -5406,6 +5780,17 @@ async function handleChouseisanSyncCommand(
         return directUrl;
       }
       return await env.STATE.get(chouseisanUrlKey(kind));
+    };
+    const enqueueAfterHint = async (
+      kind: ChouseisanSyncKind,
+      url: string,
+      snapshot: ChouseisanSnapshot,
+      year: number
+    ): Promise<void> => {
+      const queued = await enqueueChouseisanCalendarSync(env, snapshot, year, kind, url, userId);
+      if (!queued.ok) {
+        throw new Error(queued.error);
+      }
     };
 
     if (command.target === "auto") {
@@ -5429,17 +5814,12 @@ async function handleChouseisanSyncCommand(
       await env.STATE.put(chouseisanUrlKey(inferredKind), autoUrl, {
         expirationTtl: PRACTICE_TYPE_HINT_TTL_SECONDS
       });
-      const syncResult = await syncChouseisanSchedule(env, inferredKind, autoUrl, nowMs, {
+      await syncChouseisanSchedule(env, inferredKind, autoUrl, nowMs, {
         snapshot,
         year: inferYearFromChouseisan(snapshot, nowMs)
       });
-      const label = inferredKind === "regular" ? "通常練習" : "個別練習";
-      lines.push(`・${label}: ${syncResult.addedOrUpdated}日を同期（削除${syncResult.removed}日）`);
-      lines.push(formatCalendarSyncLine(label === "通常練習" ? "通常" : "個別", syncResult.calendarSync));
-      if (syncResult.conflictCount > 0) {
-        lines.push(`・同日競合: ${syncResult.conflictCount}日（通常練習を優先して確定）`);
-      }
-      lines.push(`・URL登録: ${label} 用として保存しました`);
+      await enqueueAfterHint(inferredKind, autoUrl, snapshot, inferYearFromChouseisan(snapshot, nowMs));
+      lines.push(buildChouseisanCalendarSyncStartedReply([inferredKind]));
     } else if (command.target === "both") {
       const regularUrl = await resolveUrl("regular", command.urlRegular);
       const personalUrl = await resolveUrl("personal", command.urlPersonal);
@@ -5448,38 +5828,25 @@ async function handleChouseisanSyncCommand(
       }
       const regular = await syncChouseisanSchedule(env, "regular", regularUrl, nowMs);
       const personal = await syncChouseisanSchedule(env, "personal", personalUrl, nowMs);
-      lines.push(
-        `・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`,
-        `・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`,
-        formatCalendarSyncLine("通常", regular.calendarSync),
-        formatCalendarSyncLine("個別", personal.calendarSync)
-      );
-      const conflictCount = Math.max(regular.conflictCount, personal.conflictCount);
-      if (conflictCount > 0) {
-        lines.push(`・同日競合: ${conflictCount}日（通常練習を優先して確定）`);
-      }
+      await enqueueAfterHint("regular", regularUrl, regular.snapshot, regular.year);
+      await enqueueAfterHint("personal", personalUrl, personal.snapshot, personal.year);
+      lines.push(buildChouseisanCalendarSyncStartedReply(["regular", "personal"]));
     } else if (command.target === "regular") {
       const regularUrl = await resolveUrl("regular", command.urlRegular);
       if (!regularUrl) {
         throw new Error("通常練習用の調整さんURLが必要です。");
       }
       const regular = await syncChouseisanSchedule(env, "regular", regularUrl, nowMs);
-      lines.push(`・通常練習: ${regular.addedOrUpdated}日を同期（削除${regular.removed}日）`);
-      lines.push(formatCalendarSyncLine("通常", regular.calendarSync));
-      if (regular.conflictCount > 0) {
-        lines.push(`・同日競合: ${regular.conflictCount}日（通常練習を優先して確定）`);
-      }
+      await enqueueAfterHint("regular", regularUrl, regular.snapshot, regular.year);
+      lines.push(buildChouseisanCalendarSyncStartedReply(["regular"]));
     } else {
       const personalUrl = await resolveUrl("personal", command.urlPersonal);
       if (!personalUrl) {
         throw new Error("個別練習用の調整さんURLが必要です。");
       }
       const personal = await syncChouseisanSchedule(env, "personal", personalUrl, nowMs);
-      lines.push(`・個別練習: ${personal.addedOrUpdated}日を同期（削除${personal.removed}日）`);
-      lines.push(formatCalendarSyncLine("個別", personal.calendarSync));
-      if (personal.conflictCount > 0) {
-        lines.push(`・同日競合: ${personal.conflictCount}日（通常練習を優先して確定）`);
-      }
+      await enqueueAfterHint("personal", personalUrl, personal.snapshot, personal.year);
+      lines.push(buildChouseisanCalendarSyncStartedReply(["personal"]));
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "不明なエラー";
@@ -11326,6 +11693,26 @@ export default {
     });
   },
 
+  async queue(batch: MessageBatch<ChouseisanCalendarSyncJob>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      try {
+        await handleChouseisanCalendarSyncQueueMessage(env, message.body);
+        message.ack();
+      } catch (error) {
+        const errorType = error instanceof Error ? error.name : "unknown";
+        const errorMessage = error instanceof Error ? error.message : "unknown";
+        console.log({
+          stage: "queue_consumer_error",
+          sync_id: message.body?.syncId ?? null,
+          kind: message.body?.kind ?? null,
+          error_type: errorType,
+          error_message: errorMessage
+        });
+        message.retry();
+      }
+    }
+  },
+
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const jstHour = Number(
       new Intl.DateTimeFormat("en-US", {
@@ -11455,6 +11842,14 @@ export const TEST_HOOKS = {
   buildLeadCheckReplyText,
   calculateMonthlyFeeFromRegularSnapshot,
   syncRuiCalendarFromChouseisan,
+  buildChouseisanCalendarSyncJob,
+  applyNormalizedCalendarSyncEntries,
+  enqueueChouseisanCalendarSync,
+  handleChouseisanCalendarSyncQueueMessage,
+  handleChouseisanSyncCommand,
+  isLatestChouseisanCalendarSyncJob,
+  deterministicCalendarEventId,
+  buildChouseisanCalendarSyncStartedReply,
   buildRuiAttendanceSummary,
   normalizeRuiCalendarDays,
   extractChouseisanRootObject,
