@@ -2873,6 +2873,129 @@ window.Chouseisan = {
   assert.equal(ruiMeeting.meeting_place, "プラウド前");
   assert.equal(ruiMeeting.meeting_time, "17:20");
 
+  // 10/3: 本文に集合が無く、配車表本人行由来の 17:20 / 志村家 は残す
+  const oct3DispatchText = [
+    "お疲れ様です。",
+    "10/3（土）18:00〜21:00",
+    "白幡台小練習",
+    "配車の連絡です。",
+    "引率代　片道100円を志村さんにお支払いください",
+    "帰りバス引率が必要になった場合は山田さんです。"
+  ].join("\n");
+  const oct3OwnRow = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-10-03",
+      practice_location: "白幡台小",
+      practice_time: "18:00〜21:00",
+      meeting_time: "17:20",
+      meeting_place: "志村家",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" },
+      return_dropoff_place: "志村家",
+      return_release_place: "志村家"
+    }) as any,
+    oct3DispatchText
+  );
+  assert.equal(oct3OwnRow.meeting_time, "17:20");
+  assert.equal(oct3OwnRow.meeting_place, "志村家");
+  assert.equal(oct3OwnRow.practice_location, "白幡台小");
+  assert.notEqual(oct3OwnRow.meeting_place, "白幡台小");
+  const oct3Readout = hooks.formatStructuredResultForLine(
+    "羽魂練習会",
+    hooks.applyReturnReleaseBusinessRules(oct3OwnRow as any)
+  );
+  assert.match(oct3Readout, /集合：17:20 志村家/);
+  assert.match(oct3Readout, /行き：志村さんの車/);
+  assert.match(oct3Readout, /帰り：志村さんの車/);
+  assert.match(oct3Readout, /解散：志村家/);
+  assert.ok(!oct3Readout.includes("集合：不明"));
+  assert.ok(!/集合：白幡台小/.test(oct3Readout));
+
+  // 別人行の集合だけが本文にある場合は塁へ適用しない
+  const otherRowMeeting = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      practice_date: "2026-10-03",
+      practice_location: "白幡台小",
+      practice_time: "18:00〜21:00",
+      meeting_time: "17:20",
+      meeting_place: "プラウド前",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" },
+      return_release_place: "志村家"
+    }) as any,
+    `${oct3DispatchText}\n花子ちゃんは17:20にプラウド前集合です。`
+  );
+  assert.equal(otherRowMeeting.meeting_time, null);
+  assert.equal(otherRowMeeting.meeting_place, null);
+  assert.ok(
+    !hooks.formatStructuredResultForLine("羽魂練習会", otherRowMeeting as any).includes("プラウド前")
+  );
+
+  // 本文の別人向け指示と、画像本人行の志村家集合が併存しても本人行を採用
+  const ownRowDespiteOtherText = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      practice_date: "2026-10-03",
+      practice_location: "白幡台小",
+      practice_time: "18:00〜21:00",
+      meeting_time: "17:20",
+      meeting_place: "志村家",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" },
+      return_release_place: "志村家"
+    }) as any,
+    `${oct3DispatchText}\n花子ちゃんは17:20にプラウド前集合です。\n太郎くんは真舟号に乗ってください。`
+  );
+  assert.equal(ownRowDespiteOtherText.meeting_time, "17:20");
+  assert.equal(ownRowDespiteOtherText.meeting_place, "志村家");
+  assert.equal(ownRowDespiteOtherText.outbound_transport.person, "志村さん");
+  const ownRowReadout = hooks.formatStructuredResultForLine("羽魂練習会", ownRowDespiteOtherText as any);
+  assert.match(ownRowReadout, /集合：17:20 志村家/);
+  assert.ok(!ownRowReadout.includes("プラウド前"));
+  assert.ok(!ownRowReadout.includes("真舟号"));
+
+  // 白幡台小練習を集合場所にしない
+  const venueNotMeeting = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      practice_date: "2026-10-03",
+      practice_location: null,
+      practice_time: "18:00〜21:00",
+      meeting_time: null,
+      meeting_place: "白幡台小",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" }
+    }) as any,
+    oct3DispatchText
+  );
+  assert.equal(venueNotMeeting.practice_location, "白幡台小");
+  assert.equal(venueNotMeeting.meeting_place, null);
+  assert.ok(!/集合：白幡台小/.test(hooks.formatStructuredResultForLine("羽魂練習会", venueNotMeeting as any)));
+
+  // 本人行に集合が本当に無い通常練習・行きバスは従来の土日fallback
+  const noOwnRowMeeting = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_date: "2026-10-03",
+      practice_location: "白幡台小",
+      practice_time: "18:00〜21:00",
+      meeting_time: null,
+      meeting_place: null,
+      outbound_transport: { type: "バス", person: null },
+      return_transport: { type: "バス", person: null }
+    }) as any,
+    oct3DispatchText
+  );
+  assert.equal(noOwnRowMeeting.meeting_time, null);
+  assert.equal(noOwnRowMeeting.meeting_place, null);
+  assert.equal(
+    hooks.resolveContactMeetingLabel(hooks.toPracticeRowForDisplay(noOwnRowMeeting as any)),
+    "16:55 KSP（または17:20 溝の口南口）"
+  );
+
   // 本人行バスと本文の塁本人向け車指示が矛盾したらneeds_review
   const conflicted = hooks.normalizePracticeLocationAndMeetingFields(
     baseResult({
