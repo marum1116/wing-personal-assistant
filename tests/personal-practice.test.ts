@@ -2873,7 +2873,7 @@ window.Chouseisan = {
   assert.equal(ruiMeeting.meeting_place, "プラウド前");
   assert.equal(ruiMeeting.meeting_time, "17:20");
 
-  // 10/3: 本文に集合が無く、配車表本人行由来の 17:20 / 志村家 は残す
+  // ケースA: 本文に集合が無くても、notesの渡辺塁本人行根拠があれば残す
   const oct3DispatchText = [
     "お疲れ様です。",
     "10/3（土）18:00〜21:00",
@@ -2882,6 +2882,7 @@ window.Chouseisan = {
     "引率代　片道100円を志村さんにお支払いください",
     "帰りバス引率が必要になった場合は山田さんです。"
   ].join("\n");
+  const oct3OwnRowNotes = "渡辺 塁本人行の行き: 車 志村号 17:20 志村家";
   const oct3OwnRow = hooks.normalizePracticeLocationAndMeetingFields(
     baseResult({
       message_kind: "dispatch_confirmed",
@@ -2896,7 +2897,8 @@ window.Chouseisan = {
       outbound_transport: { type: "車", person: "志村さん" },
       return_transport: { type: "車", person: "志村さん" },
       return_dropoff_place: "志村家",
-      return_release_place: "志村家"
+      return_release_place: "志村家",
+      notes: oct3OwnRowNotes
     }) as any,
     oct3DispatchText
   );
@@ -2915,7 +2917,23 @@ window.Chouseisan = {
   assert.ok(!oct3Readout.includes("集合：不明"));
   assert.ok(!/集合：白幡台小/.test(oct3Readout));
 
-  // 別人行の集合だけが本文にある場合は塁へ適用しない
+  // 本文に文字列が無いだけでは残さない
+  const absentWithoutAttribution = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      practice_date: "2026-10-03",
+      practice_location: "白幡台小",
+      meeting_time: "17:20",
+      meeting_place: "志村家",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" },
+      notes: null
+    }) as any,
+    oct3DispatchText
+  );
+  assert.equal(absentWithoutAttribution.meeting_time, null);
+  assert.equal(absentWithoutAttribution.meeting_place, null);
+
+  // ケースB: 別人行の集合を誤ってmeetingへ入れても、本人行根拠が無ければ残さない
   const otherRowMeeting = hooks.normalizePracticeLocationAndMeetingFields(
     baseResult({
       practice_date: "2026-10-03",
@@ -2925,17 +2943,32 @@ window.Chouseisan = {
       meeting_place: "プラウド前",
       outbound_transport: { type: "車", person: "志村さん" },
       return_transport: { type: "車", person: "志村さん" },
-      return_release_place: "志村家"
+      return_release_place: "志村家",
+      notes: "別参加者の行き: 17:20 プラウド前\n渡辺塁本人行の行き: 車 志村号"
     }) as any,
-    `${oct3DispatchText}\n花子ちゃんは17:20にプラウド前集合です。`
+    oct3DispatchText
   );
   assert.equal(otherRowMeeting.meeting_time, null);
   assert.equal(otherRowMeeting.meeting_place, null);
-  assert.ok(
-    !hooks.formatStructuredResultForLine("羽魂練習会", otherRowMeeting as any).includes("プラウド前")
-  );
+  const otherRowReadout = hooks.formatStructuredResultForLine("羽魂練習会", otherRowMeeting as any);
+  assert.ok(!otherRowReadout.includes("プラウド前"));
+  assert.match(otherRowReadout, /集合：不明/);
 
-  // 本文の別人向け指示と、画像本人行の志村家集合が併存しても本人行を採用
+  // 本文の別人向け指示も塁へ適用しない
+  const otherTextMeeting = hooks.normalizePracticeLocationAndMeetingFields(
+    baseResult({
+      practice_date: "2026-10-03",
+      meeting_time: "17:20",
+      meeting_place: "プラウド前",
+      outbound_transport: { type: "車", person: "志村さん" },
+      return_transport: { type: "車", person: "志村さん" }
+    }) as any,
+    `${oct3DispatchText}\n花子ちゃんは17:20にプラウド前集合です。`
+  );
+  assert.equal(otherTextMeeting.meeting_time, null);
+  assert.equal(otherTextMeeting.meeting_place, null);
+
+  // ケースC: 別人行と本人行が同じ画像にあっても、本人行の志村家を採用する
   const ownRowDespiteOtherText = hooks.normalizePracticeLocationAndMeetingFields(
     baseResult({
       practice_date: "2026-10-03",
@@ -2945,7 +2978,8 @@ window.Chouseisan = {
       meeting_place: "志村家",
       outbound_transport: { type: "車", person: "志村さん" },
       return_transport: { type: "車", person: "志村さん" },
-      return_release_place: "志村家"
+      return_release_place: "志村家",
+      notes: "別参加者の行き: 17:20 プラウド前\n渡辺塁本人行の行き: 車 志村号 17:20 志村家"
     }) as any,
     `${oct3DispatchText}\n花子ちゃんは17:20にプラウド前集合です。\n太郎くんは真舟号に乗ってください。`
   );

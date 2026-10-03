@@ -5205,7 +5205,10 @@ function isRuiNameInWindow(windowText: string | null): boolean {
   if (!windowText) {
     return false;
   }
-  return RUI_NAME_RE.test(windowText);
+  if (RUI_NAME_RE.test(windowText)) {
+    return true;
+  }
+  return /渡辺\s*塁/.test(windowText);
 }
 
 function isExplicitVenueMeetingForRui(inputText: string, venue: string): boolean {
@@ -5239,11 +5242,20 @@ function meetingCueVariants(cue: string): string[] {
   return [...variants];
 }
 
+function textLineAt(inputText: string, index: number): string {
+  const start = inputText.lastIndexOf("\n", index - 1) + 1;
+  let end = inputText.indexOf("\n", index);
+  if (end < 0) {
+    end = inputText.length;
+  }
+  return inputText.slice(start, end);
+}
+
 /**
- * 集合cueが本文のどこに属するか。
- * - rui: 渡辺塁近傍
- * - non_rui: 本文にあるが塁向けではない（別人向け個別指示など）
- * - absent: 本文に無い（配車表本人行など画像由来）
+ * 集合cueが本文または配車表根拠（notes）のどこに属するか。
+ * - rui: 同じ行が渡辺塁本人向け
+ * - non_rui: 文字列はあるが本人行ではない
+ * - absent: 本人帰属の根拠が無い
  * - empty: 値なし
  */
 function classifyMeetingCueInText(
@@ -5253,7 +5265,7 @@ function classifyMeetingCueInText(
   if (!isConcreteText(cue)) {
     return "empty";
   }
-  const ruiName = "(?:渡辺塁|渡辺くん|塁くん|ルイくん)";
+  const ruiName = "(?:渡辺\\s*塁|渡辺くん|塁くん|ルイくん)";
   let found = false;
   for (const variant of meetingCueVariants(cue)) {
     let from = 0;
@@ -5263,11 +5275,7 @@ function classifyMeetingCueInText(
         break;
       }
       found = true;
-      const window = inputText.slice(
-        Math.max(0, index - 56),
-        Math.min(inputText.length, index + variant.length + 56)
-      );
-      if (isRuiNameInWindow(window)) {
+      if (isRuiNameInWindow(textLineAt(inputText, index))) {
         return "rui";
       }
       from = index + Math.max(1, variant.length);
@@ -5279,6 +5287,13 @@ function classifyMeetingCueInText(
     }
   }
   return found ? "non_rui" : "absent";
+}
+
+function meetingAttributionText(inputText: string, notes: string | null): string {
+  if (!isConcreteText(notes)) {
+    return inputText;
+  }
+  return `${inputText}\n${notes}`;
 }
 
 function detectRuiExplicitTransportConflict(result: StructuredLineResult, inputText: string): boolean {
@@ -5532,21 +5547,20 @@ function normalizePracticeLocationAndMeetingFields(
     meetingTime = null;
   }
 
-  // 本文に出てくる集合は、渡辺塁本人向けと確認できるものだけ残す。
-  // 本文に無い集合は配車表本人行など画像由来なので消さない。
-  // 同じ時刻が別人向け本文にあっても、集合場所が本文に無いなら本人行の時刻として残す。
+  // 本文、または notes の配車表本人行根拠で、渡辺塁と同じ行に紐づく集合だけ残す。
+  // 本文に文字列が無いだけでは残さない。別人行の誤抽出も残さない。
   if (isConcreteText(meetingPlace) || isConcreteText(meetingTime)) {
-    const placeClass = classifyMeetingCueInText(inputText, meetingPlace);
-    const timeClass = classifyMeetingCueInText(inputText, meetingTime);
+    const attributionText = meetingAttributionText(inputText, result.notes);
+    const placeClass = classifyMeetingCueInText(attributionText, meetingPlace);
+    const timeClass = classifyMeetingCueInText(attributionText, meetingTime);
     const venueMeeting =
       isConcreteText(meetingPlace) &&
       isKnownPracticeVenueName(meetingPlace) &&
       isExplicitVenueMeetingForRui(inputText, canonicalizePracticeLocation(meetingPlace));
-    const placeAnchorsOwnRow = placeClass === "absent" || placeClass === "rui" || venueMeeting;
-    if (placeClass === "non_rui" && !venueMeeting) {
+    if (placeClass !== "rui" && placeClass !== "empty" && !venueMeeting) {
       meetingPlace = null;
     }
-    if (timeClass === "non_rui" && !placeAnchorsOwnRow) {
+    if (timeClass !== "rui" && timeClass !== "empty") {
       meetingTime = null;
     }
   }
@@ -10623,7 +10637,11 @@ async function callOpenAIForStructuredResult(
     "『渡辺 塁』のように姓と名の間に空白があっても本人行です。" +
     "本人行の行きブロックに集合時刻と集合場所（例: 17:20 と 志村家）がある場合、交通手段と同じ本人向け情報として meeting_time と meeting_place に必ず入れてください。" +
     "○○号だけを採用して、同じ行きブロックの集合時刻・集合場所を落とさないでください。" +
-    "本文に集合の記載が無くても、配車表本人行にあれば meeting_time / meeting_place を null にしないでください。" +
+    "配車表本人行から集合を採用した場合は、notes に根拠を本人行と同じ1行で残してください。例: 「渡辺塁本人行の行き: 17:20 志村家」。" +
+    "その行には渡辺塁（空白付きの渡辺 塁でも可）と、採用した集合時刻・集合場所をすべて書いてください。" +
+    "別参加者の集合を書く場合は別行にし、渡辺塁の行へ混ぜないでください。" +
+    "本人行に集合が無い場合は meeting_time と meeting_place を null にし、その根拠行も書かないでください。" +
+    "本文に集合が無いことだけでは meeting を埋めず、本人行に実在する集合だけを入れてください。" +
     "帰りブロックの降車場所を、行きの集合場所の代わりにしないでください。行きブロックの場所を meeting_place に入れてください。" +
     "別参加者の行だけにある集合時刻・集合場所は渡辺塁の meeting_time / meeting_place に入れないでください。" +
     "配車表本人行と、本文の渡辺塁本人向け明示指示が本当に矛盾する場合のみneeds_confirmation=trueとuncertain_pointsへ理由を入れてください。" +
