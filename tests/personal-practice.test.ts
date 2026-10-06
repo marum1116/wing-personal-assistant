@@ -4829,6 +4829,54 @@ window.Chouseisan = {
   assert.equal(busCaseB2Rows[0]?.rule_key, "transport:return:bus");
   assert.equal(busCaseB2Rows[0]?.needs_review, 0);
 
+  const busGuideFromText = (text: string, busGuide: string | null = null) =>
+    hooks.applyReturnBusGuideTextFallback(
+      baseResult({
+        message_kind: "dispatch_confirmed",
+        practice_type: "通常練習",
+        practice_type_basis: "explicit",
+        practice_type_evidence: "通常練習",
+        practice_date: "2026-10-08",
+        attendance: "参加",
+        outbound_transport: { type: "自力", person: null },
+        return_transport: { type: "バス", person: null },
+        bus_guide: busGuide,
+        return_release_place: null
+      }) as any,
+      text
+    );
+
+  const fujitaShared = busGuideFromText(
+    "10/8(木)\n19:00〜21:00\n白幡台小練習\n配車の連絡です。\n\n引率代 片道100円を号車ごとにお支払い下さい。\n\nバス引率、見守り藤田です。"
+  );
+  assert.equal(fujitaShared.bus_guide, "藤田さん");
+  const fujitaPaid = hooks.applyStandingPaymentRules(fujitaShared as any);
+  assert.equal(fujitaPaid.result.payments[0]?.type, "バス引率代");
+  assert.equal(fujitaPaid.result.payments[0]?.amount, 100);
+  assert.equal(fujitaPaid.result.payments[0]?.payee, "藤田さん");
+  const fujitaReadout = hooks.formatStructuredResultForLine(
+    "羽魂練習会",
+    hooks.applyReturnReleaseBusinessRules(fujitaPaid.result as any)
+  );
+  assert.match(fujitaReadout, /帰り：バス/);
+  assert.match(fujitaReadout, /バス引率：藤田さん/);
+  assert.match(fujitaReadout, /解散：溝の口南口/);
+  assert.match(fujitaReadout, /バス引率代（100円、支払先：藤田さん）/);
+  assert.ok(!fujitaReadout.includes("引率者が特定できない"));
+  assert.ok(!fujitaReadout.includes("確認必要"));
+
+  assert.equal(busGuideFromText("バス引率は藤田です。").bus_guide, "藤田さん");
+  assert.equal(busGuideFromText("帰りバス引率は山田さんです。").bus_guide, "山田さん");
+  assert.equal(busGuideFromText("バス引率藤田、見守り山田です。").bus_guide, "藤田さん");
+  assert.equal(busGuideFromText("見守り藤田です。").bus_guide, null);
+  assert.equal(busGuideFromText("花子ちゃんのバス引率は山田です。").bus_guide, null);
+  assert.equal(busGuideFromText("太郎くんはバス引率藤田です。").bus_guide, null);
+  const releaseOnly = hooks.applyReturnReleaseBusinessRules(
+    busGuideFromText("見守り藤田です。") as any
+  );
+  assert.equal(releaseOnly.return_release_place, "溝の口南口");
+  assert.equal(releaseOnly.bus_guide, null);
+
   // Bus Allowance Case C: 2名引率だが役割不明なら支払先null + needs_reviewで残す
   await hooks.saveStructuredResultToD1(
     env,

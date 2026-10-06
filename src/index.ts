@@ -4333,13 +4333,85 @@ function splitGuideNames(raw: string | null): string[] {
     .filter((name) => name.length > 0 && name !== "不明");
 }
 
+function normalizeBusGuidePerson(raw: string): string | null {
+  const compact = raw.trim().replace(/さん$/u, "").replace(/です$/u, "");
+  if (!/^[一-龯ぁ-んァ-ヶー]{1,8}$/u.test(compact)) {
+    return null;
+  }
+  if (/^(バス|引率|見守り|帰り|復路|代|片道|必要|場合|不明|です)$/u.test(compact)) {
+    return null;
+  }
+  return `${compact}さん`;
+}
+
+function isOtherChildBusGuideClause(clause: string): boolean {
+  if (isRuiNameInWindow(clause)) {
+    return false;
+  }
+  return /(?:くん|ちゃん)/u.test(clause);
+}
+
+function addBusGuidePerson(names: string[], raw: string | undefined): void {
+  const name = raw ? normalizeBusGuidePerson(raw) : null;
+  if (name && !names.includes(name)) {
+    names.push(name);
+  }
+}
+
+/**
+ * 「バス引率」という役割に対応する人だけを取る。
+ * 見守りだけの名前、別人向けの指定は入れない。
+ */
+function extractBusGuideNamesBoundToRole(inputText: string): string[] {
+  const names: string[] = [];
+  for (const clause of inputText.split(/[。．\n]/u)) {
+    if (!clause.includes("バス引率")) {
+      continue;
+    }
+    if (isOtherChildBusGuideClause(clause)) {
+      continue;
+    }
+
+    const shared = clause.match(
+      /((?:バス引率|見守り)(?:[、,]\s*(?:バス引率|見守り))+)\s*([一-龯ぁ-んァ-ヶー]{1,8})(?:さん)?です/u
+    );
+    if (shared?.[1]?.includes("バス引率") && shared[2]) {
+      addBusGuidePerson(names, shared[2]);
+      continue;
+    }
+
+    const assigned = clause.match(/バス引率(?!代)(?:は|:|：)\s*([^。\n]+)/u);
+    if (assigned?.[1]) {
+      const chunk = assigned[1].replace(/です.*$/u, "");
+      for (const part of chunk.split(/[、,・/／\s]+/u)) {
+        addBusGuidePerson(names, part);
+      }
+      continue;
+    }
+
+    const stuck = clause.match(/バス引率(?!代)\s*([一-龯ぁ-んァ-ヶー]{1,8})(?:さん)?/u);
+    if (stuck?.[1]) {
+      addBusGuidePerson(names, stuck[1]);
+    }
+  }
+  return names;
+}
+
 function extractReturnBusGuideFromText(inputText: string): string[] {
   const sentenceMatch = inputText.match(/(?:帰り|復路)[^。\n]*引率(?:は|:|：)?\s*([^。\n]+)/);
   if (sentenceMatch && sentenceMatch[1]) {
-    return sentenceMatch[1]
+    const legacyNames = sentenceMatch[1]
       .split(/[、,・/／\s]+/)
       .map((name) => name.trim())
       .filter((name) => name.length > 0 && name !== "不明" && /さん$/.test(name));
+    if (legacyNames.length > 0) {
+      return legacyNames;
+    }
+  }
+
+  const boundToRole = extractBusGuideNamesBoundToRole(inputText);
+  if (boundToRole.length > 0) {
+    return boundToRole;
   }
 
   const roleHintNames: string[] = [];
@@ -10666,6 +10738,8 @@ async function callOpenAIForStructuredResult(
     "そのような全体向け条件情報は必要ならnotesへ記載し、本人に適用されない条件付き支払い・引率に関する不明点をuncertain_pointsへ追加しないでください。" +
     "dispatch_candidateでは『車出し可能』『引率可能』を本人確定配車として扱わないでください。" +
     "『帰りバス引率は藤田さん』等の一般情報だけで本人のreturn_transportを確定しないでください。" +
+    "『バス引率、見守り藤田です』『バス引率は藤田です』『バス引率藤田、見守り山田です』のように、バス引率という役割に対応する人をbus_guideへ入れてください。姓だけの『藤田です』は藤田さんとして扱ってください。" +
+    "見守りだけの名前はbus_guideに入れないでください。別人向けのバス引率指定もbus_guideに入れないでください。" +
     "『100円』という金額だけで見守り代や他のpayment_typeを推測しないでください。見守り代は『見守り代』と明記がある場合のみ抽出してください。" +
     "monthly_chargesは必須配列です。実際に支払う具体的な月次請求（対象月と金額が確定）でない限り必ず空配列にしてください。" +
     "一般料金ルール（単価説明・毎月の一般規則）だけではmonthly_chargesを作らないでください。" +
