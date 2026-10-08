@@ -14,7 +14,7 @@ import { resolve } from "node:path";
 
 const EXCEL_URL =
   process.env.EXCEL_URL ??
-  "https://1drv.ms/x/c/9bd7af7f5c25ad41/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc?e=sfvpfA";
+  "https://onedrive.live.com/:x:/g/personal/9BD7AF7F5C25AD41/IQAkWwmfLgFuT6hubXFEMGY_AU5v3uZy-bXHxjaW1QcF-7w?resid=9BD7AF7F5C25AD41!s9f095b24012e4f6ea86e6d714430663f&ithint=file%2Cxlsx&migratedtospo=true&redeem=aHR0cHM6Ly8xZHJ2Lm1zL3gvYy85YmQ3YWY3ZjVjMjVhZDQxL0lRQWtXd21mTGdGdVQ2aHViWEZFTUdZX0FVNXYzdVp5LWJYSHhqYVcxUWNGLTd3";
 
 const IMAGE_PATH = resolve(process.cwd(), "assets/rich-menu-wing.png");
 const WIDTH = 2500;

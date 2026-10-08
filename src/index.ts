@@ -33,7 +33,7 @@ const LEAD_CHECK_COMMAND = "引率チェック";
 const REGULAR_CHOUSEISAN_URL_COMMAND = "通常調整さん";
 const PERSONAL_CHOUSEISAN_URL_COMMAND = "個人調整さん";
 const DEFAULT_EXCEL_URL =
-  "https://1drv.ms/x/c/9bd7af7f5c25ad41/IQAoLXgc3XNZRIWLZqFtLG1wAWcDwuWjaLfUjLdPrZ1h2zc?e=sfvpfA";
+  "https://onedrive.live.com/:x:/g/personal/9BD7AF7F5C25AD41/IQAkWwmfLgFuT6hubXFEMGY_AU5v3uZy-bXHxjaW1QcF-7w?resid=9BD7AF7F5C25AD41!s9f095b24012e4f6ea86e6d714430663f&ithint=file%2Cxlsx&migratedtospo=true&redeem=aHR0cHM6Ly8xZHJ2Lm1zL3gvYy85YmQ3YWY3ZjVjMjVhZDQxL0lRQWtXd21mTGdGdVQ2aHViWEZFTUdZX0FVNXYzdVp5LWJYSHhqYVcxUWNGLTd3";
 const WING_EVENT_TITLE = "wing練習";
 const WING_EVENT_MARKED_TITLE = "◯wing練習";
 const WING_EVENT_TENTATIVE_TITLE = "仮）wing練習";
