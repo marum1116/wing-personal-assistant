@@ -5819,6 +5819,44 @@ window.Chouseisan = {
   ).first<{ count: number }>();
   assert.equal(notRuiCount?.count, 0);
 
+  const concatenated = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({
+      practice_date: "2026-10-13",
+      start_time: "18:00",
+      end_time: "21:00",
+      practice_location: "永谷地区センター",
+      participant_names: ["濱田渡辺西坂"],
+      meeting_time: "18:00",
+      meeting_place: null
+    }) as any
+  );
+  assert.equal(concatenated.action, "saved");
+  if (concatenated.action === "saved") {
+    assert.deepEqual(concatenated.record.participant_names, ["濱田", "渡辺", "西坂"]);
+    assert.equal(concatenated.record.coordinator_name, "濱田");
+    assert.equal(concatenated.record.rui_participates, true);
+    assert.equal(concatenated.record.watanabe_is_coordinator, false);
+  }
+  const alreadySplit = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({ participant_names: ["濱田", "渡辺", "西坂"] }) as any
+  );
+  assert.equal(alreadySplit.action, "saved");
+  if (alreadySplit.action === "saved") {
+    assert.deepEqual(alreadySplit.record.participant_names, ["濱田", "渡辺", "西坂"]);
+  }
+  const unsplittable = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({ participant_names: ["濱田渡辺不明"] }) as any
+  );
+  assert.equal(unsplittable.action, "skipped_not_rui");
+  const keptGivenName = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({ participant_names: ["渡辺 塁"] }) as any
+  );
+  assert.equal(keptGivenName.action, "saved");
+  if (keptGivenName.action === "saved") {
+    assert.deepEqual(keptGivenName.record.participant_names, ["渡辺 塁"]);
+    assert.equal(keptGivenName.record.watanabe_is_coordinator, true);
+  }
+
   const twoSlots = await hooks.applyYahooPersonalCalendarSlots(yahooEnv.env, [
     yahooDraft({
       practice_date: "2026-10-10",

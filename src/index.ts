@@ -1663,6 +1663,68 @@ function isRuiYahooCalendarParticipantName(name: string): boolean {
   return normalized === "渡辺" || normalized === "渡辺塁";
 }
 
+const YAHOO_PERSONAL_CALENDAR_SURNAMES = [
+  "濱田",
+  "渡辺",
+  "西坂",
+  "重松",
+  "山田",
+  "藤田",
+  "佐藤",
+  "村中",
+  "真船",
+  "吉村",
+  "遠山",
+  "平林",
+  "立脇",
+  "神邊",
+  "中村",
+  "尾林",
+  "近藤",
+  "丹下"
+];
+
+function segmentConcatenatedPersonalSurnames(token: string): string[] | null {
+  const normalized = normalizeParticipantName(token);
+  const matches: string[][] = [];
+  const walk = (index: number, path: string[]): void => {
+    if (matches.length > 1) {
+      return;
+    }
+    if (index === normalized.length) {
+      matches.push([...path]);
+      return;
+    }
+    for (const surname of YAHOO_PERSONAL_CALENDAR_SURNAMES) {
+      if (normalized.startsWith(surname, index)) {
+        path.push(surname);
+        walk(index + surname.length, path);
+        path.pop();
+      }
+    }
+  };
+  walk(0, []);
+  if (matches.length !== 1 || !matches[0] || matches[0].length < 2) {
+    return null;
+  }
+  return matches[0];
+}
+
+function expandYahooPersonalParticipantNames(names: string[]): string[] {
+  const expanded: string[] = [];
+  for (const name of names) {
+    const pieces = name
+      .split(/[、,，・/]+/u)
+      .map((piece) => piece.trim())
+      .filter((piece) => piece.length > 0);
+    for (const piece of pieces) {
+      const segmented = segmentConcatenatedPersonalSurnames(piece);
+      expanded.push(...(segmented ?? [piece]));
+    }
+  }
+  return expanded;
+}
+
 function parseAttendMarks(
   member: { attend: string | null; kouho: Array<number | string> | null },
   choiceCount: number
@@ -11578,7 +11640,7 @@ function classifyYahooPersonalCalendarSlot(draft: YahooPersonalCalendarSlotDraft
       end_time: endTime
     };
   }
-  const names = draft.participant_names.map((name) => name.trim());
+  const names = expandYahooPersonalParticipantNames(draft.participant_names);
   if (names.length === 0 || names.some((name) => name.length === 0)) {
     return {
       action: "needs_confirmation",
@@ -11758,7 +11820,8 @@ async function callOpenAIForYahooPersonalCalendar(
     "あなたはYahoo共有カレンダーのスクリーンショットから、確定した個人練習の枠を抽出する係です。必ずJSON Schemaに従うJSONだけを返してください。" +
     "画像はYahoo個人練習カレンダーです。日ごとにまとめず、画像に写っている練習枠を1件ずつslotsへ入れてください。" +
     "同じ日の午前と午後は別slotです。1件にmergeしないでください。" +
-    "participant_namesは画像上の表示順のままの配列です。並べ替え、重複削除、推測による追加をしないでください。先頭が取りまとめ担当です。" +
+    "participant_namesは画像上の表示順のままの配列です。並べ替えや推測による追加はしないでください。先頭が取りまとめ担当です。" +
+    "タイトルや参加者欄が『濱田渡辺西坂』のように姓の連結になっているときは、姓ごとに分けてください。" +
     "practice_dateは画像から年を含めて確定できるときだけYYYY-MM-DDです。確定できなければnullです。" +
     "start_timeとend_timeは練習の開始・終了です。集合時刻ではありません。HH:MMで、確定できなければnullです。時刻を補完しないでください。" +
     "meeting_timeは集合時刻です。練習開始時刻と混同しないでください。書かれていなければnullです。" +
