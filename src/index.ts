@@ -10,8 +10,16 @@ import {
   resolveSupplementSlot,
   shouldRoutePersonalSlotSupplement,
   type PersonalSlotContextRecord,
-  type PersonalSlotParticipantRow
+  type PersonalSlotParticipantRow,
+  type SlotFeeOverrideInput
 } from "./personal-slot-supplement";
+import {
+  calculatePersonalPracticeFee,
+  selectPersonalPracticeFeeTemplate,
+  type PersonalPracticeFeeResult,
+  type PersonalPracticeFeeTemplate,
+  type PersonalPracticeFeeVariant
+} from "./personal-practice-fee";
 
 interface Env {
   LINE_CHANNEL_SECRET: string;
@@ -11694,7 +11702,7 @@ async function upsertPersonalConfirmedSlot(env: Env, record: YahooConfirmedSlotR
     .bind(record.practice_date, record.start_time)
     .first<{ id: number }>();
   if (saved) {
-    await syncPersonalSlotParticipantDefaults(env, saved.id, record.participant_names, nowIso);
+    await syncPersonalSlotParticipantDefaults(env, saved.id, record.participant_names, nowIso, record.meeting_place);
   }
 }
 
@@ -11819,7 +11827,8 @@ async function syncPersonalSlotParticipantDefaults(
   env: Env,
   slotId: number,
   names: string[],
-  nowIso: string
+  nowIso: string,
+  meetingPlace: string | null
 ): Promise<void> {
   const existingRows = await env.DB.prepare(
     `SELECT participant_order, participant_name, outbound_transport, outbound_source,
@@ -11830,7 +11839,7 @@ async function syncPersonalSlotParticipantDefaults(
   )
     .bind(slotId)
     .all<PersonalSlotParticipantRow>();
-  const rebuilt = rebuildParticipantsPreservingExplicit(names, existingRows.results ?? [], slotId, nowIso);
+  const rebuilt = rebuildParticipantsPreservingExplicit(names, existingRows.results ?? [], slotId, nowIso, meetingPlace);
   await env.DB.prepare(`DELETE FROM personal_confirmed_slot_participants WHERE slot_id = ?1`).bind(slotId).run();
   for (const row of rebuilt) {
     await env.DB.prepare(
@@ -11886,13 +11895,22 @@ async function loadPersonalSlotContext(env: Env, userId: string, nowMs: number):
   }
 }
 
-async function listRuiPersonalSlots(env: Env): Promise<Array<{ id: number; practice_date: string; start_time: string; end_time: string | null; practice_location: string | null }>> {
+async function listRuiPersonalSlots(
+  env: Env
+): Promise<Array<{ id: number; practice_date: string; start_time: string; end_time: string | null; practice_location: string | null; meeting_place: string | null }>> {
   const rows = await env.DB.prepare(
-    `SELECT id, practice_date, start_time, end_time, practice_location
+    `SELECT id, practice_date, start_time, end_time, practice_location, meeting_place
      FROM personal_confirmed_slots
      WHERE rui_participates = 1
      ORDER BY practice_date, start_time`
-  ).all<{ id: number; practice_date: string; start_time: string; end_time: string | null; practice_location: string | null }>();
+  ).all<{
+    id: number;
+    practice_date: string;
+    start_time: string;
+    end_time: string | null;
+    practice_location: string | null;
+    meeting_place: string | null;
+  }>();
   return rows.results ?? [];
 }
 
@@ -11942,7 +11960,16 @@ async function applyParsedPersonalSlotSupplement(
     return { status: "needs_confirmation", message: merged.message };
   }
   const nowIso = new Date(nowMs).toISOString();
-  for (const row of merged.rows) {
+  const slotRow = slots.find((slot) => slot.id === slotId);
+  const meetingPlace = interpreted.meeting_place ?? slotRow?.meeting_place ?? null;
+  const rebuilt = rebuildParticipantsPreservingExplicit(
+    merged.rows.map((row) => row.participant_name),
+    merged.rows,
+    slotId,
+    nowIso,
+    meetingPlace
+  );
+  for (const row of rebuilt) {
     await env.DB.prepare(
       `UPDATE personal_confirmed_slot_participants
        SET outbound_transport = ?1,
@@ -11967,6 +11994,21 @@ async function applyParsedPersonalSlotSupplement(
       )
       .run();
   }
+  for (const feeOverride of interpreted.fee_overrides) {
+    await env.DB.prepare(
+      `INSERT INTO personal_confirmed_slot_fee_overrides (
+        slot_id, fee_type, mode, amount, note, source, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, 'explicit_user_supplement', ?6)
+      ON CONFLICT(slot_id, fee_type) DO UPDATE SET
+        mode = excluded.mode,
+        amount = excluded.amount,
+        note = excluded.note,
+        source = excluded.source,
+        updated_at = excluded.updated_at`
+    )
+      .bind(slotId, feeOverride.fee_type, feeOverride.mode, feeOverride.amount, feeOverride.note, nowIso)
+      .run();
+  }
   if (interpreted.meeting_place || interpreted.court_or_area || interpreted.deferred_fee_note) {
     await env.DB.prepare(
       `UPDATE personal_confirmed_slots
@@ -11979,14 +12021,14 @@ async function applyParsedPersonalSlotSupplement(
       .bind(interpreted.meeting_place, interpreted.court_or_area, interpreted.deferred_fee_note, nowIso, slotId)
       .run();
   }
-  const slotRow = slots.find((slot) => slot.id === slotId);
+  const feeLines = interpreted.fee_overrides.map((feeOverride) => formatSlotFeeOverrideLine(feeOverride));
   return {
     status: "applied",
-    message: formatPersonalSupplementReply(
+    message: [formatPersonalSupplementReply(
       formatYahooSlotWhenLabel(target.slot.practice_date, target.slot.start_time, slotRow?.end_time ?? null),
       slotRow?.practice_location ?? null,
-      merged.rows
-    )
+      rebuilt
+    ), ...feeLines].filter((line) => line.length > 0).join("\n")
   };
 }
 
@@ -12697,10 +12739,91 @@ function selectPersonalSlotReminders(
   return { coordinatorSlots, paymentSlots, endTimeUnknownSlotIds };
 }
 
+function formatSlotFeeOverrideLine(feeOverride: SlotFeeOverrideInput): string {
+  if (feeOverride.fee_type === "highway_fee" && feeOverride.mode === "no_charge") {
+    return "高速代：なし（明示）";
+  }
+  if (feeOverride.fee_type === "facility_fee" && feeOverride.mode === "fixed_amount" && typeof feeOverride.amount === "number") {
+    return `施設費：${formatYen(feeOverride.amount)}（明示）`;
+  }
+  if (feeOverride.fee_type === "facility_fee" && feeOverride.mode === "deferred") {
+    return "施設費：後日精算（明示）";
+  }
+  if (feeOverride.fee_type === "parking_fee" && feeOverride.mode === "fixed_amount" && typeof feeOverride.amount === "number") {
+    return `コインパーキング：${formatYen(feeOverride.amount)}（明示）`;
+  }
+  if (feeOverride.fee_type === "instruction_multiplier" && typeof feeOverride.amount === "number") {
+    return `指導料：${feeOverride.amount}コマ（明示）`;
+  }
+  return "";
+}
+
+function formatResolvedFeeLines(result: PersonalPracticeFeeResult): string[] {
+  const lines: string[] = [];
+  for (const item of result.items) {
+    if (item.status === "deferred") {
+      continue;
+    }
+    if (item.status === "no_charge") {
+      if (item.origin === "override") {
+        lines.push(`${item.label}：なし`);
+      }
+      continue;
+    }
+    if (item.status === "amount" && typeof item.amount === "number") {
+      if (item.amount === 0 && item.fee_type !== "facility_fee") {
+        continue;
+      }
+      lines.push(`${item.label}：${item.amount === 0 ? "無料" : formatYen(item.amount)}`);
+    }
+  }
+  return lines;
+}
+
+async function loadPersonalPracticeFeeCalculation(
+  env: Env,
+  slot: PersonalSlotReminderRow,
+  participantRows: PersonalSlotParticipantRow[]
+): Promise<PersonalPracticeFeeResult> {
+  const templates = await env.DB.prepare(
+    `SELECT id, facility_key, facility_name, version, is_active, valid_from,
+            instruction_fee_per_person, escort_fee_per_shimura_direction,
+            facility_fee_mode, facility_fee_amount, highway_fee_mode, highway_fee_round_trip,
+            parking_fee_mode, parking_fee_amount, deferred_note, blocks_completion_note
+     FROM personal_practice_fee_templates`
+  ).all<PersonalPracticeFeeTemplate>();
+  const variants = await env.DB.prepare(
+    `SELECT template_id, variant_key, amount FROM personal_practice_fee_template_variants`
+  ).all<PersonalPracticeFeeVariant>();
+  const overrides = await env.DB.prepare(
+    `SELECT fee_type, mode, amount, note
+     FROM personal_confirmed_slot_fee_overrides
+     WHERE slot_id = ?1`
+  )
+    .bind(slot.id)
+    .all<SlotFeeOverrideInput>();
+  return calculatePersonalPracticeFee({
+    slot: {
+      practice_date: slot.practice_date,
+      start_time: slot.start_time,
+      end_time: slot.end_time,
+      practice_location: slot.practice_location,
+      meeting_place: slot.meeting_place,
+      court_or_area: slot.court_or_area,
+      participant_names: parseSlotParticipantNames(slot.participant_names_json)
+    },
+    participants: participantRows,
+    templates: templates.results ?? [],
+    variants: variants.results ?? [],
+    overrides: overrides.results ?? []
+  });
+}
+
 function formatCoordinatorReminder(
   slot: PersonalSlotReminderRow,
   fee: PersonalSlotFeeLink,
-  participantRows: PersonalSlotParticipantRow[] = []
+  participantRows: PersonalSlotParticipantRow[] = [],
+  calculation?: PersonalPracticeFeeResult
 ): string {
   const participants = parseSlotParticipantNames(slot.participant_names_json);
   const when = formatYahooSlotWhenLabel(slot.practice_date, slot.start_time, slot.end_time);
@@ -12740,19 +12863,15 @@ function formatCoordinatorReminder(
       }
     }
   }
-  const missing = [
-    ...(fee.kind === "amount" ? [] : ["参加費の確定金額"]),
-    ...(transportKnown ? [] : ["参加者ごとの交通手段"]),
-    "引率代",
-    "施設費",
-    "高速代",
-    ...(slot.court_or_area ? [] : ["使用コート面"]),
-    "志村さんへ渡す現金の総額"
-  ];
-  const nakagawaraNote = isNakagawaraSupportSchool(slot.practice_location)
-    ? "※設備費等は後日精算となります。"
-    : null;
-  if (fee.kind === "amount" && slot.practice_location && meeting && slot.meeting_time && slot.meeting_place) {
+  const feeReady =
+    calculation?.status === "complete" &&
+    calculation.total_amount !== null &&
+    calculation.per_person_amount !== null &&
+    Boolean(slot.practice_location) &&
+    Boolean(meeting);
+  const deferredNote = calculation?.deferred_note ?? (isNakagawaraSupportSchool(slot.practice_location) ? "※設備費等は後日精算となります。" : null);
+  if (calculation && feeReady && calculation.total_amount !== null && calculation.per_person_amount !== null) {
+    const breakdown = formatResolvedFeeLines(calculation);
     lines.push(
       "",
       "【個別練習LINEへ送る文章】",
@@ -12761,29 +12880,94 @@ function formatCoordinatorReminder(
       "",
       `【${slot.practice_location}】${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
       "",
-      `⏰${slot.meeting_place}${formatYahooClockForLine(slot.meeting_time)}集合`,
+      `⏰${slot.meeting_place}${formatYahooClockForLine(slot.meeting_time ?? "")}集合`,
       "",
-      `参加費：${formatYen(fee.amount)}`,
+      ...breakdown,
+      `合計：${formatYen(calculation.total_amount)}`,
+      `1人あたり：${formatYen(calculation.per_person_amount)}`,
       "",
       "当日、渡辺まどかまでPayPayにてお支払いをお願いいたします。",
-      ...(nakagawaraNote ? ["", nakagawaraNote] : [])
+      ...(deferredNote ? ["", deferredNote] : [])
+    );
+    lines.push(
+      "",
+      "【封筒に書く内容】",
+      "",
+      `日付：${dateShort}`,
+      `参加者：${participants.join("、")}`,
+      "",
+      "＜案内内容＞",
+      `${place} ${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+      `集合 ${meeting}`,
+      ...breakdown,
+      `合計：${formatYen(calculation.total_amount)}`,
+      `1人あたり：${formatYen(calculation.per_person_amount)}`,
+      `志村さんへ渡す現金：${formatYen(calculation.total_amount)}`,
+      ...(deferredNote ? [deferredNote] : [])
+    );
+  } else if (calculation) {
+    const breakdown = formatResolvedFeeLines(calculation);
+    if (breakdown.length > 0) {
+      lines.push("", "確定できている費用：", ...breakdown);
+    }
+    const points = calculation.uncertain_points.length > 0 ? calculation.uncertain_points : ["参加費"];
+    lines.push("", "【確認が必要】", "", ...points.map((item) => `・${item}`), "", "上記が確定するまで、完成した金額は出しません。");
+    lines.push(
+      "",
+      "【封筒に書く内容】",
+      "",
+      `日付：${dateShort}`,
+      `参加者：${participants.join("、")}`,
+      "",
+      "＜案内内容＞",
+      `${place} ${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+      meeting ? `集合 ${meeting}` : "集合：不明",
+      "現金：確認が必要",
+      ...(deferredNote ? [deferredNote] : [])
+    );
+  } else {
+    const missing = [
+      ...(fee.kind === "amount" ? [] : ["参加費の確定金額"]),
+      ...(transportKnown ? [] : ["参加者ごとの交通手段"]),
+      "引率代",
+      "施設費",
+      "高速代",
+      ...(slot.court_or_area ? [] : ["使用コート面"]),
+      "志村さんへ渡す現金の総額"
+    ];
+    if (fee.kind === "amount" && slot.practice_location && meeting && slot.meeting_time && slot.meeting_place) {
+      lines.push(
+        "",
+        "【個別練習LINEへ送る文章】",
+        "",
+        `${dateWithWeekday}個別練習参加費のご案内です。`,
+        "",
+        `【${slot.practice_location}】${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+        "",
+        `⏰${slot.meeting_place}${formatYahooClockForLine(slot.meeting_time)}集合`,
+        "",
+        `参加費：${formatYen(fee.amount)}`,
+        "",
+        "当日、渡辺まどかまでPayPayにてお支払いをお願いいたします。",
+        ...(deferredNote ? ["", deferredNote] : [])
+      );
+    }
+    lines.push("", "【案内作成に確認が必要です】", "", ...missing.map((item) => `・${item}`), "", "上記を確認後、案内を完成してください。");
+    lines.push(
+      "",
+      "【封筒に書く内容】",
+      "",
+      `日付：${dateShort}`,
+      `参加者：${participants.join("、")}`,
+      "",
+      "＜案内内容＞",
+      `${place} ${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+      meeting ? `集合 ${meeting}` : "集合：不明",
+      fee.kind === "amount" ? `参加費（1人分の記録）：${formatYen(fee.amount)}` : "参加費：確認が必要",
+      "現金：確認が必要",
+      ...(deferredNote ? [deferredNote] : [])
     );
   }
-  lines.push("", "【案内作成に確認が必要です】", "", ...missing.map((item) => `・${item}`), "", "上記を確認後、案内を完成してください。");
-  lines.push(
-    "",
-    "【封筒に書く内容】",
-    "",
-    `日付：${dateShort}`,
-    `参加者：${participants.join("、")}`,
-    "",
-    "＜案内内容＞",
-    `${place} ${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
-    meeting ? `集合 ${meeting}` : "集合：不明",
-    fee.kind === "amount" ? `参加費（1人分の記録）：${formatYen(fee.amount)}` : "参加費：確認が必要",
-    "現金：確認が必要",
-    ...(nakagawaraNote ? [nakagawaraNote] : [])
-  );
   lines.push(
     "",
     "【当日の準備】",
@@ -12898,9 +13082,10 @@ async function handlePersonalSlotReminderScheduled(
   for (const slot of plan.coordinatorSlots) {
     const fee = resolvePersonalSlotFeeLink(slot.practice_date, slots, payments);
     const participantRows = await loadSlotParticipants(env, slot.id);
+    const calculation = await loadPersonalPracticeFeeCalculation(env, slot, participantRows);
     const status = await push(
       ownerLineUserId,
-      [{ type: "text", text: formatCoordinatorReminder(slot, fee.kind === "paid" ? { kind: "unknown" } : fee, participantRows) }],
+      [{ type: "text", text: formatCoordinatorReminder(slot, fee.kind === "paid" ? { kind: "unknown" } : fee, participantRows, calculation) }],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
     if (typeof status !== "number") {
@@ -13181,5 +13366,8 @@ export const TEST_HOOKS = {
   mergeParticipantOverrides,
   rebuildParticipantsPreservingExplicit,
   applyParsedPersonalSlotSupplement,
+  calculatePersonalPracticeFee,
+  selectPersonalPracticeFeeTemplate,
+  loadPersonalPracticeFeeCalculation,
   getActiveMonthlyFeeRule
 };

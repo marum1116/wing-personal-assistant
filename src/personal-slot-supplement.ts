@@ -14,7 +14,25 @@ export type PersonalTransport =
 export type PersonalTransportSource =
   | "default_personal_practice"
   | "explicit_user_supplement"
-  | "unresolved_multi_participant";
+  | "unresolved_multi_participant"
+  | "unresolved_nonstandard_meeting";
+
+export type SlotFeeType =
+  | "instruction_fee"
+  | "facility_fee"
+  | "highway_fee"
+  | "escort_fee"
+  | "parking_fee"
+  | "instruction_multiplier";
+
+export type SlotFeeOverrideMode = "fixed_amount" | "no_charge" | "deferred" | "needs_confirmation";
+
+export type SlotFeeOverrideInput = {
+  fee_type: SlotFeeType;
+  mode: SlotFeeOverrideMode;
+  amount: number | null;
+  note: string | null;
+};
 
 export type PersonalSlotParticipantRow = {
   id?: number;
@@ -64,6 +82,7 @@ export type PersonalSupplementInterpretation =
       meeting_place: string | null;
       court_or_area: string | null;
       deferred_fee_note: string | null;
+      fee_overrides: SlotFeeOverrideInput[];
     };
 
 const NICKNAME_GROUPS: string[][] = [
@@ -83,10 +102,21 @@ export function defaultTransportForParticipantCount(count: number): {
   transport: PersonalTransport;
   source: PersonalTransportSource;
 } {
-  if (count >= 1 && count <= 3) {
-    return { transport: "shimura_car", source: "default_personal_practice" };
+  return defaultTransportForParticipant(count, null, "outbound");
+}
+
+export function defaultTransportForParticipant(
+  count: number,
+  meetingPlace: string | null,
+  direction: "outbound" | "return"
+): { transport: PersonalTransport; source: PersonalTransportSource } {
+  if (count >= 4 || count < 1) {
+    return { transport: "unknown", source: "unresolved_multi_participant" };
   }
-  return { transport: "unknown", source: "unresolved_multi_participant" };
+  if (direction === "outbound" && meetingPlace && meetingPlace !== "志村家前") {
+    return { transport: "unknown", source: "unresolved_nonstandard_meeting" };
+  }
+  return { transport: "shimura_car", source: "default_personal_practice" };
 }
 
 export function shouldRoutePersonalSlotSupplement(inputText: string, hasRecentSlotContext: boolean): boolean {
@@ -97,7 +127,10 @@ export function shouldRoutePersonalSlotSupplement(inputText: string, hasRecentSl
   if (!hasRecentSlotContext) {
     return false;
   }
-  const strongCue = /自転車|志村号|志村さん|送迎|往復|現地集合|引率代|精算|個人練|個人練習|[ABCabcＡＢＣ]面|母が送|母送迎|母が送り/.test(text);
+  const strongCue =
+    /自転車|志村号|志村さん|送迎|往復|現地集合|引率代|精算|個人練|個人練習|[ABCabcＡＢＣ1-9１-９]面|母が送|母送迎|母が送り|施設費|設備費|高速|コインパ/.test(
+      text
+    );
   const namedDirection = /行き|帰り/.test(text) && /塁|ルイ|センタ|千太|ケンタ|渡辺|重松|山田|藤田|佐藤|村中/.test(text);
   return strongCue || namedDirection;
 }
@@ -203,6 +236,7 @@ export function interpretPersonalPracticeSupplement(
   let meetingPlace: string | null = null;
   let court: string | null = null;
   let deferred: string | null = null;
+  const feeOverrides: SlotFeeOverrideInput[] = [];
   const clauses = text
     .split(/[。．\n]/)
     .flatMap((part) => part.split("、"))
@@ -239,8 +273,48 @@ export function interpretPersonalPracticeSupplement(
       meetingPlace = "現地";
       continue;
     }
+    if (/(施設費|設備費|高速|コインパ)/.test(clause) && /(高い|少し)/.test(clause)) {
+      return {
+        status: "needs_confirmation",
+        message: "《確認が必要》\n\n金額が特定できないため、料金には反映しません。"
+      };
+    }
+    const facilityAmount = /(?:施設費|設備費)(?:は|が)?\s*(\d{1,6})\s*円/.exec(clause);
+    if (facilityAmount?.[1]) {
+      feeOverrides.push({
+        fee_type: "facility_fee",
+        mode: "fixed_amount",
+        amount: Number(facilityAmount[1]),
+        note: null
+      });
+      continue;
+    }
+    const parkingAmount = /(?:コインパーキング|コインパ)(?:代)?(?:は|が)?\s*(\d{1,6})\s*円/.exec(clause);
+    if (parkingAmount?.[1]) {
+      feeOverrides.push({
+        fee_type: "parking_fee",
+        mode: "fixed_amount",
+        amount: Number(parkingAmount[1]),
+        note: null
+      });
+      continue;
+    }
+    if (/高速(?:代)?(?:は|が)?(?:なし|無い|ない)/.test(clause)) {
+      feeOverrides.push({ fee_type: "highway_fee", mode: "no_charge", amount: null, note: null });
+      continue;
+    }
     if (/施設費|設備費/.test(clause) && /後日/.test(clause)) {
       deferred = "施設費等は後日精算";
+      feeOverrides.push({
+        fee_type: "facility_fee",
+        mode: "deferred",
+        amount: null,
+        note: "※設備費等は後日精算となります。"
+      });
+      continue;
+    }
+    if (/(?:^|指導料は)2コマ(?:です)?$/.test(clause.replace(/\s+/g, ""))) {
+      feeOverrides.push({ fee_type: "instruction_multiplier", mode: "fixed_amount", amount: 2, note: null });
       continue;
     }
     const roundTrip = /往復|行き帰り|行きも帰りも|自転車往復|往復自転車/.test(clause);
@@ -296,7 +370,7 @@ export function interpretPersonalPracticeSupplement(
     }
   }
 
-  if (overrides.size === 0 && !meetingPlace && !court && !deferred) {
+  if (overrides.size === 0 && feeOverrides.length === 0 && !meetingPlace && !court && !deferred) {
     return { status: "not_supplement" };
   }
   return {
@@ -305,7 +379,8 @@ export function interpretPersonalPracticeSupplement(
     overrides: [...overrides.values()],
     meeting_place: meetingPlace,
     court_or_area: court,
-    deferred_fee_note: deferred
+    deferred_fee_note: deferred,
+    fee_overrides: feeOverrides
   };
 }
 
@@ -396,21 +471,23 @@ export function rebuildParticipantsPreservingExplicit(
   names: string[],
   existing: PersonalSlotParticipantRow[],
   slotId: number,
-  nowIso: string
+  nowIso: string,
+  meetingPlace: string | null = null
 ): PersonalSlotParticipantRow[] {
-  const initial = defaultTransportForParticipantCount(names.length);
   return names.map((name, index) => {
     const previous = existing.find((row) => row.participant_name === name);
     const outboundExplicit = previous?.outbound_source === "explicit_user_supplement";
     const returnExplicit = previous?.return_source === "explicit_user_supplement";
+    const outbound = defaultTransportForParticipant(names.length, meetingPlace, "outbound");
+    const inbound = defaultTransportForParticipant(names.length, meetingPlace, "return");
     return {
       slot_id: slotId,
       participant_order: index,
       participant_name: name,
-      outbound_transport: outboundExplicit && previous ? previous.outbound_transport : initial.transport,
-      outbound_source: outboundExplicit && previous ? previous.outbound_source : initial.source,
-      return_transport: returnExplicit && previous ? previous.return_transport : initial.transport,
-      return_source: returnExplicit && previous ? previous.return_source : initial.source,
+      outbound_transport: outboundExplicit && previous ? previous.outbound_transport : outbound.transport,
+      outbound_source: outboundExplicit && previous ? previous.outbound_source : outbound.source,
+      return_transport: returnExplicit && previous ? previous.return_transport : inbound.transport,
+      return_source: returnExplicit && previous ? previous.return_source : inbound.source,
       escort_fee_override: previous?.escort_fee_override ?? null,
       escort_fee_override_reason: previous?.escort_fee_override_reason ?? null,
       updated_at: nowIso

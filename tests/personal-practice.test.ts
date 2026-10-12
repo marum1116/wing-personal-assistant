@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import { TEST_HOOKS } from "../src/index";
@@ -274,6 +275,7 @@ function createTestEnv() {
       UNIQUE (slot_id, participant_order)
     );
   `);
+  sqlite.exec(readFileSync("migrations/0014_personal_practice_fee_templates.sql", "utf8"));
 
   return {
     raw: sqlite,
@@ -6352,6 +6354,377 @@ window.Chouseisan = {
   assert.equal(hooks.shouldRoutePersonalSlotSupplement("10/8 白幡台小 19:00〜21:00 行きバス", true), false);
   assert.equal(hooks.shouldRoutePersonalSlotSupplement("塁とセンタは往復自転車です", false), false);
   assert.equal(hooks.shouldRoutePersonalSlotSupplement("個人練習補足 塁は行き自転車です", false), true);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("B面です", false), false);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("B面です", true), true);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("現地集合です", false), false);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("2面です", true), true);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("施設費は後日です", true), true);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("高速なしです", false), false);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("高速なしです", true), true);
+
+  const feeEnv = createTestEnv();
+  const feeTemplates = await feeEnv.env.DB.prepare(
+    `SELECT id, facility_key, facility_name, version, is_active, valid_from,
+            instruction_fee_per_person, escort_fee_per_shimura_direction,
+            facility_fee_mode, facility_fee_amount, highway_fee_mode, highway_fee_round_trip,
+            parking_fee_mode, parking_fee_amount, deferred_note, blocks_completion_note
+     FROM personal_practice_fee_templates`
+  ).all<any>();
+  const feeVariants = await feeEnv.env.DB.prepare(
+    `SELECT template_id, variant_key, amount FROM personal_practice_fee_template_variants`
+  ).all<any>();
+  function shimuraParticipants(names: string[]) {
+    return names.map((name, index) => ({
+      slot_id: 1,
+      participant_order: index,
+      participant_name: name,
+      outbound_transport: "shimura_car" as const,
+      outbound_source: "default_personal_practice" as const,
+      return_transport: "shimura_car" as const,
+      return_source: "default_personal_practice" as const,
+      escort_fee_override: null,
+      escort_fee_override_reason: null
+    }));
+  }
+  function feeSlot(overrides: Record<string, unknown>) {
+    return {
+      practice_date: "2026-10-13",
+      start_time: "09:00",
+      end_time: "12:00",
+      practice_location: "菅田地区センター",
+      meeting_place: "志村家前",
+      court_or_area: null,
+      participant_names: ["渡辺", "重松", "山田"],
+      ...overrides
+    };
+  }
+  const standardFee = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({}),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(standardFee.status, "complete");
+  assert.equal(standardFee.total_amount, 6020);
+  assert.equal(standardFee.per_person_amount, 2007);
+  assert.equal(standardFee.participant_amounts?.length, 3);
+
+  const nagayaCourt = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "永谷地区センター", court_or_area: "B面" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(nagayaCourt.status, "complete");
+  assert.equal(nagayaCourt.total_amount, 6960);
+  assert.equal(nagayaCourt.per_person_amount, 2320);
+  const nagayaUnknownCourt = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "永谷地区センター", court_or_area: null }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(nagayaUnknownCourt.status, "needs_confirmation");
+  assert.equal(nagayaUnknownCourt.total_amount, null);
+
+  const nakahara = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "中原支援学校" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(nakahara.status, "complete");
+  assert.equal(nakahara.total_amount, 5100);
+  assert.equal(nakahara.per_person_amount, 1700);
+  assert.match(nakahara.deferred_note ?? "", /後日精算/);
+  assert.equal(nakahara.items.find((item: { fee_type: string }) => item.fee_type === "facility_fee")?.status, "deferred");
+
+  const mixedTransport = shimuraParticipants(["渡辺", "重松", "山田"]);
+  mixedTransport[0] = {
+    ...mixedTransport[0],
+    outbound_transport: "bicycle",
+    outbound_source: "explicit_user_supplement",
+    return_transport: "bicycle",
+    return_source: "explicit_user_supplement"
+  };
+  const mixedFee = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({}),
+    participants: mixedTransport,
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(mixedFee.status, "needs_confirmation");
+  assert.equal(mixedFee.total_amount, null);
+  assert.equal(mixedFee.participant_amounts, null);
+  assert.ok(mixedFee.uncertain_points.some((point: string) => point.includes("高速代")));
+
+  const sixFee = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ participant_names: ["渡辺", "重松", "山田", "佐藤", "藤田", "村中"] }),
+    participants: ["渡辺", "重松", "山田", "佐藤", "藤田", "村中"].map((name, index) => ({
+      slot_id: 1,
+      participant_order: index,
+      participant_name: name,
+      outbound_transport: "unknown" as const,
+      outbound_source: "unresolved_multi_participant" as const,
+      return_transport: "unknown" as const,
+      return_source: "unresolved_multi_participant" as const,
+      escort_fee_override: null,
+      escort_fee_override_reason: null
+    })),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(sixFee.status, "needs_confirmation");
+
+  const shinohara = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "篠原地区センター" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(shinohara.status, "complete");
+  assert.equal(shinohara.total_amount, 7380);
+  assert.equal(shinohara.items.find((item: { fee_type: string }) => item.fee_type === "parking_fee")?.amount, 700);
+
+  const variableParking = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "白幡地区センター" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(variableParking.status, "needs_confirmation");
+  assert.ok(variableParking.uncertain_points.some((point: string) => point.includes("コインパーキング")));
+
+  const highwayOverride = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({}),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: [{ fee_type: "highway_fee", mode: "no_charge", amount: null, note: null }]
+  });
+  assert.equal(highwayOverride.status, "complete");
+  assert.equal(highwayOverride.total_amount, 5600);
+  assert.equal(highwayOverride.items.find((item: { fee_type: string }) => item.fee_type === "highway_fee")?.origin, "override");
+
+  const facilityOverride = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "永谷地区センター", court_or_area: null }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: [{ fee_type: "facility_fee", mode: "fixed_amount", amount: 500, note: null }]
+  });
+  assert.equal(facilityOverride.status, "complete");
+  assert.equal(facilityOverride.total_amount, 6920);
+
+  const deferredOverride = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({}),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: [{ fee_type: "facility_fee", mode: "deferred", amount: null, note: "※設備費等は後日精算となります。" }]
+  });
+  assert.equal(deferredOverride.status, "complete");
+  assert.equal(deferredOverride.total_amount, 5520);
+  assert.match(deferredOverride.deferred_note ?? "", /後日/);
+
+  const twoHours = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "上中里地区センター", end_time: "11:00" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(twoHours.status, "complete");
+  assert.equal(twoHours.total_amount, 7640);
+  const threeHoursNotTwoLessons = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_location: "上中里地区センター", end_time: "13:00" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: feeTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(threeHoursNotTwoLessons.status, "needs_confirmation");
+
+  await feeEnv.env.DB.prepare(
+    `INSERT INTO personal_practice_fee_templates (
+      facility_key, facility_name, version, is_active, valid_from,
+      instruction_fee_per_person, escort_fee_per_shimura_direction,
+      facility_fee_mode, facility_fee_amount, highway_fee_mode, highway_fee_round_trip,
+      parking_fee_mode, parking_fee_amount, deferred_note, blocks_completion_note, source, created_at
+    ) VALUES ('sugita', '菅田地区センター', 2, 1, '2026-11-01', 1500, 100, 'fixed', 800, 'round_trip', 420, 'none', NULL, NULL, NULL, 'test_revision', '2026-10-12T00:00:00.000Z')`
+  ).run();
+  const versionCount = await feeEnv.env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM personal_practice_fee_templates WHERE facility_key = 'sugita'`
+  ).first<{ count: number }>();
+  assert.equal(versionCount?.count, 2);
+  const refreshedTemplates = await feeEnv.env.DB.prepare(
+    `SELECT id, facility_key, facility_name, version, is_active, valid_from,
+            instruction_fee_per_person, escort_fee_per_shimura_direction,
+            facility_fee_mode, facility_fee_amount, highway_fee_mode, highway_fee_round_trip,
+            parking_fee_mode, parking_fee_amount, deferred_note, blocks_completion_note
+     FROM personal_practice_fee_templates`
+  ).all<any>();
+  const beforeRevision = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_date: "2026-10-13" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: refreshedTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(beforeRevision.template_version, 1);
+  assert.equal(beforeRevision.total_amount, 6020);
+  const afterRevision = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_date: "2026-11-02" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: refreshedTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(afterRevision.template_version, 2);
+  assert.equal(afterRevision.total_amount, 6320);
+  const pastDate = hooks.calculatePersonalPracticeFee({
+    slot: feeSlot({ practice_date: "2026-10-01" }),
+    participants: shimuraParticipants(["渡辺", "重松", "山田"]),
+    templates: refreshedTemplates.results,
+    variants: feeVariants.results,
+    overrides: []
+  });
+  assert.equal(pastDate.status, "needs_confirmation");
+  assert.equal(pastDate.template_version, null);
+
+  const onSite = await hooks.applyYahooPersonalCalendarSlots(feeEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-13",
+      practice_location: "菅田地区センター",
+      meeting_time: "8:30",
+      meeting_place: "現地集合",
+      participant_names: ["渡辺", "重松", "山田"]
+    }) as any
+  ]);
+  assert.equal(onSite[0]?.action, "saved");
+  const onSiteTransport = await feeEnv.env.DB.prepare(
+    `SELECT participant_name AS name, outbound_transport AS outbound, outbound_source AS outbound_source,
+            return_transport AS return_transport, return_source AS return_source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-13' AND p.participant_name = '渡辺'`
+  ).first<{ name: string; outbound: string; outbound_source: string; return_transport: string; return_source: string }>();
+  assert.equal(onSiteTransport?.outbound, "unknown");
+  assert.equal(onSiteTransport?.outbound_source, "unresolved_nonstandard_meeting");
+  assert.equal(onSiteTransport?.return_transport, "shimura_car");
+  assert.equal(onSiteTransport?.return_source, "default_personal_practice");
+
+  await feeEnv.env.STATE.put(
+    "personal_slot_context:fee-user",
+    JSON.stringify({
+      slots: [{ practice_date: "2026-10-13", start_time: "09:00" }],
+      saved_at: new Date().toISOString()
+    })
+  );
+  const courtOnly = await hooks.applyParsedPersonalSlotSupplement(feeEnv.env, "fee-user", "B面です", Date.now());
+  assert.equal(courtOnly.status, "applied");
+  const onSiteAfterCourt = await feeEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-13' AND p.participant_name = '山田'`
+  ).first<{ outbound: string; source: string }>();
+  assert.equal(onSiteAfterCourt?.outbound, "unknown");
+  assert.equal(onSiteAfterCourt?.source, "unresolved_nonstandard_meeting");
+
+  const explicitKept = await hooks.applyParsedPersonalSlotSupplement(
+    feeEnv.env,
+    "fee-user",
+    "塁は往復自転車です。高速なしです",
+    Date.now()
+  );
+  assert.equal(explicitKept.status, "applied");
+  await hooks.applyYahooPersonalCalendarSlots(feeEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-13",
+      practice_location: "菅田地区センター",
+      meeting_time: "8:30",
+      meeting_place: "現地集合",
+      participant_names: ["渡辺", "重松", "山田"]
+    }) as any
+  ]);
+  const afterResendTransport = await feeEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-13' AND p.participant_name = '渡辺'`
+  ).first<{ outbound: string; source: string }>();
+  assert.equal(afterResendTransport?.outbound, "bicycle");
+  assert.equal(afterResendTransport?.source, "explicit_user_supplement");
+  const afterResendFee = await feeEnv.env.DB.prepare(
+    `SELECT mode FROM personal_confirmed_slot_fee_overrides o
+     JOIN personal_confirmed_slots s ON s.id = o.slot_id
+     WHERE s.practice_date = '2026-10-13' AND o.fee_type = 'highway_fee'`
+  ).first<{ mode: string }>();
+  assert.equal(afterResendFee?.mode, "no_charge");
+
+  const ambiguousMoney = hooks.interpretPersonalPracticeSupplement("施設費は少し高いです", ["2026-10-13"]);
+  assert.equal(ambiguousMoney.status, "needs_confirmation");
+
+  const standardText = hooks.formatCoordinatorReminder(
+    {
+      id: 1,
+      practice_date: "2026-10-13",
+      start_time: "09:00",
+      end_time: "12:00",
+      practice_location: "菅田地区センター",
+      participant_names_json: JSON.stringify(["渡辺", "重松", "山田"]),
+      meeting_time: "08:30",
+      meeting_place: "志村家前",
+      court_or_area: null,
+      notes: null,
+      coordinator_name: "渡辺",
+      rui_participates: 1,
+      watanabe_is_coordinator: 1,
+      coordinator_reminder_sent_at: null,
+      payment_reminder_sent_at: null
+    },
+    { kind: "unknown" },
+    shimuraParticipants(["渡辺", "重松", "山田"]),
+    standardFee
+  );
+  assert.match(standardText, /【個別練習LINEへ送る文章】/);
+  assert.match(standardText, /合計：6,020円/);
+  assert.match(standardText, /1人あたり：2,007円/);
+  assert.match(standardText, /志村さんへ渡す現金：6,020円/);
+  assert.equal(standardText.includes("【確認が必要】"), false);
+  const heldText = hooks.formatCoordinatorReminder(
+    {
+      id: 1,
+      practice_date: "2026-10-13",
+      start_time: "09:00",
+      end_time: "12:00",
+      practice_location: "菅田地区センター",
+      participant_names_json: JSON.stringify(["渡辺", "重松", "山田"]),
+      meeting_time: "08:30",
+      meeting_place: "志村家前",
+      court_or_area: null,
+      notes: null,
+      coordinator_name: "渡辺",
+      rui_participates: 1,
+      watanabe_is_coordinator: 1,
+      coordinator_reminder_sent_at: null,
+      payment_reminder_sent_at: null
+    },
+    { kind: "unknown" },
+    mixedTransport,
+    mixedFee
+  );
+  assert.match(heldText, /【確認が必要】/);
+  assert.equal(heldText.includes("合計："), false);
 
   console.log("personal-practice test: all cases passed");
 }
