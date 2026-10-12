@@ -32,6 +32,9 @@ const EXCEL_COMMAND = "Excel";
 const LEAD_CHECK_COMMAND = "引率チェック";
 const REGULAR_CHOUSEISAN_URL_COMMAND = "通常調整さん";
 const PERSONAL_CHOUSEISAN_URL_COMMAND = "個人調整さん";
+const YAHOO_PERSONAL_CALENDAR_COMMAND = "個人練習カレンダー";
+const YAHOO_CALENDAR_SCREENSHOT_SOURCE = "yahoo_calendar_screenshot";
+const DEFAULT_YAHOO_PERSONAL_MEETING_PLACE = "志村家前";
 const DEFAULT_EXCEL_URL =
   "https://1drv.ms/x/c/9bd7af7f5c25ad41/IQAkWwmfLgFuT6hubXFEMGY_AU5v3uZy-bXHxjaW1QcF-7w";
 const WING_EVENT_TITLE = "wing練習";
@@ -1625,6 +1628,16 @@ function normalizeParticipantName(name: string): string {
 function isRuiParticipantName(name: string): boolean {
   const normalized = normalizeParticipantName(name);
   return normalized.includes("渡辺塁") || normalized === "塁" || normalized.includes("塁くん") || normalized.includes("ルイ");
+}
+
+function isYahooPersonalCalendarCommand(inputText: string): boolean {
+  return inputText.trim() === YAHOO_PERSONAL_CALENDAR_COMMAND;
+}
+
+/** Yahoo個人練習カレンダーの参加者欄だけ。通常の配車・本人判定には使わない。 */
+function isRuiYahooCalendarParticipantName(name: string): boolean {
+  const normalized = normalizeParticipantName(name);
+  return normalized === "渡辺" || normalized === "渡辺塁";
 }
 
 function parseAttendMarks(
@@ -11355,6 +11368,477 @@ async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<v
   }
 }
 
+type YahooPersonalCalendarSlotDraft = {
+  practice_date: string | null;
+  start_time: string | null;
+  end_time: string | null;
+  practice_location: string | null;
+  participant_names: string[];
+  participant_order_uncertain: boolean;
+  meeting_time: string | null;
+  meeting_place: string | null;
+  court_or_area: string | null;
+  notes: string | null;
+  needs_confirmation: boolean;
+};
+
+type YahooConfirmedSlotRecord = {
+  practice_date: string;
+  start_time: string;
+  end_time: string | null;
+  practice_location: string | null;
+  participant_names: string[];
+  meeting_time: string | null;
+  meeting_place: string | null;
+  court_or_area: string | null;
+  notes: string | null;
+  coordinator_name: string;
+  rui_participates: true;
+  watanabe_is_coordinator: boolean;
+};
+
+type YahooSlotOutcome =
+  | {
+      action: "needs_confirmation";
+      reason: string;
+      practice_date: string | null;
+      start_time: string | null;
+      end_time: string | null;
+    }
+  | {
+      action: "skipped_not_rui";
+      practice_date: string;
+      start_time: string;
+      end_time: string | null;
+    }
+  | { action: "saved"; record: YahooConfirmedSlotRecord };
+
+const YAHOO_PERSONAL_CALENDAR_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    slots: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          practice_date: { type: ["string", "null"] },
+          start_time: { type: ["string", "null"] },
+          end_time: { type: ["string", "null"] },
+          practice_location: { type: ["string", "null"] },
+          participant_names: { type: "array", items: { type: "string" } },
+          participant_order_uncertain: { type: "boolean" },
+          meeting_time: { type: ["string", "null"] },
+          meeting_place: { type: ["string", "null"] },
+          court_or_area: { type: ["string", "null"] },
+          notes: { type: ["string", "null"] },
+          needs_confirmation: { type: "boolean" }
+        },
+        required: [
+          "practice_date",
+          "start_time",
+          "end_time",
+          "practice_location",
+          "participant_names",
+          "participant_order_uncertain",
+          "meeting_time",
+          "meeting_place",
+          "court_or_area",
+          "notes",
+          "needs_confirmation"
+        ]
+      }
+    }
+  },
+  required: ["slots"]
+} as const;
+
+function normalizeYahooPracticeDate(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed) || !parseYmdAsUtcDate(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function normalizeYahooClockTime(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim().replace(/集合$/u, "");
+  const hm = /^(\d{1,2}):(\d{2})$/.exec(trimmed);
+  if (hm) {
+    const hour = Number(hm[1]);
+    const minute = Number(hm[2]);
+    if (hour > 23 || minute > 59) {
+      return null;
+    }
+    return `${String(hour).padStart(2, "0")}:${hm[2]}`;
+  }
+  const jp = /^(\d{1,2})時(?:(\d{1,2})分)?$/.exec(trimmed);
+  if (!jp) {
+    return null;
+  }
+  const hour = Number(jp[1]);
+  const minute = Number(jp[2] ?? "0");
+  if (hour > 23 || minute > 59) {
+    return null;
+  }
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function formatYahooClockForLine(hhmm: string): string {
+  const [hour, minute] = hhmm.split(":");
+  return `${Number(hour)}:${minute}`;
+}
+
+function formatYahooSlotWhenLabel(practiceDate: string, startTime: string, endTime: string | null): string {
+  const parsed = parseYmdAsUtcDate(practiceDate);
+  const month = Number(practiceDate.slice(5, 7));
+  const day = Number(practiceDate.slice(8, 10));
+  const weekday = parsed ? ["日", "月", "火", "水", "木", "金", "土"][parsed.getUTCDay()] ?? "" : "";
+  const startLabel = formatYahooClockForLine(startTime);
+  const timeLabel = endTime ? `${startLabel}〜${formatYahooClockForLine(endTime)}` : startLabel;
+  return `${month}/${day}（${weekday}）${timeLabel}`;
+}
+
+function resolveYahooMeetingFields(
+  meetingTimeRaw: string | null,
+  meetingPlaceRaw: string | null
+): { meeting_time: string | null; meeting_place: string | null } {
+  const meetingTime = normalizeYahooClockTime(meetingTimeRaw);
+  if (!meetingTime) {
+    return { meeting_time: null, meeting_place: null };
+  }
+  const explicit = meetingPlaceRaw?.trim() ?? "";
+  if (!explicit) {
+    return { meeting_time: meetingTime, meeting_place: DEFAULT_YAHOO_PERSONAL_MEETING_PLACE };
+  }
+  return {
+    meeting_time: meetingTime,
+    meeting_place: explicit === "現地集合" ? "現地" : explicit
+  };
+}
+
+function classifyYahooPersonalCalendarSlot(draft: YahooPersonalCalendarSlotDraft): YahooSlotOutcome {
+  const practiceDate = normalizeYahooPracticeDate(draft.practice_date);
+  const startTime = normalizeYahooClockTime(draft.start_time);
+  const endTime = normalizeYahooClockTime(draft.end_time);
+  if (draft.needs_confirmation || draft.participant_order_uncertain) {
+    return {
+      action: "needs_confirmation",
+      reason: "日付・開始時刻・参加者の順序を確定できないため、保存しませんでした。",
+      practice_date: practiceDate,
+      start_time: startTime,
+      end_time: endTime
+    };
+  }
+  if (!practiceDate) {
+    return {
+      action: "needs_confirmation",
+      reason: "日付を確定できないため、保存しませんでした。",
+      practice_date: null,
+      start_time: startTime,
+      end_time: endTime
+    };
+  }
+  if (!startTime) {
+    return {
+      action: "needs_confirmation",
+      reason: "開始時刻を確定できないため、保存しませんでした。",
+      practice_date: practiceDate,
+      start_time: null,
+      end_time: endTime
+    };
+  }
+  const names = draft.participant_names.map((name) => name.trim());
+  if (names.length === 0 || names.some((name) => name.length === 0)) {
+    return {
+      action: "needs_confirmation",
+      reason: "参加者またはその順序を確定できないため、保存しませんでした。",
+      practice_date: practiceDate,
+      start_time: startTime,
+      end_time: endTime
+    };
+  }
+  if (!names.some((name) => isRuiYahooCalendarParticipantName(name))) {
+    return {
+      action: "skipped_not_rui",
+      practice_date: practiceDate,
+      start_time: startTime,
+      end_time: endTime
+    };
+  }
+  const meeting = resolveYahooMeetingFields(draft.meeting_time, draft.meeting_place);
+  const coordinatorName = names[0] ?? "";
+  return {
+    action: "saved",
+    record: {
+      practice_date: practiceDate,
+      start_time: startTime,
+      end_time: endTime,
+      practice_location: draft.practice_location?.trim() || null,
+      participant_names: names,
+      meeting_time: meeting.meeting_time,
+      meeting_place: meeting.meeting_place,
+      court_or_area: draft.court_or_area?.trim() || null,
+      notes: draft.notes?.trim() || null,
+      coordinator_name: coordinatorName,
+      rui_participates: true,
+      watanabe_is_coordinator: isRuiYahooCalendarParticipantName(coordinatorName)
+    }
+  };
+}
+
+function formatYahooPersonalCalendarReply(outcomes: YahooSlotOutcome[]): string {
+  if (outcomes.length === 0) {
+    return "《個人練習カレンダー読み取り》\n\n枠を読み取れませんでした。確認が必要です。";
+  }
+  const blocks = outcomes.map((outcome) => {
+    if (outcome.action === "needs_confirmation") {
+      const when =
+        outcome.practice_date && outcome.start_time
+          ? formatYahooSlotWhenLabel(outcome.practice_date, outcome.start_time, outcome.end_time)
+          : null;
+      return [when, "確認が必要", outcome.reason].filter((line) => line !== null).join("\n");
+    }
+    if (outcome.action === "skipped_not_rui") {
+      return [
+        formatYahooSlotWhenLabel(outcome.practice_date, outcome.start_time, outcome.end_time),
+        "塁は参加者に含まれていないため、",
+        "渡辺家の管理対象には保存しませんでした。"
+      ].join("\n");
+    }
+    const record = outcome.record;
+    const place = record.practice_location ?? "不明";
+    const meeting =
+      record.meeting_time && record.meeting_place
+        ? `${formatYahooClockForLine(record.meeting_time)} ${record.meeting_place}`
+        : "不明";
+    const role = record.watanabe_is_coordinator ? "取りまとめ担当" : "支払い側";
+    return [
+      formatYahooSlotWhenLabel(record.practice_date, record.start_time, record.end_time),
+      `場所：${place}`,
+      `参加者：${record.participant_names.join("、")}`,
+      `集合：${meeting}`,
+      `取りまとめ：${record.coordinator_name}`,
+      "塁：参加",
+      `渡辺家：${role}`,
+      "",
+      "保存しました。"
+    ].join("\n");
+  });
+  return ["《個人練習カレンダー読み取り》", "", blocks.join("\n\n")].join("\n");
+}
+
+async function upsertPersonalConfirmedSlot(env: Env, record: YahooConfirmedSlotRecord, nowIso: string): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO personal_confirmed_slots (
+      practice_date, start_time, end_time, practice_location, participant_names_json,
+      meeting_time, meeting_place, court_or_area, notes,
+      coordinator_name, rui_participates, watanabe_is_coordinator, source,
+      created_at, updated_at
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?13)
+    ON CONFLICT(practice_date, start_time) DO UPDATE SET
+      end_time = excluded.end_time,
+      practice_location = excluded.practice_location,
+      participant_names_json = excluded.participant_names_json,
+      meeting_time = excluded.meeting_time,
+      meeting_place = excluded.meeting_place,
+      court_or_area = excluded.court_or_area,
+      notes = excluded.notes,
+      coordinator_name = excluded.coordinator_name,
+      rui_participates = excluded.rui_participates,
+      watanabe_is_coordinator = excluded.watanabe_is_coordinator,
+      source = excluded.source,
+      updated_at = excluded.updated_at`
+  )
+    .bind(
+      record.practice_date,
+      record.start_time,
+      record.end_time,
+      record.practice_location,
+      JSON.stringify(record.participant_names),
+      record.meeting_time,
+      record.meeting_place,
+      record.court_or_area,
+      record.notes,
+      record.coordinator_name,
+      record.watanabe_is_coordinator ? 1 : 0,
+      YAHOO_CALENDAR_SCREENSHOT_SOURCE,
+      nowIso
+    )
+    .run();
+}
+
+async function applyYahooPersonalCalendarSlots(
+  env: Env,
+  drafts: YahooPersonalCalendarSlotDraft[]
+): Promise<YahooSlotOutcome[]> {
+  const outcomes = drafts.map((draft) => classifyYahooPersonalCalendarSlot(draft));
+  const nowIso = new Date().toISOString();
+  for (const outcome of outcomes) {
+    if (outcome.action === "saved") {
+      await upsertPersonalConfirmedSlot(env, outcome.record, nowIso);
+    }
+  }
+  return outcomes;
+}
+
+function parseYahooPersonalCalendarModelOutput(raw: unknown): YahooPersonalCalendarSlotDraft[] {
+  if (!raw || typeof raw !== "object" || !Array.isArray((raw as { slots?: unknown }).slots)) {
+    throw new Error("yahoo_calendar_output_invalid");
+  }
+  return (raw as { slots: unknown[] }).slots.map((slot) => {
+    if (!slot || typeof slot !== "object") {
+      throw new Error("yahoo_calendar_output_invalid");
+    }
+    const row = slot as Record<string, unknown>;
+    if (!Array.isArray(row.participant_names) || row.participant_names.some((name) => typeof name !== "string")) {
+      throw new Error("yahoo_calendar_output_invalid");
+    }
+    const nullableString = (value: unknown): string | null => (typeof value === "string" ? value : null);
+    return {
+      practice_date: nullableString(row.practice_date),
+      start_time: nullableString(row.start_time),
+      end_time: nullableString(row.end_time),
+      practice_location: nullableString(row.practice_location),
+      participant_names: row.participant_names as string[],
+      participant_order_uncertain: row.participant_order_uncertain === true,
+      meeting_time: nullableString(row.meeting_time),
+      meeting_place: nullableString(row.meeting_place),
+      court_or_area: nullableString(row.court_or_area),
+      notes: nullableString(row.notes),
+      needs_confirmation: row.needs_confirmation === true
+    };
+  });
+}
+
+async function callOpenAIForYahooPersonalCalendar(
+  imageDataUrl: string,
+  receivedAtIso: string,
+  env: Env
+): Promise<YahooPersonalCalendarSlotDraft[]> {
+  const systemPrompt =
+    "あなたはYahoo共有カレンダーのスクリーンショットから、確定した個人練習の枠を抽出する係です。必ずJSON Schemaに従うJSONだけを返してください。" +
+    "画像はYahoo個人練習カレンダーです。日ごとにまとめず、画像に写っている練習枠を1件ずつslotsへ入れてください。" +
+    "同じ日の午前と午後は別slotです。1件にmergeしないでください。" +
+    "participant_namesは画像上の表示順のままの配列です。並べ替え、重複削除、推測による追加をしないでください。先頭が取りまとめ担当です。" +
+    "practice_dateは画像から年を含めて確定できるときだけYYYY-MM-DDです。確定できなければnullです。" +
+    "start_timeとend_timeは練習の開始・終了です。集合時刻ではありません。HH:MMで、確定できなければnullです。時刻を補完しないでください。" +
+    "meeting_timeは集合時刻です。練習開始時刻と混同しないでください。書かれていなければnullです。" +
+    "meeting_placeは集合場所です。練習会場を集合場所にしないでください。書かれていなければnullです。" +
+    "practice_locationは練習会場です。集合場所を会場にしないでください。" +
+    "参加者の順序、日付、開始時刻のいずれかが曖昧なら、そのslotはneeds_confirmation=true、順序が曖昧ならparticipant_order_uncertain=trueにしてください。" +
+    "画像に無い枠は作らないでください。";
+  const userPrompt = JSON.stringify(
+    {
+      current_date_japan: getJstDateString(Date.now()),
+      message_received_datetime: receivedAtIso,
+      command: YAHOO_PERSONAL_CALENDAR_COMMAND
+    },
+    null,
+    2
+  );
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      reasoning: { effort: "none" },
+      input: [
+        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: userPrompt },
+            { type: "input_image", image_url: imageDataUrl }
+          ]
+        }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "yahoo_personal_practice_calendar",
+          strict: true,
+          schema: YAHOO_PERSONAL_CALENDAR_SCHEMA
+        }
+      }
+    })
+  });
+  if (!response.ok) {
+    console.error("OpenAI Yahoo calendar request failed", { status: response.status });
+    throw new Error("openai_api_error");
+  }
+  const apiResponse = (await response.json()) as unknown;
+  const outputText = extractResponseText(apiResponse);
+  if (!outputText) {
+    throw new Error("openai_output_missing");
+  }
+  try {
+    return parseYahooPersonalCalendarModelOutput(JSON.parse(outputText) as unknown);
+  } catch (error) {
+    if (error instanceof Error && error.message === "yahoo_calendar_output_invalid") {
+      throw error;
+    }
+    throw new Error("openai_output_parse_error");
+  }
+}
+
+async function handleYahooPersonalCalendarCommand(event: LineWebhookEvent, env: Env): Promise<void> {
+  const userId = event.source?.userId;
+  if (!userId || !event.replyToken) {
+    return;
+  }
+  await sleep(PAIR_WAIT_MS);
+  const imageDataUrl = await resolvePairedImageDataUrlForTextEvent(
+    env,
+    userId,
+    event.timestamp ?? Date.now()
+  );
+  if (!imageDataUrl) {
+    await replyMessages(
+      event.replyToken,
+      [
+        {
+          type: "text",
+          text: "スクリーンショットが見つかりません。先にYahooカレンダーの画像を送り、そのあと「個人練習カレンダー」と送ってください。"
+        }
+      ],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  try {
+    const drafts = await callOpenAIForYahooPersonalCalendar(
+      imageDataUrl,
+      new Date(event.timestamp ?? Date.now()).toISOString(),
+      env
+    );
+    const outcomes = await applyYahooPersonalCalendarSlots(env, drafts);
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: formatYahooPersonalCalendarReply(outcomes) }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    console.error("Yahoo personal calendar parse failed", { errorType });
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: "解析できませんでした。もう一度送ってください。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+  }
+}
+
 async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promise<void> {
   if (!event.replyToken) {
     return;
@@ -11406,6 +11890,10 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   }
   if (isPersonalChouseisanUrlCommand(inputText)) {
     await handleChouseisanUrlCommand(event, env, "personal");
+    return;
+  }
+  if (isYahooPersonalCalendarCommand(inputText)) {
+    await handleYahooPersonalCalendarCommand(event, env);
     return;
   }
 
@@ -11996,6 +12484,12 @@ export const TEST_HOOKS = {
   parseChoiceDateTime,
   inferTimeRangeFromChouseisanDetail,
   isRuiParticipantName,
+  isRuiYahooCalendarParticipantName,
+  isYahooPersonalCalendarCommand,
+  classifyYahooPersonalCalendarSlot,
+  applyYahooPersonalCalendarSlots,
+  formatYahooPersonalCalendarReply,
+  parseYahooPersonalCalendarModelOutput,
   replyWithPushFallback,
   replyMessages,
   pushMessages,

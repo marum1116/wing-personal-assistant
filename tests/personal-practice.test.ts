@@ -235,6 +235,28 @@ function createTestEnv() {
       confirmed_at TEXT,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS personal_confirmed_slots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      practice_date TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT,
+      practice_location TEXT,
+      participant_names_json TEXT NOT NULL,
+      meeting_time TEXT,
+      meeting_place TEXT,
+      court_or_area TEXT,
+      notes TEXT,
+      coordinator_name TEXT NOT NULL,
+      rui_participates INTEGER NOT NULL,
+      watanabe_is_coordinator INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      coordinator_reminder_sent_at TEXT,
+      payment_reminder_sent_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (practice_date, start_time)
+    );
   `);
 
   return {
@@ -5705,6 +5727,156 @@ window.Chouseisan = {
   assert.equal(markerResult.stale, false);
   assert.equal(markerResult.result?.updated, 1);
   assert.deepEqual(markerPatchedSummaries, ["◯wing練習"]);
+
+  assert.equal(hooks.isRuiParticipantName("渡辺"), false);
+  assert.equal(hooks.isRuiYahooCalendarParticipantName("渡辺"), true);
+  assert.equal(hooks.isRuiYahooCalendarParticipantName("渡辺塁"), true);
+  assert.equal(hooks.isRuiYahooCalendarParticipantName("渡辺 塁"), true);
+  assert.equal(hooks.isRuiYahooCalendarParticipantName("重松"), false);
+  assert.equal(hooks.isYahooPersonalCalendarCommand("個人練習カレンダー"), true);
+  assert.equal(hooks.isYahooPersonalCalendarCommand("個人練習カレンダーです"), false);
+
+  function yahooDraft(overrides: Record<string, unknown>) {
+    return {
+      practice_date: "2026-10-11",
+      start_time: "9:00",
+      end_time: "12:00",
+      practice_location: "中原支援学校",
+      participant_names: ["渡辺", "重松", "村中"],
+      participant_order_uncertain: false,
+      meeting_time: "8:30",
+      meeting_place: null,
+      court_or_area: null,
+      notes: null,
+      needs_confirmation: false,
+      ...overrides
+    };
+  }
+
+  const yahooEnv = createTestEnv();
+  const firstSlot = hooks.classifyYahooPersonalCalendarSlot(yahooDraft({}) as any);
+  assert.equal(firstSlot.action, "saved");
+  if (firstSlot.action === "saved") {
+    assert.equal(firstSlot.record.rui_participates, true);
+    assert.equal(firstSlot.record.coordinator_name, "渡辺");
+    assert.equal(firstSlot.record.watanabe_is_coordinator, true);
+    assert.equal(firstSlot.record.meeting_time, "08:30");
+    assert.equal(firstSlot.record.meeting_place, "志村家前");
+    assert.equal(firstSlot.record.start_time, "09:00");
+    assert.deepEqual(firstSlot.record.participant_names, ["渡辺", "重松", "村中"]);
+  }
+  const savedFirst = await hooks.applyYahooPersonalCalendarSlots(yahooEnv.env, [yahooDraft({}) as any]);
+  assert.match(hooks.formatYahooPersonalCalendarReply(savedFirst), /渡辺家：取りまとめ担当/);
+  assert.match(hooks.formatYahooPersonalCalendarReply(savedFirst), /保存しました。/);
+
+  const secondNames = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({ participant_names: ["重松", "渡辺", "村中"] }) as any
+  );
+  assert.equal(secondNames.action, "saved");
+  if (secondNames.action === "saved") {
+    assert.equal(secondNames.record.coordinator_name, "重松");
+    assert.equal(secondNames.record.watanabe_is_coordinator, false);
+  }
+
+  const notRui = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({
+      practice_date: "2026-10-12",
+      start_time: "9:00",
+      end_time: "11:00",
+      participant_names: ["重松", "村中", "山田"]
+    }) as any
+  );
+  assert.equal(notRui.action, "skipped_not_rui");
+  const notRuiApplied = await hooks.applyYahooPersonalCalendarSlots(yahooEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-12",
+      start_time: "9:00",
+      end_time: "11:00",
+      participant_names: ["重松", "村中", "山田"]
+    }) as any
+  ]);
+  assert.match(hooks.formatYahooPersonalCalendarReply(notRuiApplied), /保存しませんでした/);
+  const notRuiCount = await yahooEnv.env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM personal_confirmed_slots WHERE practice_date = '2026-10-12'"
+  ).first<{ count: number }>();
+  assert.equal(notRuiCount?.count, 0);
+
+  const twoSlots = await hooks.applyYahooPersonalCalendarSlots(yahooEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-10",
+      start_time: "09:00",
+      end_time: "12:00",
+      participant_names: ["山田", "渡辺", "藤田"],
+      meeting_time: null,
+      meeting_place: null
+    }) as any,
+    yahooDraft({
+      practice_date: "2026-10-10",
+      start_time: "13:00",
+      end_time: "16:00",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:40",
+      meeting_place: null
+    }) as any
+  ]);
+  assert.equal(twoSlots[0]?.action, "saved");
+  assert.equal(twoSlots[1]?.action, "saved");
+  if (twoSlots[0]?.action === "saved" && twoSlots[1]?.action === "saved") {
+    assert.equal(twoSlots[0].record.watanabe_is_coordinator, false);
+    assert.equal(twoSlots[1].record.watanabe_is_coordinator, true);
+    assert.equal(twoSlots[0].record.meeting_place, null);
+    assert.equal(twoSlots[1].record.meeting_place, "志村家前");
+  }
+  const twoCount = await yahooEnv.env.DB.prepare(
+    "SELECT start_time, coordinator_name, watanabe_is_coordinator FROM personal_confirmed_slots WHERE practice_date = '2026-10-10' ORDER BY start_time"
+  ).all<{ start_time: string; coordinator_name: string; watanabe_is_coordinator: number }>();
+  assert.equal(twoCount.results.length, 2);
+  assert.equal(twoCount.results[0]?.coordinator_name, "山田");
+  assert.equal(twoCount.results[0]?.watanabe_is_coordinator, 0);
+  assert.equal(twoCount.results[1]?.coordinator_name, "渡辺");
+  assert.equal(twoCount.results[1]?.watanabe_is_coordinator, 1);
+  assert.match(hooks.formatYahooPersonalCalendarReply(twoSlots), /支払い側/);
+  assert.match(hooks.formatYahooPersonalCalendarReply(twoSlots), /取りまとめ担当/);
+
+  await hooks.applyYahooPersonalCalendarSlots(yahooEnv.env, [
+    yahooDraft({ practice_location: "更新後の会場" }) as any
+  ]);
+  const upserted = await yahooEnv.env.DB.prepare(
+    "SELECT COUNT(*) AS count, practice_location AS location FROM personal_confirmed_slots WHERE practice_date = '2026-10-11' AND start_time = '09:00'"
+  ).first<{ count: number; location: string }>();
+  assert.equal(upserted?.count, 1);
+  assert.equal(upserted?.location, "更新後の会場");
+
+  const beforeUnknown = await yahooEnv.env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM personal_confirmed_slots WHERE practice_date = '2026-10-11'"
+  ).first<{ count: number }>();
+  const unknownStart = await hooks.applyYahooPersonalCalendarSlots(yahooEnv.env, [
+    yahooDraft({ start_time: null, practice_location: "混ぜてはいけない" }) as any
+  ]);
+  assert.equal(unknownStart[0]?.action, "needs_confirmation");
+  const afterUnknown = await yahooEnv.env.DB.prepare(
+    "SELECT COUNT(*) AS count, practice_location AS location FROM personal_confirmed_slots WHERE practice_date = '2026-10-11' AND start_time = '09:00'"
+  ).first<{ count: number; location: string }>();
+  assert.equal(afterUnknown?.count, beforeUnknown?.count);
+  assert.equal(afterUnknown?.location, "更新後の会場");
+
+  const explicitPlace = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({ meeting_time: "13:00", meeting_place: "現地集合" }) as any
+  );
+  assert.equal(explicitPlace.action, "saved");
+  if (explicitPlace.action === "saved") {
+    assert.equal(explicitPlace.record.meeting_time, "13:00");
+    assert.equal(explicitPlace.record.meeting_place, "現地");
+  }
+
+  const eightThirty = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({ meeting_time: "8:30集合", meeting_place: null }) as any
+  );
+  assert.equal(eightThirty.action, "saved");
+  if (eightThirty.action === "saved") {
+    assert.equal(eightThirty.record.meeting_time, "08:30");
+    assert.equal(eightThirty.record.meeting_place, "志村家前");
+  }
 
   console.log("personal-practice test: all cases passed");
 }
