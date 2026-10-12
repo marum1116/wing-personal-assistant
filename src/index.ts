@@ -1,3 +1,18 @@
+import {
+  PERSONAL_SLOT_CONTEXT_TTL_SECONDS,
+  formatPersonalSupplementReply,
+  formatTransportStateLabel,
+  interpretPersonalPracticeSupplement,
+  mergeParticipantOverrides,
+  participantsNeedTransportConfirmation,
+  personalSlotContextKey,
+  rebuildParticipantsPreservingExplicit,
+  resolveSupplementSlot,
+  shouldRoutePersonalSlotSupplement,
+  type PersonalSlotContextRecord,
+  type PersonalSlotParticipantRow
+} from "./personal-slot-supplement";
+
 interface Env {
   LINE_CHANNEL_SECRET: string;
   LINE_CHANNEL_ACCESS_TOKEN: string;
@@ -11673,6 +11688,14 @@ async function upsertPersonalConfirmedSlot(env: Env, record: YahooConfirmedSlotR
       nowIso
     )
     .run();
+  const saved = await env.DB.prepare(
+    `SELECT id FROM personal_confirmed_slots WHERE practice_date = ?1 AND start_time = ?2 LIMIT 1`
+  )
+    .bind(record.practice_date, record.start_time)
+    .first<{ id: number }>();
+  if (saved) {
+    await syncPersonalSlotParticipantDefaults(env, saved.id, record.participant_names, nowIso);
+  }
 }
 
 async function applyYahooPersonalCalendarSlots(
@@ -11792,6 +11815,199 @@ async function callOpenAIForYahooPersonalCalendar(
   }
 }
 
+async function syncPersonalSlotParticipantDefaults(
+  env: Env,
+  slotId: number,
+  names: string[],
+  nowIso: string
+): Promise<void> {
+  const existingRows = await env.DB.prepare(
+    `SELECT participant_order, participant_name, outbound_transport, outbound_source,
+            return_transport, return_source, escort_fee_override, escort_fee_override_reason
+     FROM personal_confirmed_slot_participants
+     WHERE slot_id = ?1
+     ORDER BY participant_order`
+  )
+    .bind(slotId)
+    .all<PersonalSlotParticipantRow>();
+  const rebuilt = rebuildParticipantsPreservingExplicit(names, existingRows.results ?? [], slotId, nowIso);
+  await env.DB.prepare(`DELETE FROM personal_confirmed_slot_participants WHERE slot_id = ?1`).bind(slotId).run();
+  for (const row of rebuilt) {
+    await env.DB.prepare(
+      `INSERT INTO personal_confirmed_slot_participants (
+        slot_id, participant_order, participant_name,
+        outbound_transport, outbound_source, return_transport, return_source,
+        escort_fee_override, escort_fee_override_reason, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`
+    )
+      .bind(
+        row.slot_id,
+        row.participant_order,
+        row.participant_name,
+        row.outbound_transport,
+        row.outbound_source,
+        row.return_transport,
+        row.return_source,
+        row.escort_fee_override,
+        row.escort_fee_override_reason,
+        nowIso
+      )
+      .run();
+  }
+}
+
+async function savePersonalSlotContext(env: Env, userId: string, slots: Array<{ practice_date: string; start_time: string }>): Promise<void> {
+  const record: PersonalSlotContextRecord = {
+    slots,
+    saved_at: new Date().toISOString()
+  };
+  await env.STATE.put(personalSlotContextKey(userId), JSON.stringify(record), {
+    expirationTtl: PERSONAL_SLOT_CONTEXT_TTL_SECONDS
+  });
+}
+
+async function loadPersonalSlotContext(env: Env, userId: string, nowMs: number): Promise<PersonalSlotContextRecord | null> {
+  const raw = await env.STATE.get(personalSlotContextKey(userId));
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as PersonalSlotContextRecord;
+    if (!Array.isArray(parsed.slots) || typeof parsed.saved_at !== "string") {
+      return null;
+    }
+    const ageMs = nowMs - Date.parse(parsed.saved_at);
+    if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > PERSONAL_SLOT_CONTEXT_TTL_SECONDS * 1000) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function listRuiPersonalSlots(env: Env): Promise<Array<{ id: number; practice_date: string; start_time: string; end_time: string | null; practice_location: string | null }>> {
+  const rows = await env.DB.prepare(
+    `SELECT id, practice_date, start_time, end_time, practice_location
+     FROM personal_confirmed_slots
+     WHERE rui_participates = 1
+     ORDER BY practice_date, start_time`
+  ).all<{ id: number; practice_date: string; start_time: string; end_time: string | null; practice_location: string | null }>();
+  return rows.results ?? [];
+}
+
+async function loadSlotParticipants(env: Env, slotId: number): Promise<PersonalSlotParticipantRow[]> {
+  const rows = await env.DB.prepare(
+    `SELECT id, slot_id, participant_order, participant_name, outbound_transport, outbound_source,
+            return_transport, return_source, escort_fee_override, escort_fee_override_reason
+     FROM personal_confirmed_slot_participants
+     WHERE slot_id = ?1
+     ORDER BY participant_order`
+  )
+    .bind(slotId)
+    .all<PersonalSlotParticipantRow>();
+  return rows.results ?? [];
+}
+
+async function applyParsedPersonalSlotSupplement(
+  env: Env,
+  userId: string,
+  inputText: string,
+  nowMs: number
+): Promise<{ status: "not_supplement" | "needs_confirmation" | "applied"; message: string }> {
+  const slots = await listRuiPersonalSlots(env);
+  const recent = await loadPersonalSlotContext(env, userId, nowMs);
+  const interpreted = interpretPersonalPracticeSupplement(
+    inputText,
+    [...new Set(slots.map((slot) => slot.practice_date))]
+  );
+  if (interpreted.status === "not_supplement") {
+    return { status: "not_supplement", message: "" };
+  }
+  if (interpreted.status === "needs_confirmation") {
+    return { status: "needs_confirmation", message: interpreted.message };
+  }
+  const target = resolveSupplementSlot(interpreted.hint, slots, recent?.slots ?? null);
+  if (!target.ok) {
+    return { status: "needs_confirmation", message: target.message };
+  }
+  const slotId = target.slot.id;
+  if (typeof slotId !== "number") {
+    return { status: "needs_confirmation", message: "《確認が必要》\n\n対象の個人練習枠を確定できません。" };
+  }
+  const participants = await loadSlotParticipants(env, slotId);
+  const names = participants.map((row) => row.participant_name);
+  const merged = mergeParticipantOverrides(participants, interpreted.overrides, names);
+  if (!merged.ok) {
+    return { status: "needs_confirmation", message: merged.message };
+  }
+  const nowIso = new Date(nowMs).toISOString();
+  for (const row of merged.rows) {
+    await env.DB.prepare(
+      `UPDATE personal_confirmed_slot_participants
+       SET outbound_transport = ?1,
+           outbound_source = ?2,
+           return_transport = ?3,
+           return_source = ?4,
+           escort_fee_override = ?5,
+           escort_fee_override_reason = ?6,
+           updated_at = ?7
+       WHERE slot_id = ?8 AND participant_order = ?9`
+    )
+      .bind(
+        row.outbound_transport,
+        row.outbound_source,
+        row.return_transport,
+        row.return_source,
+        row.escort_fee_override,
+        row.escort_fee_override_reason,
+        nowIso,
+        slotId,
+        row.participant_order
+      )
+      .run();
+  }
+  if (interpreted.meeting_place || interpreted.court_or_area || interpreted.deferred_fee_note) {
+    await env.DB.prepare(
+      `UPDATE personal_confirmed_slots
+       SET meeting_place = COALESCE(?1, meeting_place),
+           court_or_area = COALESCE(?2, court_or_area),
+           deferred_fee_note = COALESCE(?3, deferred_fee_note),
+           updated_at = ?4
+       WHERE id = ?5`
+    )
+      .bind(interpreted.meeting_place, interpreted.court_or_area, interpreted.deferred_fee_note, nowIso, slotId)
+      .run();
+  }
+  const slotRow = slots.find((slot) => slot.id === slotId);
+  return {
+    status: "applied",
+    message: formatPersonalSupplementReply(
+      formatYahooSlotWhenLabel(target.slot.practice_date, target.slot.start_time, slotRow?.end_time ?? null),
+      slotRow?.practice_location ?? null,
+      merged.rows
+    )
+  };
+}
+
+async function maybeHandlePersonalSlotSupplement(event: LineWebhookEvent, env: Env, inputText: string): Promise<boolean> {
+  const userId = event.source?.userId;
+  if (!userId || !event.replyToken) {
+    return false;
+  }
+  const nowMs = event.timestamp ?? Date.now();
+  const recent = await loadPersonalSlotContext(env, userId, nowMs);
+  if (!shouldRoutePersonalSlotSupplement(inputText, recent !== null)) {
+    return false;
+  }
+  const result = await applyParsedPersonalSlotSupplement(env, userId, inputText, nowMs);
+  if (result.status === "not_supplement") {
+    return false;
+  }
+  await replyMessages(event.replyToken, [{ type: "text", text: result.message }], env.LINE_CHANNEL_ACCESS_TOKEN);
+  return true;
+}
+
 async function handleYahooPersonalCalendarCommand(event: LineWebhookEvent, env: Env): Promise<void> {
   const userId = event.source?.userId;
   if (!userId || !event.replyToken) {
@@ -11823,6 +12039,15 @@ async function handleYahooPersonalCalendarCommand(event: LineWebhookEvent, env: 
       env
     );
     const outcomes = await applyYahooPersonalCalendarSlots(env, drafts);
+    await savePersonalSlotContext(
+      env,
+      userId,
+      outcomes.flatMap((outcome) =>
+        outcome.action === "saved"
+          ? [{ practice_date: outcome.record.practice_date, start_time: outcome.record.start_time }]
+          : []
+      )
+    );
     await replyMessages(
       event.replyToken,
       [{ type: "text", text: formatYahooPersonalCalendarReply(outcomes) }],
@@ -11894,6 +12119,9 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   }
   if (isYahooPersonalCalendarCommand(inputText)) {
     await handleYahooPersonalCalendarCommand(event, env);
+    return;
+  }
+  if (event.source?.userId && (await maybeHandlePersonalSlotSupplement(event, env, inputText))) {
     return;
   }
 
@@ -12469,7 +12697,11 @@ function selectPersonalSlotReminders(
   return { coordinatorSlots, paymentSlots, endTimeUnknownSlotIds };
 }
 
-function formatCoordinatorReminder(slot: PersonalSlotReminderRow, fee: PersonalSlotFeeLink): string {
+function formatCoordinatorReminder(
+  slot: PersonalSlotReminderRow,
+  fee: PersonalSlotFeeLink,
+  participantRows: PersonalSlotParticipantRow[] = []
+): string {
   const participants = parseSlotParticipantNames(slot.participant_names_json);
   const when = formatYahooSlotWhenLabel(slot.practice_date, slot.start_time, slot.end_time);
   const month = Number(slot.practice_date.slice(5, 7));
@@ -12495,9 +12727,22 @@ function formatCoordinatorReminder(slot: PersonalSlotReminderRow, fee: PersonalS
     "集合：",
     meeting ?? "不明"
   ];
+  const transportKnown =
+    participantRows.length > 0 && !participantsNeedTransportConfirmation(participantRows);
+  if (transportKnown) {
+    lines.push("", "交通：");
+    for (const row of participantRows) {
+      lines.push(
+        `${row.participant_name} 行き${formatTransportStateLabel(row.outbound_transport, row.outbound_source)} / 帰り${formatTransportStateLabel(row.return_transport, row.return_source)}`
+      );
+      if (row.escort_fee_override === "no_charge_this_slot") {
+        lines.push(`${row.participant_name} 引率代：この枠では請求なし`);
+      }
+    }
+  }
   const missing = [
     ...(fee.kind === "amount" ? [] : ["参加費の確定金額"]),
-    "参加者ごとの交通手段",
+    ...(transportKnown ? [] : ["参加者ごとの交通手段"]),
     "引率代",
     "施設費",
     "高速代",
@@ -12652,9 +12897,10 @@ async function handlePersonalSlotReminderScheduled(
   let paymentSent = 0;
   for (const slot of plan.coordinatorSlots) {
     const fee = resolvePersonalSlotFeeLink(slot.practice_date, slots, payments);
+    const participantRows = await loadSlotParticipants(env, slot.id);
     const status = await push(
       ownerLineUserId,
-      [{ type: "text", text: formatCoordinatorReminder(slot, fee.kind === "paid" ? { kind: "unknown" } : fee) }],
+      [{ type: "text", text: formatCoordinatorReminder(slot, fee.kind === "paid" ? { kind: "unknown" } : fee, participantRows) }],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
     if (typeof status !== "number") {
@@ -12929,5 +13175,11 @@ export const TEST_HOOKS = {
   formatCoordinatorReminder,
   formatPaymentSideReminder,
   classifyScheduledTrigger,
+  shouldRoutePersonalSlotSupplement,
+  interpretPersonalPracticeSupplement,
+  resolveSupplementSlot,
+  mergeParticipantOverrides,
+  rebuildParticipantsPreservingExplicit,
+  applyParsedPersonalSlotSupplement,
   getActiveMonthlyFeeRule
 };

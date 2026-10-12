@@ -253,9 +253,25 @@ function createTestEnv() {
       source TEXT NOT NULL,
       coordinator_reminder_sent_at TEXT,
       payment_reminder_sent_at TEXT,
+      deferred_fee_note TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE (practice_date, start_time)
+    );
+
+    CREATE TABLE IF NOT EXISTS personal_confirmed_slot_participants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      slot_id INTEGER NOT NULL,
+      participant_order INTEGER NOT NULL,
+      participant_name TEXT NOT NULL,
+      outbound_transport TEXT NOT NULL,
+      outbound_source TEXT NOT NULL,
+      return_transport TEXT NOT NULL,
+      return_source TEXT NOT NULL,
+      escort_fee_override TEXT,
+      escort_fee_override_reason TEXT,
+      updated_at TEXT NOT NULL,
+      UNIQUE (slot_id, participant_order)
     );
   `);
 
@@ -6071,6 +6087,271 @@ window.Chouseisan = {
     push: async () => 200
   });
   assert.equal(pushedAgain.paymentSent, 0);
+
+  const supplementEnv = createTestEnv();
+  await hooks.applyYahooPersonalCalendarSlots(supplementEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-10",
+      start_time: "09:00",
+      end_time: "12:00",
+      participant_names: ["山田", "渡辺", "藤田"],
+      meeting_time: null,
+      meeting_place: null
+    }) as any,
+    yahooDraft({
+      practice_date: "2026-10-10",
+      start_time: "13:00",
+      end_time: "16:00",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:40",
+      meeting_place: null
+    }) as any,
+    yahooDraft({
+      practice_date: "2026-10-11",
+      participant_names: ["渡辺", "重松", "山田"]
+    }) as any
+  ]);
+  const defaultRows = await supplementEnv.env.DB.prepare(
+    `SELECT p.participant_name AS name, p.outbound_transport AS outbound, p.outbound_source AS outbound_source,
+            p.return_transport AS return_transport, p.return_source AS return_source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-11' AND s.start_time = '09:00'
+     ORDER BY p.participant_order`
+  ).all<{ name: string; outbound: string; outbound_source: string; return_transport: string; return_source: string }>();
+  assert.equal(defaultRows.results.length, 3);
+  assert.ok(defaultRows.results.every((row) => row.outbound === "shimura_car" && row.outbound_source === "default_personal_practice"));
+  assert.ok(defaultRows.results.every((row) => row.return_transport === "shimura_car" && row.return_source === "default_personal_practice"));
+
+  await hooks.applyYahooPersonalCalendarSlots(supplementEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-12",
+      participant_names: ["渡辺", "重松", "山田", "佐藤", "藤田", "村中"]
+    }) as any
+  ]);
+  const sixRows = await supplementEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-12'`
+  ).all<{ outbound: string; source: string }>();
+  assert.equal(sixRows.results.length, 6);
+  assert.ok(sixRows.results.every((row) => row.outbound === "unknown" && row.source === "unresolved_multi_participant"));
+
+  const roundTrip = await hooks.applyParsedPersonalSlotSupplement(
+    supplementEnv.env,
+    "user-1",
+    "塁とセンタは往復自転車です",
+    Date.parse("2026-10-11T01:00:00+09:00")
+  );
+  assert.equal(roundTrip.status, "needs_confirmation");
+  await supplementEnv.env.STATE.put(
+    "personal_slot_context:user-1",
+    JSON.stringify({
+      slots: [{ practice_date: "2026-10-11", start_time: "09:00" }],
+      saved_at: new Date(Date.parse("2026-10-11T01:00:00+09:00")).toISOString()
+    })
+  );
+  const roundTripApplied = await hooks.applyParsedPersonalSlotSupplement(
+    supplementEnv.env,
+    "user-1",
+    "塁とセンタは往復自転車です",
+    Date.parse("2026-10-11T01:00:00+09:00")
+  );
+  assert.equal(roundTripApplied.status, "applied");
+  const afterBicycle = await supplementEnv.env.DB.prepare(
+    `SELECT participant_name AS name, outbound_transport AS outbound, outbound_source AS outbound_source,
+            return_transport AS return_transport, return_source AS return_source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-11'
+     ORDER BY p.participant_order`
+  ).all<{ name: string; outbound: string; outbound_source: string; return_transport: string; return_source: string }>();
+  const watanabe = afterBicycle.results.find((row) => row.name === "渡辺");
+  const shigematsu = afterBicycle.results.find((row) => row.name === "重松");
+  const yamada = afterBicycle.results.find((row) => row.name === "山田");
+  assert.equal(watanabe?.outbound, "bicycle");
+  assert.equal(watanabe?.outbound_source, "explicit_user_supplement");
+  assert.equal(watanabe?.return_transport, "bicycle");
+  assert.equal(shigematsu?.outbound, "bicycle");
+  assert.equal(yamada?.outbound, "shimura_car");
+  assert.equal(yamada?.outbound_source, "default_personal_practice");
+
+  await hooks.applyYahooPersonalCalendarSlots(supplementEnv.env, [
+    yahooDraft({ practice_date: "2026-10-11", participant_names: ["渡辺", "重松", "山田"] }) as any
+  ]);
+  const afterResend = await supplementEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS source
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-11' AND p.participant_name = '渡辺'`
+  ).first<{ outbound: string; source: string }>();
+  assert.equal(afterResend?.outbound, "bicycle");
+  assert.equal(afterResend?.source, "explicit_user_supplement");
+
+  const oneWayEnv = createTestEnv();
+  await hooks.applyYahooPersonalCalendarSlots(oneWayEnv.env, [yahooDraft({}) as any]);
+  await oneWayEnv.env.STATE.put(
+    "personal_slot_context:user-2",
+    JSON.stringify({
+      slots: [{ practice_date: "2026-10-11", start_time: "09:00" }],
+      saved_at: new Date().toISOString()
+    })
+  );
+  const oneWay = await hooks.applyParsedPersonalSlotSupplement(oneWayEnv.env, "user-2", "塁は行き自転車です", Date.now());
+  assert.equal(oneWay.status, "applied");
+  const oneWayRow = await oneWayEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS outbound_source, return_transport AS return_transport, return_source AS return_source
+     FROM personal_confirmed_slot_participants WHERE participant_name = '渡辺'`
+  ).first<{ outbound: string; outbound_source: string; return_transport: string; return_source: string }>();
+  assert.equal(oneWayRow?.outbound, "bicycle");
+  assert.equal(oneWayRow?.outbound_source, "explicit_user_supplement");
+  assert.equal(oneWayRow?.return_transport, "shimura_car");
+  assert.equal(oneWayRow?.return_source, "default_personal_practice");
+
+  const beforeAmbiguous = JSON.stringify(oneWayRow);
+  const ambiguous = await hooks.applyParsedPersonalSlotSupplement(oneWayEnv.env, "user-2", "塁は自転車です", Date.now());
+  assert.equal(ambiguous.status, "needs_confirmation");
+  const afterAmbiguous = await oneWayEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS outbound_source, return_transport AS return_transport, return_source AS return_source
+     FROM personal_confirmed_slot_participants WHERE participant_name = '渡辺'`
+  ).first<{ outbound: string; outbound_source: string; return_transport: string; return_source: string }>();
+  assert.equal(JSON.stringify(afterAmbiguous), beforeAmbiguous);
+
+  const parentCar = await hooks.applyParsedPersonalSlotSupplement(
+    oneWayEnv.env,
+    "user-2",
+    "センタは母が送ります。帰りは志村号です",
+    Date.now()
+  );
+  assert.equal(parentCar.status, "applied");
+  const parentRow = await oneWayEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound, outbound_source AS outbound_source, return_transport AS return_transport, return_source AS return_source
+     FROM personal_confirmed_slot_participants WHERE participant_name = '重松'`
+  ).first<{ outbound: string; outbound_source: string; return_transport: string; return_source: string }>();
+  assert.equal(parentRow?.outbound, "parent_car");
+  assert.equal(parentRow?.outbound_source, "explicit_user_supplement");
+  assert.equal(parentRow?.return_transport, "shimura_car");
+  assert.equal(parentRow?.return_source, "explicit_user_supplement");
+
+  const escort = await hooks.applyParsedPersonalSlotSupplement(
+    supplementEnv.env,
+    "user-1",
+    "10/10午後、ケンタの引率代は午前で往復払います",
+    Date.now()
+  );
+  assert.equal(escort.status, "applied");
+  const escortRow = await supplementEnv.env.DB.prepare(
+    `SELECT p.outbound_transport AS outbound, p.outbound_source AS source, p.escort_fee_override AS escort, p.escort_fee_override_reason AS reason
+     FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-10' AND s.start_time = '13:00' AND p.participant_name = '山田'`
+  ).first<{ outbound: string; source: string; escort: string | null; reason: string | null }>();
+  assert.equal(escortRow?.outbound, "shimura_car");
+  assert.equal(escortRow?.source, "default_personal_practice");
+  assert.equal(escortRow?.escort, "no_charge_this_slot");
+  assert.equal(escortRow?.reason, "settled_in_other_slot");
+  const morningUntouched = await supplementEnv.env.DB.prepare(
+    `SELECT escort_fee_override AS escort FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.start_time = '09:00' AND s.practice_date = '2026-10-10' AND p.participant_name = '山田'`
+  ).first<{ escort: string | null }>();
+  assert.equal(morningUntouched?.escort, null);
+
+  await supplementEnv.env.STATE.put(
+    "personal_slot_context:user-1",
+    JSON.stringify({
+      slots: [
+        { practice_date: "2026-10-10", start_time: "09:00" },
+        { practice_date: "2026-10-10", start_time: "13:00" }
+      ],
+      saved_at: new Date().toISOString()
+    })
+  );
+  const multiRecent = await hooks.applyParsedPersonalSlotSupplement(
+    supplementEnv.env,
+    "user-1",
+    "塁は行き自転車です",
+    Date.now()
+  );
+  assert.equal(multiRecent.status, "needs_confirmation");
+
+  const afternoonOnly = await hooks.applyParsedPersonalSlotSupplement(
+    supplementEnv.env,
+    "user-1",
+    "10/10午後、塁は往復自転車",
+    Date.now()
+  );
+  assert.equal(afternoonOnly.status, "applied");
+  const afternoonWatanabe = await supplementEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-10' AND s.start_time = '13:00' AND p.participant_name = '渡辺'`
+  ).first<{ outbound: string }>();
+  const morningWatanabe = await supplementEnv.env.DB.prepare(
+    `SELECT outbound_transport AS outbound FROM personal_confirmed_slot_participants p
+     JOIN personal_confirmed_slots s ON s.id = p.slot_id
+     WHERE s.practice_date = '2026-10-10' AND s.start_time = '09:00' AND p.participant_name = '渡辺'`
+  ).first<{ outbound: string }>();
+  assert.equal(afternoonWatanabe?.outbound, "bicycle");
+  assert.equal(morningWatanabe?.outbound, "shimura_car");
+
+  const court = await hooks.applyParsedPersonalSlotSupplement(supplementEnv.env, "user-1", "B面です", Date.now());
+  assert.equal(court.status, "needs_confirmation");
+  const courtApplied = await hooks.applyParsedPersonalSlotSupplement(
+    oneWayEnv.env,
+    "user-2",
+    "B面です。現地集合です",
+    Date.now()
+  );
+  assert.equal(courtApplied.status, "applied");
+  const courtRow = await oneWayEnv.env.DB.prepare(
+    "SELECT court_or_area AS court, meeting_place AS place, meeting_time AS meeting FROM personal_confirmed_slots WHERE practice_date = '2026-10-11'"
+  ).first<{ court: string | null; place: string | null; meeting: string | null }>();
+  assert.equal(courtRow?.court, "B面");
+  assert.equal(courtRow?.place, "現地");
+  assert.equal(courtRow?.meeting, "08:30");
+
+  const reminderWithTransport = hooks.formatCoordinatorReminder(
+    {
+      id: 1,
+      practice_date: "2026-10-11",
+      start_time: "09:00",
+      end_time: "12:00",
+      practice_location: "中原支援学校",
+      participant_names_json: JSON.stringify(["渡辺", "重松", "山田"]),
+      meeting_time: "08:30",
+      meeting_place: "志村家前",
+      court_or_area: null,
+      notes: null,
+      coordinator_name: "渡辺",
+      rui_participates: 1,
+      watanabe_is_coordinator: 1,
+      coordinator_reminder_sent_at: null,
+      payment_reminder_sent_at: null
+    },
+    { kind: "unknown" },
+    [
+      {
+        slot_id: 1,
+        participant_order: 0,
+        participant_name: "渡辺",
+        outbound_transport: "bicycle",
+        outbound_source: "explicit_user_supplement",
+        return_transport: "shimura_car",
+        return_source: "default_personal_practice",
+        escort_fee_override: null,
+        escort_fee_override_reason: null
+      }
+    ]
+  );
+  assert.match(reminderWithTransport, /自転車（明示）/);
+  assert.match(reminderWithTransport, /志村号（標準）/);
+  assert.equal(reminderWithTransport.includes("参加者ごとの交通手段"), false);
+
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("10/8 白幡台小 19:00〜21:00 行きバス", true), false);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("塁とセンタは往復自転車です", false), false);
+  assert.equal(hooks.shouldRoutePersonalSlotSupplement("個人練習補足 塁は行き自転車です", false), true);
 
   console.log("personal-practice test: all cases passed");
 }
