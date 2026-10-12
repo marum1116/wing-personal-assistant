@@ -5878,6 +5878,200 @@ window.Chouseisan = {
     assert.equal(eightThirty.record.meeting_place, "志村家前");
   }
 
+  function jstInstant(date: string, time: string): number {
+    return Date.parse(`${date}T${time}:00+09:00`);
+  }
+
+  function reminderSlot(overrides: Record<string, unknown>) {
+    return {
+      id: 1,
+      practice_date: "2026-10-11",
+      start_time: "09:00",
+      end_time: "12:00",
+      practice_location: "中原支援学校",
+      participant_names_json: JSON.stringify(["渡辺", "重松", "村中"]),
+      meeting_time: "08:30",
+      meeting_place: "志村家前",
+      court_or_area: null,
+      notes: null,
+      coordinator_name: "渡辺",
+      rui_participates: 1,
+      watanabe_is_coordinator: 1,
+      coordinator_reminder_sent_at: null,
+      payment_reminder_sent_at: null,
+      ...overrides
+    };
+  }
+
+  const dayBeforeNine = jstInstant("2026-10-10", "09:00");
+  const coordinatorPlan = hooks.selectPersonalSlotReminders(dayBeforeNine, [reminderSlot({})], []);
+  assert.equal(coordinatorPlan.coordinatorSlots.length, 1);
+  assert.equal(coordinatorPlan.paymentSlots.length, 0);
+  const coordinatorText = hooks.formatCoordinatorReminder(coordinatorPlan.coordinatorSlots[0], { kind: "unknown" });
+  assert.match(coordinatorText, /【明日の個人練習｜取りまとめ】/);
+  assert.match(coordinatorText, /【案内作成に確認が必要です】/);
+  assert.match(coordinatorText, /参加費の確定金額/);
+  assert.match(coordinatorText, /※設備費等は後日精算となります。/);
+  assert.match(coordinatorText, /当日、塁に持たせる/);
+  assert.equal(coordinatorText.includes("0円"), false);
+  assert.equal(
+    hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "08:45"), [reminderSlot({})], []).coordinatorSlots.length,
+    0
+  );
+
+  const payerTomorrow = hooks.selectPersonalSlotReminders(dayBeforeNine, [
+    reminderSlot({
+      coordinator_name: "重松",
+      watanabe_is_coordinator: 0,
+      participant_names_json: JSON.stringify(["重松", "渡辺", "村中"])
+    })
+  ], []);
+  assert.equal(payerTomorrow.coordinatorSlots.length, 0);
+
+  const endInstant = jstInstant("2026-10-10", "12:00");
+  const payerToday = reminderSlot({
+    practice_date: "2026-10-10",
+    coordinator_name: "重松",
+    watanabe_is_coordinator: 0,
+    participant_names_json: JSON.stringify(["重松", "渡辺", "村中"])
+  });
+  const paymentPlan = hooks.selectPersonalSlotReminders(endInstant, [payerToday], []);
+  assert.equal(paymentPlan.paymentSlots.length, 1);
+  assert.equal(paymentPlan.coordinatorSlots.length, 0);
+  assert.equal(
+    hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "12:14"), [payerToday], []).paymentSlots.length,
+    1
+  );
+  assert.equal(
+    hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "12:30"), [payerToday], []).paymentSlots.length,
+    0
+  );
+  const unknownAmountText = hooks.formatPaymentSideReminder(payerToday, { kind: "unknown" });
+  assert.match(unknownAmountText, /重松さん/);
+  assert.match(unknownAmountText, /金額は個別練習LINEの案内を確認してください。/);
+  assert.equal(unknownAmountText.includes("0円"), false);
+
+  const watanabeEnd = hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "16:00"), [
+    reminderSlot({
+      practice_date: "2026-10-10",
+      start_time: "13:00",
+      end_time: "16:00"
+    })
+  ], []);
+  assert.equal(watanabeEnd.paymentSlots.length, 0);
+
+  const morning = reminderSlot({
+    id: 11,
+    practice_date: "2026-10-10",
+    start_time: "09:00",
+    end_time: "12:00",
+    coordinator_name: "山田",
+    watanabe_is_coordinator: 0,
+    participant_names_json: JSON.stringify(["山田", "渡辺", "藤田"])
+  });
+  const afternoon = reminderSlot({
+    id: 12,
+    practice_date: "2026-10-10",
+    start_time: "13:00",
+    end_time: "16:00",
+    coordinator_name: "渡辺",
+    watanabe_is_coordinator: 1,
+    participant_names_json: JSON.stringify(["渡辺", "重松", "山田"])
+  });
+  const dayBeforeBoth = hooks.selectPersonalSlotReminders(jstInstant("2026-10-09", "09:00"), [morning, afternoon], []);
+  assert.deepEqual(dayBeforeBoth.coordinatorSlots.map((slot) => slot.id), [12]);
+  assert.equal(dayBeforeBoth.paymentSlots.length, 0);
+  const noonBoth = hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "12:00"), [morning, afternoon], [
+    { practice_date: "2026-10-10", amount: 1700, payee: "山田さん", status: "unpaid" }
+  ]);
+  assert.deepEqual(noonBoth.paymentSlots.map((target) => target.slot.id), [11]);
+  assert.equal(noonBoth.paymentSlots[0]?.fee.kind, "unknown");
+  assert.equal(hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "16:00"), [morning, afternoon], []).paymentSlots.length, 0);
+  const ambiguousText = hooks.formatPaymentSideReminder(morning, { kind: "unknown" });
+  assert.equal(ambiguousText.includes("1,700円"), false);
+
+  assert.equal(
+    hooks.selectPersonalSlotReminders(dayBeforeNine, [reminderSlot({ coordinator_reminder_sent_at: "sent" })], []).coordinatorSlots.length,
+    0
+  );
+  assert.equal(
+    hooks.selectPersonalSlotReminders(endInstant, [reminderSlot({ ...payerToday, payment_reminder_sent_at: "sent" })], []).paymentSlots.length,
+    0
+  );
+  assert.equal(
+    hooks.selectPersonalSlotReminders(jstInstant("2026-10-10", "14:00"), [reminderSlot({})], []).coordinatorSlots.length,
+    1
+  );
+
+  const noEnd = hooks.selectPersonalSlotReminders(endInstant, [reminderSlot({ ...payerToday, id: 21, end_time: null })], []);
+  assert.equal(noEnd.paymentSlots.length, 0);
+  assert.deepEqual(noEnd.endTimeUnknownSlotIds, [21]);
+
+  const singleFee = hooks.resolvePersonalSlotFeeLink("2026-10-11", [reminderSlot({})], [
+    { practice_date: "2026-10-11", amount: 1700, payee: "重松さん", status: "unpaid" }
+  ]);
+  assert.equal(singleFee.kind, "amount");
+  if (singleFee.kind === "amount") {
+    const linkedText = hooks.formatPaymentSideReminder(
+      reminderSlot({ coordinator_name: "重松", watanabe_is_coordinator: 0 }),
+      singleFee
+    );
+    assert.match(linkedText, /1,700円/);
+    assert.match(linkedText, /重松さんへPayPayしてください。/);
+  }
+  const paidPlan = hooks.selectPersonalSlotReminders(endInstant, [payerToday], [
+    { practice_date: "2026-10-10", amount: 1700, payee: "重松さん", status: "paid" }
+  ]);
+  assert.equal(paidPlan.paymentSlots.length, 0);
+
+  assert.equal(hooks.classifyScheduledTrigger("*/15 * * * *", 8), "personal_slots");
+  assert.equal(hooks.classifyScheduledTrigger("0 23 * * *", 8), "monthly_fee");
+  assert.equal(hooks.classifyScheduledTrigger("0 0 * * *", 9), "payment");
+
+  const reminderEnv = createTestEnv();
+  await reminderEnv.env.STATE.put("owner_line_user_id", "owner-1");
+  await reminderEnv.env.DB.prepare(
+    `INSERT INTO personal_confirmed_slots (
+      practice_date, start_time, end_time, practice_location, participant_names_json,
+      meeting_time, meeting_place, coordinator_name, rui_participates, watanabe_is_coordinator,
+      source, created_at, updated_at
+    ) VALUES ('2026-10-10', '09:00', '12:00', '中原支援学校', ?1, '08:30', '志村家前', '重松', 1, 0, 'yahoo_calendar_screenshot', 't', 't')`
+  )
+    .bind(JSON.stringify(["重松", "渡辺", "村中"]))
+    .run();
+  await reminderEnv.env.DB.prepare(
+    `INSERT INTO payments (
+      practice_date, payment_type, amount, payee, status, billing_scope, direction, source, rule_key, created_at, updated_at
+    ) VALUES ('2026-10-10', '個人練習代', 1700, '重松さん', 'unpaid', 'event', 'none', 'line', 'personal_practice_fee', 't', 't')`
+  ).run();
+  const failedPush = await hooks.handlePersonalSlotReminderScheduled({ scheduledTime: endInstant }, reminderEnv.env, {
+    nowMs: endInstant,
+    push: async () => undefined
+  });
+  assert.equal(failedPush.paymentSent, 0);
+  const afterFail = await reminderEnv.env.DB.prepare(
+    "SELECT payment_reminder_sent_at AS sent_at FROM personal_confirmed_slots WHERE practice_date = '2026-10-10'"
+  ).first<{ sent_at: string | null }>();
+  assert.equal(afterFail?.sent_at, null);
+  const reminderUntouched = await reminderEnv.env.DB.prepare(
+    "SELECT reminder_sent_on AS sent_on FROM payments WHERE practice_date = '2026-10-10'"
+  ).first<{ sent_on: string | null }>();
+  assert.equal(reminderUntouched?.sent_on, null);
+  const pushed = await hooks.handlePersonalSlotReminderScheduled({ scheduledTime: endInstant }, reminderEnv.env, {
+    nowMs: endInstant,
+    push: async () => 200
+  });
+  assert.equal(pushed.paymentSent, 1);
+  const afterPush = await reminderEnv.env.DB.prepare(
+    "SELECT payment_reminder_sent_at AS sent_at FROM personal_confirmed_slots WHERE practice_date = '2026-10-10'"
+  ).first<{ sent_at: string | null }>();
+  assert.ok(afterPush?.sent_at);
+  const pushedAgain = await hooks.handlePersonalSlotReminderScheduled({ scheduledTime: endInstant }, reminderEnv.env, {
+    nowMs: endInstant,
+    push: async () => 200
+  });
+  assert.equal(pushedAgain.paymentSent, 0);
+
   console.log("personal-practice test: all cases passed");
 }
 

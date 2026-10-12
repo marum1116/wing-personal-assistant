@@ -12289,6 +12289,400 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
   return new Response("OK", { status: 200 });
 }
 
+const PERSONAL_SLOT_REMINDER_CRON = "*/15 * * * *";
+const PERSONAL_SLOT_COORDINATOR_REMINDER_HOUR_JST = 9;
+const PERSONAL_SLOT_PAYMENT_REMINDER_WINDOW_MINUTES = 30;
+
+function classifyScheduledTrigger(cron: string, jstHour: number): "personal_slots" | "monthly_fee" | "payment" {
+  if (cron === PERSONAL_SLOT_REMINDER_CRON) {
+    return "personal_slots";
+  }
+  if (jstHour === 8) {
+    return "monthly_fee";
+  }
+  return "payment";
+}
+
+function getJstHourMinute(epochMs: number): { hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Tokyo",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(new Date(epochMs));
+  const hour = Number(parts.find((part) => part.type === "hour")?.value ?? "0");
+  const minute = Number(parts.find((part) => part.type === "minute")?.value ?? "0");
+  return {
+    hour: hour === 24 ? 0 : hour,
+    minute
+  };
+}
+
+type PersonalSlotReminderRow = {
+  id: number;
+  practice_date: string;
+  start_time: string;
+  end_time: string | null;
+  practice_location: string | null;
+  participant_names_json: string;
+  meeting_time: string | null;
+  meeting_place: string | null;
+  court_or_area: string | null;
+  notes: string | null;
+  coordinator_name: string;
+  rui_participates: number;
+  watanabe_is_coordinator: number;
+  coordinator_reminder_sent_at: string | null;
+  payment_reminder_sent_at: string | null;
+};
+
+type PersonalSlotFeePayment = {
+  practice_date: string;
+  amount: number | null;
+  payee: string | null;
+  status: "unpaid" | "paid";
+};
+
+type PersonalSlotFeeLink =
+  | { kind: "unknown" }
+  | { kind: "paid" }
+  | { kind: "amount"; amount: number; payee: string | null };
+
+type PersonalSlotReminderPlan = {
+  coordinatorSlots: PersonalSlotReminderRow[];
+  paymentSlots: Array<{ slot: PersonalSlotReminderRow; fee: PersonalSlotFeeLink }>;
+  endTimeUnknownSlotIds: number[];
+};
+
+function clockToMinutes(hhmm: string): number | null {
+  const normalized = normalizeYahooClockTime(hhmm);
+  if (!normalized) {
+    return null;
+  }
+  const [hour, minute] = normalized.split(":").map((value) => Number(value));
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    return null;
+  }
+  return hour * 60 + minute;
+}
+
+function formatFamilyHonorific(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return "取りまとめ担当";
+  }
+  return trimmed.endsWith("さん") ? trimmed : `${trimmed}さん`;
+}
+
+function parseSlotParticipantNames(json: string): string[] {
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (!Array.isArray(parsed) || parsed.some((name) => typeof name !== "string")) {
+      return [];
+    }
+    return parsed as string[];
+  } catch {
+    return [];
+  }
+}
+
+function isNakagawaraSupportSchool(location: string | null): boolean {
+  return Boolean(location && location.includes("中原支援学校"));
+}
+
+function resolvePersonalSlotFeeLink(
+  practiceDate: string,
+  slots: PersonalSlotReminderRow[],
+  payments: PersonalSlotFeePayment[]
+): PersonalSlotFeeLink {
+  const slotsOnDate = slots.filter(
+    (slot) => slot.practice_date === practiceDate && Number(slot.rui_participates) === 1
+  ).length;
+  const fees = payments.filter((payment) => payment.practice_date === practiceDate);
+  if (slotsOnDate !== 1 || fees.length !== 1) {
+    return { kind: "unknown" };
+  }
+  const fee = fees[0];
+  if (!fee) {
+    return { kind: "unknown" };
+  }
+  if (fee.status === "paid") {
+    return { kind: "paid" };
+  }
+  if (typeof fee.amount === "number" && fee.amount > 0) {
+    return { kind: "amount", amount: fee.amount, payee: fee.payee };
+  }
+  return { kind: "unknown" };
+}
+
+function selectPersonalSlotReminders(
+  nowMs: number,
+  slots: PersonalSlotReminderRow[],
+  payments: PersonalSlotFeePayment[]
+): PersonalSlotReminderPlan {
+  const today = getJstDateString(nowMs);
+  const tomorrow = shiftYmdByDays(today, 1);
+  const clock = getJstHourMinute(nowMs);
+  const nowMinutes = clock.hour * 60 + clock.minute;
+  const coordinatorDue = clock.hour > PERSONAL_SLOT_COORDINATOR_REMINDER_HOUR_JST ||
+    (clock.hour === PERSONAL_SLOT_COORDINATOR_REMINDER_HOUR_JST && clock.minute >= 0);
+  const coordinatorSlots: PersonalSlotReminderRow[] = [];
+  const paymentSlots: Array<{ slot: PersonalSlotReminderRow; fee: PersonalSlotFeeLink }> = [];
+  const endTimeUnknownSlotIds: number[] = [];
+
+  for (const slot of slots) {
+    if (Number(slot.rui_participates) !== 1) {
+      continue;
+    }
+    if (
+      Number(slot.watanabe_is_coordinator) === 1 &&
+      slot.coordinator_reminder_sent_at === null &&
+      slot.practice_date === tomorrow &&
+      coordinatorDue
+    ) {
+      coordinatorSlots.push(slot);
+    }
+    if (Number(slot.watanabe_is_coordinator) === 1 || slot.payment_reminder_sent_at !== null) {
+      continue;
+    }
+    if (slot.practice_date !== today) {
+      continue;
+    }
+    if (!slot.end_time) {
+      endTimeUnknownSlotIds.push(slot.id);
+      continue;
+    }
+    const endMinutes = clockToMinutes(slot.end_time);
+    if (endMinutes === null) {
+      endTimeUnknownSlotIds.push(slot.id);
+      continue;
+    }
+    if (nowMinutes >= endMinutes && nowMinutes < endMinutes + PERSONAL_SLOT_PAYMENT_REMINDER_WINDOW_MINUTES) {
+      const fee = resolvePersonalSlotFeeLink(slot.practice_date, slots, payments);
+      if (fee.kind === "paid") {
+        continue;
+      }
+      paymentSlots.push({ slot, fee });
+    }
+  }
+
+  return { coordinatorSlots, paymentSlots, endTimeUnknownSlotIds };
+}
+
+function formatCoordinatorReminder(slot: PersonalSlotReminderRow, fee: PersonalSlotFeeLink): string {
+  const participants = parseSlotParticipantNames(slot.participant_names_json);
+  const when = formatYahooSlotWhenLabel(slot.practice_date, slot.start_time, slot.end_time);
+  const month = Number(slot.practice_date.slice(5, 7));
+  const day = Number(slot.practice_date.slice(8, 10));
+  const parsedDate = parseYmdAsUtcDate(slot.practice_date);
+  const weekday = parsedDate ? ["日", "月", "火", "水", "木", "金", "土"][parsedDate.getUTCDay()] ?? "" : "";
+  const dateWithWeekday = `${month}/${day}（${weekday}）`;
+  const dateShort = `${month}/${day}`;
+  const place = slot.practice_location ?? "不明";
+  const meeting =
+    slot.meeting_time && slot.meeting_place
+      ? `${formatYahooClockForLine(slot.meeting_time)} ${slot.meeting_place}`
+      : null;
+  const lines = [
+    "【明日の個人練習｜取りまとめ】",
+    "",
+    when,
+    place,
+    "",
+    "参加者：",
+    participants.join("、"),
+    "",
+    "集合：",
+    meeting ?? "不明"
+  ];
+  const missing = [
+    ...(fee.kind === "amount" ? [] : ["参加費の確定金額"]),
+    "参加者ごとの交通手段",
+    "引率代",
+    "施設費",
+    "高速代",
+    ...(slot.court_or_area ? [] : ["使用コート面"]),
+    "志村さんへ渡す現金の総額"
+  ];
+  const nakagawaraNote = isNakagawaraSupportSchool(slot.practice_location)
+    ? "※設備費等は後日精算となります。"
+    : null;
+  if (fee.kind === "amount" && slot.practice_location && meeting && slot.meeting_time && slot.meeting_place) {
+    lines.push(
+      "",
+      "【個別練習LINEへ送る文章】",
+      "",
+      `${dateWithWeekday}個別練習参加費のご案内です。`,
+      "",
+      `【${slot.practice_location}】${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+      "",
+      `⏰${slot.meeting_place}${formatYahooClockForLine(slot.meeting_time)}集合`,
+      "",
+      `参加費：${formatYen(fee.amount)}`,
+      "",
+      "当日、渡辺まどかまでPayPayにてお支払いをお願いいたします。",
+      ...(nakagawaraNote ? ["", nakagawaraNote] : [])
+    );
+  }
+  lines.push("", "【案内作成に確認が必要です】", "", ...missing.map((item) => `・${item}`), "", "上記を確認後、案内を完成してください。");
+  lines.push(
+    "",
+    "【封筒に書く内容】",
+    "",
+    `日付：${dateShort}`,
+    `参加者：${participants.join("、")}`,
+    "",
+    "＜案内内容＞",
+    `${place} ${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+    meeting ? `集合 ${meeting}` : "集合：不明",
+    fee.kind === "amount" ? `参加費（1人分の記録）：${formatYen(fee.amount)}` : "参加費：確認が必要",
+    "現金：確認が必要",
+    ...(nakagawaraNote ? [nakagawaraNote] : [])
+  );
+  lines.push(
+    "",
+    "【当日の準備】",
+    "",
+    "・志村さんへ渡す現金を用意",
+    "・封筒へ上記内容を記載",
+    "・封筒をしっかり閉じる",
+    "・当日、塁に持たせる"
+  );
+  return lines.join("\n");
+}
+
+function formatPaymentSideReminder(slot: PersonalSlotReminderRow, fee: PersonalSlotFeeLink): string {
+  const payee =
+    fee.kind === "amount" && fee.payee?.trim()
+      ? fee.payee.trim()
+      : formatFamilyHonorific(slot.coordinator_name);
+  const lines = [
+    "【個人練習｜支払い】",
+    "",
+    "個人練習が終了する時間です。",
+    "",
+    "取りまとめ担当：",
+    formatFamilyHonorific(slot.coordinator_name)
+  ];
+  if (fee.kind === "amount") {
+    lines.push("", "参加費：", formatYen(fee.amount), "", `${payee}へPayPayしてください。`);
+  } else {
+    lines.push("", "取りまとめ担当へ参加費をPayPayしてください。", "", "金額は個別練習LINEの案内を確認してください。");
+  }
+  return lines.join("\n");
+}
+
+async function loadPersonalSlotReminderContext(
+  env: Env,
+  today: string,
+  tomorrow: string
+): Promise<{ slots: PersonalSlotReminderRow[]; payments: PersonalSlotFeePayment[] }> {
+  const slotRows = await env.DB.prepare(
+    `SELECT id, practice_date, start_time, end_time, practice_location, participant_names_json,
+            meeting_time, meeting_place, court_or_area, notes, coordinator_name,
+            rui_participates, watanabe_is_coordinator, coordinator_reminder_sent_at, payment_reminder_sent_at
+     FROM personal_confirmed_slots
+     WHERE practice_date IN (?1, ?2)
+       AND rui_participates = 1`
+  )
+    .bind(today, tomorrow)
+    .all<PersonalSlotReminderRow>();
+  const paymentRows = await env.DB.prepare(
+    `SELECT practice_date, amount, payee, status
+     FROM payments
+     WHERE practice_date IN (?1, ?2)
+       AND voided_at IS NULL
+       AND status IN ('unpaid', 'paid')
+       AND rule_key IN ('personal_practice_fee', 'personal_practice_fee_adjustment')`
+  )
+    .bind(today, tomorrow)
+    .all<PersonalSlotFeePayment>();
+  return {
+    slots: slotRows.results ?? [],
+    payments: paymentRows.results ?? []
+  };
+}
+
+async function markPersonalSlotReminderSent(
+  env: Env,
+  slotId: number,
+  column: "coordinator_reminder_sent_at" | "payment_reminder_sent_at",
+  sentAtIso: string
+): Promise<void> {
+  const sql =
+    column === "coordinator_reminder_sent_at"
+      ? `UPDATE personal_confirmed_slots
+         SET coordinator_reminder_sent_at = ?1, updated_at = ?1
+         WHERE id = ?2 AND coordinator_reminder_sent_at IS NULL`
+      : `UPDATE personal_confirmed_slots
+         SET payment_reminder_sent_at = ?1, updated_at = ?1
+         WHERE id = ?2 AND payment_reminder_sent_at IS NULL`;
+  await env.DB.prepare(sql).bind(sentAtIso, slotId).run();
+}
+
+async function handlePersonalSlotReminderScheduled(
+  controller: { scheduledTime?: number },
+  env: Env,
+  deps?: {
+    push?: (to: string, messages: LineReplyMessage[], accessToken: string) => Promise<number | undefined>;
+    nowMs?: number;
+  }
+): Promise<{ coordinatorSent: number; paymentSent: number }> {
+  console.log({ stage: "personal_slot_reminder_start" });
+  const ownerLineUserId = await env.STATE.get("owner_line_user_id");
+  if (!ownerLineUserId) {
+    console.log({ stage: "personal_slot_reminder_no_owner" });
+    return { coordinatorSent: 0, paymentSent: 0 };
+  }
+  const nowMs = deps?.nowMs ?? controller.scheduledTime ?? Date.now();
+  const today = getJstDateString(nowMs);
+  const tomorrow = shiftYmdByDays(today, 1);
+  const { slots, payments } = await loadPersonalSlotReminderContext(env, today, tomorrow);
+  const plan = selectPersonalSlotReminders(nowMs, slots, payments);
+  for (const slotId of plan.endTimeUnknownSlotIds) {
+    console.log({
+      stage: "personal_slot_payment_reminder_skipped",
+      reason: "end_time_unknown",
+      slot_id: slotId
+    });
+  }
+  const push = deps?.push ?? pushLineMessages;
+  const sentAtIso = new Date(nowMs).toISOString();
+  let coordinatorSent = 0;
+  let paymentSent = 0;
+  for (const slot of plan.coordinatorSlots) {
+    const fee = resolvePersonalSlotFeeLink(slot.practice_date, slots, payments);
+    const status = await push(
+      ownerLineUserId,
+      [{ type: "text", text: formatCoordinatorReminder(slot, fee.kind === "paid" ? { kind: "unknown" } : fee) }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof status !== "number") {
+      continue;
+    }
+    await markPersonalSlotReminderSent(env, slot.id, "coordinator_reminder_sent_at", sentAtIso);
+    coordinatorSent += 1;
+  }
+  for (const target of plan.paymentSlots) {
+    const status = await push(
+      ownerLineUserId,
+      [{ type: "text", text: formatPaymentSideReminder(target.slot, target.fee) }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof status !== "number") {
+      continue;
+    }
+    await markPersonalSlotReminderSent(env, target.slot.id, "payment_reminder_sent_at", sentAtIso);
+    paymentSent += 1;
+  }
+  console.log({
+    stage: "personal_slot_reminder_complete",
+    coordinator_sent: coordinatorSent,
+    payment_sent: paymentSent
+  });
+  return { coordinatorSent, paymentSent };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -12339,6 +12733,15 @@ export default {
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (classifyScheduledTrigger(controller.cron, -1) === "personal_slots") {
+      ctx.waitUntil(
+        handlePersonalSlotReminderScheduled(controller, env).catch((error) => {
+          const errorType = error instanceof Error ? error.name : "unknown";
+          console.error("Personal slot reminder scheduled failed", { errorType });
+        })
+      );
+      return;
+    }
     const jstHour = Number(
       new Intl.DateTimeFormat("en-US", {
         timeZone: "Asia/Tokyo",
@@ -12346,7 +12749,7 @@ export default {
         hour12: false
       }).format(new Date(controller.scheduledTime ?? Date.now()))
     );
-    if (jstHour === 8) {
+    if (classifyScheduledTrigger(controller.cron, jstHour) === "monthly_fee") {
       ctx.waitUntil(
         handleMonthlyFeeReminderScheduled(controller, env).catch((error) => {
           const errorType = error instanceof Error ? error.name : "unknown";
@@ -12520,5 +12923,11 @@ export const TEST_HOOKS = {
   handleMarkPaidPostback,
   handlePaymentReminderScheduled,
   handleMonthlyFeeReminderScheduled,
+  handlePersonalSlotReminderScheduled,
+  selectPersonalSlotReminders,
+  resolvePersonalSlotFeeLink,
+  formatCoordinatorReminder,
+  formatPaymentSideReminder,
+  classifyScheduledTrigger,
   getActiveMonthlyFeeRule
 };
