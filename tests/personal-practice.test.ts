@@ -276,6 +276,7 @@ function createTestEnv() {
     );
   `);
   sqlite.exec(readFileSync("migrations/0014_personal_practice_fee_templates.sql", "utf8"));
+  sqlite.exec(readFileSync("migrations/0015_personal_slot_payment_notices.sql", "utf8"));
 
   return {
     raw: sqlite,
@@ -6763,6 +6764,301 @@ window.Chouseisan = {
   );
   assert.match(heldText, /【確認が必要】/);
   assert.equal(heldText.includes("合計："), false);
+
+  const paymentNoticeText = `個人練習支払い
+10/13(火)18:00-21:00 個人練習参加費のご案内です
+
+【永谷地区センター】
+
+指導料　1500×3=4,500円
+施設費　B面　　 540円
+高速代往復　660×2=1,320円
+引率代往復　100×2×3人=600円
+合計　6,960円
+
+お一人　2,320円
+
+18時集合
+
+当日、濱田までPayPayお願いいたします`;
+  const noticeEnv = createTestEnv();
+  const noticeNow = Date.parse("2026-10-14T12:00:00+09:00");
+  await hooks.applyYahooPersonalCalendarSlots(noticeEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-13",
+      start_time: "18:00",
+      end_time: "21:00",
+      practice_location: "永谷地区センター",
+      participant_names: ["濱田", "渡辺", "西坂"],
+      meeting_time: "18:00",
+      meeting_place: null
+    }) as any
+  ]);
+  assert.equal(hooks.splitPersonalPracticePaymentCommand("個人練習支払い"), "image");
+  assert.equal(hooks.splitPersonalPracticePaymentCommand(paymentNoticeText), "text");
+  const registered = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    paymentNoticeText,
+    "line_text",
+    noticeNow
+  );
+  assert.equal(registered.status, "registered");
+  assert.match(registered.message, /2,320円/);
+  assert.match(registered.message, /濱田さん/);
+  assert.match(registered.message, /6,960円/);
+  assert.match(registered.message, /B面/);
+  const noticeRow = await noticeEnv.env.DB.prepare(
+    `SELECT n.payee_name AS payee, n.payee_source AS payee_source, n.payment_method AS method,
+            n.payment_method_source AS method_source, n.participant_amount AS participant_amount,
+            n.total_amount AS total_amount, n.court_or_area AS court, n.fee_breakdown_json AS breakdown,
+            n.source_type AS source_type, s.payment_reminder_sent_at AS sent_at
+     FROM personal_slot_payment_notices n
+     JOIN personal_confirmed_slots s ON s.id = n.slot_id
+     WHERE s.practice_date = '2026-10-13' AND s.start_time = '18:00'`
+  ).first<{
+    payee: string;
+    payee_source: string;
+    method: string;
+    method_source: string;
+    participant_amount: number;
+    total_amount: number;
+    court: string;
+    breakdown: string;
+    source_type: string;
+    sent_at: string | null;
+  }>();
+  assert.equal(noticeRow?.payee, "濱田");
+  assert.equal(noticeRow?.payee_source, "explicit_notice");
+  assert.equal(noticeRow?.method, "PayPay");
+  assert.equal(noticeRow?.method_source, "explicit_notice");
+  assert.equal(noticeRow?.participant_amount, 2320);
+  assert.equal(noticeRow?.total_amount, 6960);
+  assert.equal(noticeRow?.court, "B面");
+  assert.equal(noticeRow?.source_type, "line_text");
+  const breakdown = JSON.parse(noticeRow?.breakdown ?? "[]") as Array<{ label: string; amount: number }>;
+  assert.equal(breakdown.find((item) => item.label === "指導料")?.amount, 4500);
+  assert.equal(breakdown.find((item) => item.label === "施設費")?.amount, 540);
+  assert.equal(breakdown.find((item) => item.label === "高速代")?.amount, 1320);
+  assert.equal(breakdown.find((item) => item.label === "引率代")?.amount, 600);
+  const paymentCount = await noticeEnv.env.DB.prepare("SELECT COUNT(*) AS count FROM payments").first<{ count: number }>();
+  assert.equal(paymentCount?.count, 0);
+
+  const imageRegistered = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    paymentNoticeText.replace(/^個人練習支払い\s*/u, ""),
+    "line_image",
+    noticeNow
+  );
+  assert.equal(imageRegistered.status, "registered");
+  const noticeCount = await noticeEnv.env.DB.prepare(
+    "SELECT COUNT(*) AS count, source_type AS source_type FROM personal_slot_payment_notices"
+  ).first<{ count: number; source_type: string }>();
+  assert.equal(noticeCount?.count, 1);
+  assert.equal(noticeCount?.source_type, "line_image");
+
+  const corrected = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    paymentNoticeText.replace("2,320円", "2,400円"),
+    "line_text",
+    noticeNow
+  );
+  assert.equal(corrected.status, "registered");
+  const correctedAmount = await noticeEnv.env.DB.prepare(
+    "SELECT participant_amount AS amount FROM personal_slot_payment_notices"
+  ).first<{ amount: number }>();
+  assert.equal(correctedAmount?.amount, 2400);
+  await hooks.registerPersonalPracticePaymentNotice(noticeEnv.env, "notice-user", paymentNoticeText, "line_text", noticeNow);
+
+  await hooks.applyYahooPersonalCalendarSlots(noticeEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-13",
+      start_time: "18:00",
+      end_time: "21:00",
+      practice_location: "永谷地区センター",
+      participant_names: ["濱田", "渡辺", "西坂"],
+      meeting_time: "18:00",
+      meeting_place: null
+    }) as any
+  ]);
+  const noticeAfterYahoo = await noticeEnv.env.DB.prepare(
+    "SELECT participant_amount AS amount FROM personal_slot_payment_notices"
+  ).first<{ amount: number }>();
+  assert.equal(noticeAfterYahoo?.amount, 2320);
+
+  const totalOnly = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    paymentNoticeText.replace(/お一人　2,320円\n*/u, ""),
+    "line_text",
+    noticeNow
+  );
+  assert.match(totalOnly.message, /1人分の支払額は案内から確定できませんでした/);
+  const totalOnlyAmount = await noticeEnv.env.DB.prepare(
+    "SELECT participant_amount AS amount, total_amount AS total_amount FROM personal_slot_payment_notices"
+  ).first<{ amount: number | null; total_amount: number }>();
+  assert.equal(totalOnlyAmount?.amount, null);
+  assert.equal(totalOnlyAmount?.total_amount, 6960);
+  await hooks.registerPersonalPracticePaymentNotice(noticeEnv.env, "notice-user", paymentNoticeText, "line_text", noticeNow);
+
+  const missingPayee = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    paymentNoticeText.replace("濱田までPayPay", "PayPay"),
+    "line_text",
+    noticeNow
+  );
+  assert.equal(missingPayee.status, "registered");
+  const fallbackPayee = await noticeEnv.env.DB.prepare(
+    "SELECT payee_name AS payee, payee_source AS source FROM personal_slot_payment_notices"
+  ).first<{ payee: string; source: string }>();
+  assert.equal(fallbackPayee?.payee, "濱田");
+  assert.equal(fallbackPayee?.source, "slot_coordinator");
+  await hooks.registerPersonalPracticePaymentNotice(noticeEnv.env, "notice-user", paymentNoticeText, "line_text", noticeNow);
+
+  const multiEnv = createTestEnv();
+  await hooks.applyYahooPersonalCalendarSlots(multiEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-10",
+      start_time: "09:00",
+      end_time: "12:00",
+      participant_names: ["山田", "渡辺", "藤田"],
+      practice_location: "永谷地区センター"
+    }) as any,
+    yahooDraft({
+      practice_date: "2026-10-10",
+      start_time: "13:00",
+      end_time: "16:00",
+      participant_names: ["山田", "渡辺", "藤田"],
+      practice_location: "永谷地区センター"
+    }) as any
+  ]);
+  const afternoonNotice = await hooks.registerPersonalPracticePaymentNotice(
+    multiEnv.env,
+    "multi-user",
+    paymentNoticeText.replace("10/13(火)18:00-21:00", "10/10(土)13:00-16:00"),
+    "line_text",
+    noticeNow
+  );
+  assert.equal(afternoonNotice.status, "registered");
+  const afternoonNoticeSlots = await multiEnv.env.DB.prepare(
+    `SELECT s.start_time AS start_time FROM personal_slot_payment_notices n
+     JOIN personal_confirmed_slots s ON s.id = n.slot_id`
+  ).all<{ start_time: string }>();
+  assert.deepEqual(afternoonNoticeSlots.results.map((row) => row.start_time), ["13:00"]);
+  const ambiguousNotice = await hooks.registerPersonalPracticePaymentNotice(
+    multiEnv.env,
+    "multi-user",
+    paymentNoticeText.replace("10/13(火)18:00-21:00", "10/10(土)").replace("18:00-21:00", ""),
+    "line_text",
+    noticeNow
+  );
+  assert.equal(ambiguousNotice.status, "needs_confirmation");
+  assert.match(ambiguousNotice.message, /どの個人練習の料金案内か確認が必要/);
+
+  const coordinatorEnv = createTestEnv();
+  await hooks.applyYahooPersonalCalendarSlots(coordinatorEnv.env, [
+    yahooDraft({
+      practice_date: "2026-10-20",
+      start_time: "18:00",
+      end_time: "21:00",
+      participant_names: ["渡辺", "重松", "山田"],
+      practice_location: "永谷地区センター"
+    }) as any
+  ]);
+  const coordinatorNotice = await hooks.registerPersonalPracticePaymentNotice(
+    coordinatorEnv.env,
+    "coordinator-user",
+    paymentNoticeText.replace("10/13(火)", "10/20(火)"),
+    "line_text",
+    noticeNow
+  );
+  assert.match(coordinatorNotice.message, /取りまとめ担当/);
+  const coordinatorSaved = await coordinatorEnv.env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM personal_slot_payment_notices"
+  ).first<{ count: number }>();
+  assert.equal(coordinatorSaved?.count, 0);
+
+  const savedReminderSlot = await noticeEnv.env.DB.prepare(
+    `SELECT id, practice_date, start_time, end_time, practice_location, participant_names_json,
+            meeting_time, meeting_place, court_or_area, notes, coordinator_name,
+            rui_participates, watanabe_is_coordinator, coordinator_reminder_sent_at, payment_reminder_sent_at
+     FROM personal_confirmed_slots WHERE practice_date = '2026-10-13' AND start_time = '18:00'`
+  ).first<any>();
+  const noticePlan = hooks.selectPersonalSlotReminders(jstInstant("2026-10-13", "21:00"), [savedReminderSlot], [], [
+    { slot_id: savedReminderSlot.id, payee_name: "濱田", payment_method: "PayPay", participant_amount: 2320 }
+  ]);
+  assert.equal(noticePlan.paymentSlots.length, 1);
+  assert.equal(noticePlan.paymentSlots[0]?.fee.kind, "notice");
+  const noticeReminder = hooks.formatPaymentSideReminder(savedReminderSlot, noticePlan.paymentSlots[0]!.fee);
+  assert.equal(
+    noticeReminder,
+    ["【個人練習｜支払い】", "", "個人練習が終了する時間です。", "", "濱田さんへ", "2,320円をPayPayしてください。"].join("\n")
+  );
+  await noticeEnv.env.DB.prepare(
+    `INSERT INTO payments (
+      practice_date, payment_type, amount, payee, status, billing_scope, direction, source, rule_key, created_at, updated_at
+    ) VALUES ('2026-10-13', '個人練習代', 1700, '濱田さん', 'unpaid', 'event', 'none', 'line', 'personal_practice_fee', 't', 't')`
+  ).run();
+  const overridePlan = hooks.selectPersonalSlotReminders(
+    jstInstant("2026-10-13", "21:00"),
+    [savedReminderSlot],
+    [{ practice_date: "2026-10-13", amount: 1700, payee: "濱田さん", status: "unpaid" }],
+    [{ slot_id: savedReminderSlot.id, payee_name: "濱田", payment_method: "PayPay", participant_amount: 2320 }]
+  );
+  assert.equal(overridePlan.paymentSlots[0]?.fee.kind, "notice");
+  if (overridePlan.paymentSlots[0]?.fee.kind === "notice") {
+    assert.equal(overridePlan.paymentSlots[0].fee.amount, 2320);
+  }
+  assert.equal(overridePlan.paymentSlots[0]?.noticeOverridesExistingPayment, true);
+  const storedPayment = await noticeEnv.env.DB.prepare(
+    "SELECT amount, status FROM payments WHERE practice_date = '2026-10-13'"
+  ).first<{ amount: number; status: string }>();
+  assert.equal(storedPayment?.amount, 1700);
+  assert.equal(storedPayment?.status, "unpaid");
+  const fallbackPlan = hooks.selectPersonalSlotReminders(
+    jstInstant("2026-10-13", "21:00"),
+    [savedReminderSlot],
+    [{ practice_date: "2026-10-13", amount: 1700, payee: "濱田さん", status: "unpaid" }]
+  );
+  assert.equal(fallbackPlan.paymentSlots[0]?.fee.kind, "amount");
+  const genericPlan = hooks.selectPersonalSlotReminders(jstInstant("2026-10-13", "21:00"), [savedReminderSlot], []);
+  assert.equal(genericPlan.paymentSlots[0]?.fee.kind, "unknown");
+  const paidNoticePlan = hooks.selectPersonalSlotReminders(
+    jstInstant("2026-10-13", "21:00"),
+    [savedReminderSlot],
+    [{ practice_date: "2026-10-13", amount: 1700, payee: "濱田さん", status: "paid" }],
+    [{ slot_id: savedReminderSlot.id, payee_name: "濱田", payment_method: "PayPay", participant_amount: 2320 }]
+  );
+  assert.equal(paidNoticePlan.paymentSlots.length, 1);
+  assert.equal(paidNoticePlan.paymentSlots[0]?.noticeOverridesExistingPayment, true);
+  const matchingPaidPlan = hooks.selectPersonalSlotReminders(
+    jstInstant("2026-10-13", "21:00"),
+    [savedReminderSlot],
+    [{ practice_date: "2026-10-13", amount: 2320, payee: "濱田さん", status: "paid" }],
+    [{ slot_id: savedReminderSlot.id, payee_name: "濱田", payment_method: "PayPay", participant_amount: 2320 }]
+  );
+  assert.equal(matchingPaidPlan.paymentSlots.length, 0);
+  await noticeEnv.env.DB.prepare(
+    "UPDATE personal_confirmed_slots SET payment_reminder_sent_at = 'sent' WHERE practice_date = '2026-10-13'"
+  ).run();
+  const sentBefore = await noticeEnv.env.DB.prepare(
+    "SELECT payment_reminder_sent_at AS sent_at FROM personal_confirmed_slots WHERE practice_date = '2026-10-13'"
+  ).first<{ sent_at: string }>();
+  const afterSent = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    paymentNoticeText,
+    "line_text",
+    noticeNow
+  );
+  assert.match(afterSent.message, /すでに送信済み/);
+  const sentAfter = await noticeEnv.env.DB.prepare(
+    "SELECT payment_reminder_sent_at AS sent_at FROM personal_confirmed_slots WHERE practice_date = '2026-10-13'"
+  ).first<{ sent_at: string }>();
+  assert.equal(sentAfter?.sent_at, sentBefore?.sent_at);
 
   console.log("personal-practice test: all cases passed");
 }
