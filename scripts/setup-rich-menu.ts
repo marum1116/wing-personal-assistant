@@ -11,58 +11,12 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-
-const EXCEL_URL =
-  process.env.EXCEL_URL ??
-  "https://1drv.ms/x/c/9bd7af7f5c25ad41/IQAkWwmfLgFuT6hubXFEMGY_AU5v3uZy-bXHxjaW1QcF-7w";
+import { buildRichMenuAreas, RICH_MENU_HEIGHT, RICH_MENU_WIDTH } from "../src/rich-menu-layout";
 
 const IMAGE_PATH = resolve(process.cwd(), "assets/rich-menu-wing.png");
-const WIDTH = 2500;
-const HEIGHT = 1686;
-const COL = Math.floor(WIDTH / 3);
-const ROW = Math.floor(HEIGHT / 2);
-
-type Area = {
-  bounds: { x: number; y: number; width: number; height: number };
-  action:
-    | { type: "uri"; label: string; uri: string }
-    | { type: "message"; label: string; text: string };
-};
-
-function cell(col: number, row: number): { x: number; y: number; width: number; height: number } {
-  const x = col * COL;
-  const y = row * ROW;
-  const width = col === 2 ? WIDTH - x : COL;
-  const height = row === 1 ? HEIGHT - y : ROW;
-  return { x, y, width, height };
-}
-
-const AREAS: Area[] = [
-  {
-    bounds: cell(0, 0),
-    action: { type: "uri", label: "Excel", uri: EXCEL_URL }
-  },
-  {
-    bounds: cell(1, 0),
-    action: { type: "message", label: "通常調整さん", text: "通常調整さん" }
-  },
-  {
-    bounds: cell(2, 0),
-    action: { type: "message", label: "個人調整さん", text: "個人調整さん" }
-  },
-  {
-    bounds: cell(0, 1),
-    action: { type: "message", label: "引率チェック", text: "引率チェック" }
-  },
-  {
-    bounds: cell(1, 1),
-    action: { type: "message", label: "未払い", text: "未払い" }
-  },
-  {
-    bounds: cell(2, 1),
-    action: { type: "message", label: "塁に連絡", text: "塁に連絡" }
-  }
-];
+const WIDTH = RICH_MENU_WIDTH;
+const HEIGHT = RICH_MENU_HEIGHT;
+const AREAS = buildRichMenuAreas(process.env.EXCEL_URL);
 
 function loadAccessToken(): string | null {
   const fromEnv = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();

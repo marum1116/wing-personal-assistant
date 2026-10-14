@@ -29,6 +29,21 @@ import {
   type PaymentNoticeSlotCandidate,
   type PersonalPracticePaymentNoticeDraft,
 } from "./personal-slot-payment-notice";
+import {
+  buildAmbiguousImageQuickReply,
+  buildAmbiguousTextQuickReply,
+  buildMenuHelpText,
+  classifyPracticeText,
+  decideImageRoute,
+  parseImageCategory,
+  parsePersonalCollectionCommand,
+  PENDING_IMAGE_TTL_SECONDS,
+  PENDING_TEXT_TTL_SECONDS,
+  pendingImageKey,
+  pendingTextKey,
+  type ImageCategory
+} from "./inbound-routing";
+import { planReceivableSync, type ReceivableSnapshot } from "./personal-slot-receivable";
 
 interface Env {
   LINE_CHANNEL_SECRET: string;
@@ -4129,7 +4144,7 @@ function resolvePracticeType(result: StructuredLineResult): {
 
 async function resolvePracticeContext(
   env: Env,
-  sourceId: SourceId,
+  sourceId: SourceId | null,
   userId: string,
   result: StructuredLineResult,
   nowMs: number
@@ -4147,8 +4162,8 @@ async function resolvePracticeContext(
   let typeBasis: ResolvedContextBasis = "unknown";
   const addedUncertainPoints: string[] = [];
   let needsConfirmation = false;
-  const recent = await loadRecentPracticeContext(env, userId, sourceId, nowMs);
-  const sourceLabel = sourceIdToLabel(sourceId);
+  const recent = sourceId ? await loadRecentPracticeContext(env, userId, sourceId, nowMs) : null;
+  const sourceLabel = sourceId ? sourceIdToLabel(sourceId) : "不明";
   const personalPracticeFallbackEligible = isDateLessPersonalPracticePaymentMessage(result);
 
   if (!resolvedPracticeDate) {
@@ -8031,29 +8046,107 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
   return lines;
 }
 
+async function buildPersonalRuiContactBlocks(db: D1Database, practiceDate: string): Promise<string[]> {
+  const slots = await db
+    .prepare(
+      `SELECT id, start_time, end_time, practice_location, meeting_time, meeting_place, participant_names_json,
+              coordinator_name, watanabe_is_coordinator
+       FROM personal_confirmed_slots
+       WHERE practice_date = ?1 AND rui_participates = 1
+       ORDER BY start_time`
+    )
+    .bind(practiceDate)
+    .all<{
+      id: number;
+      start_time: string;
+      end_time: string | null;
+      practice_location: string | null;
+      meeting_time: string | null;
+      meeting_place: string | null;
+      participant_names_json: string;
+      coordinator_name: string;
+      watanabe_is_coordinator: number;
+    }>();
+  const blocks: string[] = [];
+  for (const slot of slots.results ?? []) {
+    const participants = await db
+      .prepare(
+        `SELECT participant_name, outbound_transport, return_transport
+         FROM personal_confirmed_slot_participants
+         WHERE slot_id = ?1
+         ORDER BY participant_order`
+      )
+      .bind(slot.id)
+      .all<{ participant_name: string; outbound_transport: string; return_transport: string }>();
+    const rows = participants.results ?? [];
+    const transportLabel = (value: string) =>
+      value === "shimura_car" ? "志村号" : value === "bicycle" ? "自転車" : value === "parent_car" ? "保護者送迎" : value === "unknown" ? "未確定" : value;
+    const unique = (values: string[]) => [...new Set(values)];
+    const outboundValues = unique(rows.map((row) => transportLabel(row.outbound_transport)));
+    const returnValues = unique(rows.map((row) => transportLabel(row.return_transport)));
+    const names = parseSlotParticipantNames(slot.participant_names_json);
+    const lines = [
+      "【個人練習】",
+      `${formatYahooClockForLine(slot.start_time)}${slot.end_time ? `〜${formatYahooClockForLine(slot.end_time)}` : ""}`,
+      slot.practice_location ?? "場所：不明",
+      `集合：${[slot.meeting_time ? formatYahooClockForLine(slot.meeting_time) : null, slot.meeting_place].filter(Boolean).join(" ") || "不明"}`,
+      `行き：${outboundValues.length === 1 ? outboundValues[0] : "参加者ごとに異なる"}`,
+      `帰り：${returnValues.length === 1 ? returnValues[0] : "参加者ごとに異なる"}`,
+      `参加者：${names.join("、") || "不明"}`,
+      `取りまとめ：${slot.coordinator_name.endsWith("さん") ? slot.coordinator_name : `${slot.coordinator_name}さん`}`
+    ];
+    if (Number(slot.watanabe_is_coordinator) === 1) {
+      lines.push("渡辺家：取りまとめ担当");
+    } else {
+      const notice = await db
+        .prepare(
+          `SELECT participant_amount, payee_name, paid_at
+           FROM personal_slot_payment_notices
+           WHERE slot_id = ?1`
+        )
+        .bind(slot.id)
+        .first<{ participant_amount: number | null; payee_name: string; paid_at: string | null }>();
+      if (notice && typeof notice.participant_amount === "number") {
+        const payee = notice.payee_name.endsWith("さん") ? notice.payee_name : `${notice.payee_name}さん`;
+        lines.push("支払い：", `${notice.participant_amount.toLocaleString("ja-JP")}円 → ${payee}`, notice.paid_at ? "（支払済み）" : "（未払い）");
+      }
+    }
+    blocks.push(lines.join("\n"));
+  }
+  return blocks;
+}
+
 async function buildRuiContactMessages(
   db: D1Database,
   dates: string[],
   labels: string[]
 ): Promise<string[]> {
-  const dayBlocks: Array<{ practice: PracticeRow | null; text: string }> = [];
+  const dayBlocks: Array<{ hasPlan: boolean; text: string }> = [];
   for (let i = 0; i < dates.length; i += 1) {
     const practiceDate = dates[i];
     const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
     const practice = await getPracticeForRuiContact(db, practiceDate);
+    const personalBlocks = await buildPersonalRuiContactBlocks(db, practiceDate);
+    const parts: string[] = [];
+    if (practice) {
+      parts.push(buildRuiContactPracticeBlock(headerLabel, practice).join("\n"));
+    } else if (personalBlocks.length === 0) {
+      parts.push(buildRuiContactPracticeBlock(headerLabel, null).join("\n"));
+    } else {
+      parts.push(`【${headerLabel}】`);
+    }
+    parts.push(...personalBlocks);
     dayBlocks.push({
-      practice,
-      text: buildRuiContactPracticeBlock(headerLabel, practice).join("\n")
+      hasPlan: practice !== null || personalBlocks.length > 0,
+      text: parts.join("\n\n")
     });
   }
 
-  // 日付指定（1日）は従来どおり1吹き出し（予定なしも含む）
   if (dates.length <= 1) {
     return dayBlocks.map((block) => block.text);
   }
 
-  // 日付指定なし（今日＋明日）: 予定がある日だけ別吹き出し。両方なしは1メッセージ。
-  const withPractice = dayBlocks.filter((block) => block.practice !== null);
+  const withPractice = dayBlocks.filter((block) => block.hasPlan);
   if (withPractice.length === 0) {
     return ["今日・明日の練習予定はありません。"];
   }
@@ -11631,49 +11724,40 @@ async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<v
     await handleMarkMonthlyNoteDonePostback(event, env, params.get("month"));
     return;
   }
-
-  const sourceId = parseSourceIdFromPostback(postbackData);
-  if (!sourceId) {
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [buildSourceQuickReply("先に情報源を選んでください。")],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
+  const collectionCommand = parsePersonalCollectionCommand(postbackData);
+  if (collectionCommand && collectionCommand !== "list") {
+    const marked = await applyPersonalCollectionMark(env, collectionCommand);
+    await handlePersonalCollectionCommand(event, env, marked);
+    return;
+  }
+  if (action === "text_kind" && event.source?.userId) {
+    const stored = await env.STATE.get(pendingTextKey(event.source.userId));
+    const kind = params.get("kind") === "personal" ? "これは個人練習です。" : "これは通常練習です。";
+    await processFreeformText(event, env, stored ? `${kind}\n${stored}` : kind, null);
+    return;
+  }
+  if (action === "image_kind" && event.source?.userId) {
+    const stored = await env.STATE.get(pendingImageKey(event.source.userId));
+    const pending = stored ? (JSON.parse(stored) as { messageId?: string; timestamp?: number }) : null;
+    if (!pending?.messageId) {
+      await replyMessages(event.replyToken, [{ type: "text", text: "画像の保持期限が切れました。もう一度送ってください。" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+      return;
     }
+    const imageDataUrl = await fetchLineImageDataUrl(pending.messageId, env);
+    if (!imageDataUrl) {
+      await replyMessages(event.replyToken, [{ type: "text", text: "画像を読み取れませんでした。もう一度送ってください。" }], env.LINE_CHANNEL_ACCESS_TOKEN);
+      return;
+    }
+    const category = parseImageCategory(params.get("kind"));
+    await runClassifiedImage(event, env, event.source.userId, imageDataUrl, category, pending.timestamp ?? Date.now());
     return;
   }
 
-  const userId = event.source?.userId;
-  if (!userId) {
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [{ type: "text", text: "先に情報源を選んでください。" }],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
-    }
+  if (parseSourceIdFromPostback(postbackData)) {
+    await replyMessages(event.replyToken, [{ type: "text", text: buildMenuHelpText() }], env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
-
-  await env.STATE.put(selectedSourceKey(userId), sourceId);
-  const sourceLabel = sourceIdToLabel(sourceId);
-  console.log({ stage: "line_reply_start" });
-  const lineStatus = await replyMessages(
-    event.replyToken,
-    [{ type: "text", text: `${sourceLabel}として受け付けます。\n記録したいメッセージを送ってください。` }],
-    env.LINE_CHANNEL_ACCESS_TOKEN
-  );
-  if (typeof lineStatus === "number") {
-    console.log({ stage: "line_reply_success", status: lineStatus });
-    console.log({ stage: "background_processing_complete" });
-  }
+  await replyMessages(event.replyToken, [{ type: "text", text: buildMenuHelpText() }], env.LINE_CHANNEL_ACCESS_TOKEN);
 }
 
 type YahooPersonalCalendarSlotDraft = {
@@ -11991,6 +12075,57 @@ async function upsertPersonalConfirmedSlot(env: Env, record: YahooConfirmedSlotR
   }
 }
 
+async function syncReceivablesForSlot(env: Env, slotId: number): Promise<{ blockedReason: string | null }> {
+  const slot = await env.DB.prepare(
+    `SELECT id, practice_date, start_time, end_time, practice_location, meeting_place, court_or_area,
+            participant_names_json, watanabe_is_coordinator
+     FROM personal_confirmed_slots
+     WHERE id = ?1`
+  )
+    .bind(slotId)
+    .first<PersonalSlotReminderRow>();
+  if (!slot || Number(slot.watanabe_is_coordinator) !== 1) {
+    return { blockedReason: null };
+  }
+  const participantRows = await loadSlotParticipants(env, slotId);
+  const calculation = await loadPersonalPracticeFeeCalculation(env, slot, participantRows);
+  const existingRows = await env.DB.prepare(
+    `SELECT participant_name, expected_amount, received_at, received_amount, status, review_note
+     FROM personal_slot_receivables
+     WHERE slot_id = ?1`
+  )
+    .bind(slotId)
+    .all<ReceivableSnapshot>();
+  const plan = planReceivableSync({
+    participantNames: parseSlotParticipantNames(slot.participant_names_json),
+    perPersonAmount: calculation.per_person_amount,
+    complete: calculation.status === "complete",
+    uncertainPoints: calculation.uncertain_points,
+    existing: existingRows.results ?? []
+  });
+  if (plan.blockedReason) {
+    return { blockedReason: plan.blockedReason };
+  }
+  const nowIso = new Date().toISOString();
+  for (const row of plan.upserts) {
+    await env.DB.prepare(
+      `INSERT INTO personal_slot_receivables (
+         slot_id, participant_name, expected_amount, received_at, received_amount, status, review_note, created_at, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+       ON CONFLICT(slot_id, participant_name) DO UPDATE SET
+         expected_amount = excluded.expected_amount,
+         received_at = excluded.received_at,
+         received_amount = excluded.received_amount,
+         status = excluded.status,
+         review_note = excluded.review_note,
+         updated_at = excluded.updated_at`
+    )
+      .bind(slotId, row.participant_name, row.expected_amount, row.received_at, row.received_amount, row.status, row.review_note, nowIso)
+      .run();
+  }
+  return { blockedReason: null };
+}
+
 async function applyYahooPersonalCalendarSlots(
   env: Env,
   drafts: YahooPersonalCalendarSlotDraft[]
@@ -12000,6 +12135,16 @@ async function applyYahooPersonalCalendarSlots(
   for (const outcome of outcomes) {
     if (outcome.action === "saved") {
       await upsertPersonalConfirmedSlot(env, outcome.record, nowIso);
+      if (outcome.record.watanabe_is_coordinator) {
+        const saved = await env.DB.prepare(
+          `SELECT id FROM personal_confirmed_slots WHERE practice_date = ?1 AND start_time = ?2`
+        )
+          .bind(outcome.record.practice_date, outcome.record.start_time)
+          .first<{ id: number }>();
+        if (saved) {
+          await syncReceivablesForSlot(env, saved.id);
+        }
+      }
     }
   }
   return outcomes;
@@ -12656,8 +12801,18 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     await handleYahooPersonalCalendarCommand(event, env);
     return;
   }
-  if (splitPersonalPracticePaymentCommand(inputText) || looksLikePersonalPracticePaymentNotice(inputText)) {
+  if (splitPersonalPracticePaymentCommand(inputText) || looksLikePersonalPracticePaymentNotice(inputText) || classifyPracticeText(inputText) === "personal_notice") {
     await handlePersonalPracticePaymentCommand(event, env, inputText);
+    return;
+  }
+  const collectionCommand = parsePersonalCollectionCommand(inputText);
+  if (collectionCommand === "list") {
+    await handlePersonalCollectionCommand(event, env);
+    return;
+  }
+  if (collectionCommand) {
+    const marked = await applyPersonalCollectionMark(env, collectionCommand);
+    await handlePersonalCollectionCommand(event, env, marked);
     return;
   }
   if (event.source?.userId && (await maybeHandlePersonalSlotSupplement(event, env, inputText))) {
@@ -12665,16 +12820,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   }
 
   if (MENU_TRIGGERS.has(inputText)) {
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [buildSourceQuickReply("情報源を選んでください。")],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
-    }
+    await replyMessages(event.replyToken, [{ type: "text", text: buildMenuHelpText() }], env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
@@ -12706,42 +12852,40 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     return;
   }
 
+  if (classifyPracticeText(inputText) === "ambiguous" && event.source?.userId) {
+    await env.STATE.put(pendingTextKey(event.source.userId), inputText, { expirationTtl: PENDING_TEXT_TTL_SECONDS });
+    const prompt = buildAmbiguousTextQuickReply();
+    await replyMessages(event.replyToken, [quickReplyMessage(prompt.text, prompt.items)], env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
+  await processFreeformText(event, env, inputText, null);
+}
+
+async function processFreeformText(
+  event: LineWebhookEvent,
+  env: Env,
+  inputText: string,
+  presetImage: string | null
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
   const userId = event.source?.userId;
   if (!userId) {
-    await replyMessages(
-      event.replyToken,
-      [buildSourceQuickReply("先に情報源を選んでください。")],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
+    await replyMessages(event.replyToken, [{ type: "text", text: buildMenuHelpText() }], env.LINE_CHANNEL_ACCESS_TOKEN);
     return;
   }
 
-  await sleep(PAIR_WAIT_MS);
-  console.log({ stage: "pair_lookup_start" });
-  const textTimestamp = event.timestamp ?? Date.now();
-  const imageDataUrl = await resolvePairedImageDataUrlForTextEvent(env, userId, textTimestamp);
-
-  const selectedSourceId = await env.STATE.get(selectedSourceKey(userId));
-  console.log({
-    stage: "source_loaded",
-    hasSelectedSource: typeof selectedSourceId === "string" && selectedSourceId.length > 0
-  });
-
-  if (!selectedSourceId || !isSourceId(selectedSourceId)) {
-    console.log({ stage: "line_reply_start" });
-    const lineStatus = await replyMessages(
-      event.replyToken,
-      [buildSourceQuickReply("先に情報源を選んでください。")],
-      env.LINE_CHANNEL_ACCESS_TOKEN
-    );
-    if (typeof lineStatus === "number") {
-      console.log({ stage: "line_reply_success", status: lineStatus });
-      console.log({ stage: "background_processing_complete" });
-    }
-    return;
+  let imageDataUrl = presetImage;
+  if (!imageDataUrl) {
+    await sleep(PAIR_WAIT_MS);
+    console.log({ stage: "pair_lookup_start" });
+    imageDataUrl = await resolvePairedImageDataUrlForTextEvent(env, userId, event.timestamp ?? Date.now());
   }
 
-  const sourceLabel = sourceIdToLabel(selectedSourceId);
+  const sourceId: SourceId | null = null;
+  const sourceLabel = "不明";
+  console.log({ stage: "source_loaded", hasSelectedSource: false });
   try {
     const receivedAtMs = event.timestamp ?? Date.now();
     const receivedAtIso = new Date(receivedAtMs).toISOString();
@@ -12776,7 +12920,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     if (monthlyHandled) {
       return;
     }
-    const resolved = await resolvePracticeContext(env, selectedSourceId, userId, parsed, receivedAtMs);
+    const resolved = await resolvePracticeContext(env, sourceId, userId, parsed, receivedAtMs);
     console.log({
       stage: "context_resolved",
       resolved_practice_date: resolved.resolvedPracticeDate,
@@ -12929,12 +13073,12 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
       messages.push({ type: "text", text: saveResult.reviewWarnings[0] });
     }
 
-    if (guardedResult.practice_date && standingApplied.resolvedPracticeType !== "不明") {
+    if (sourceId && guardedResult.practice_date && standingApplied.resolvedPracticeType !== "不明") {
       try {
         await saveRecentPracticeContext(
           env,
           userId,
-          selectedSourceId,
+          sourceId,
           guardedResult.practice_date,
           standingApplied.resolvedPracticeType,
           receivedAtMs
@@ -12970,6 +13114,228 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
 
 }
 
+function quickReplyMessage(text: string, items: Array<{ label: string; data: string; displayText: string }>): LineReplyMessage {
+  return {
+    type: "text",
+    text,
+    quickReply: {
+      items: items.slice(0, 13).map((item) => ({
+        type: "action",
+        action: {
+          type: "postback",
+          label: item.label.slice(0, 20),
+          data: item.data,
+          displayText: item.displayText
+        }
+      }))
+    }
+  };
+}
+
+async function callOpenAIForImageCategory(imageDataUrl: string, env: Env): Promise<ImageCategory> {
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      reasoning: { effort: "none" },
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "画像を1種類だけに分類してください。確信が持てない、または複数に見える場合は unknown です。" +
+                "personal_yahoo_calendar はYahooカレンダーの個人練習予定です。" +
+                "personal_payment_notice は個人練習の参加費案内です。" +
+                "regular_practice_or_transport は通常練習の連絡や配車です。" +
+                "monthly_fee_notice は月謝案内です。"
+            }
+          ]
+        },
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: "この画像の種類を返してください。" },
+            { type: "input_image", image_url: imageDataUrl }
+          ]
+        }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "inbound_image_category",
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: { category: { type: "string", enum: ["personal_yahoo_calendar", "personal_payment_notice", "regular_practice_or_transport", "monthly_fee_notice", "unknown"] } },
+            required: ["category"]
+          }
+        }
+      }
+    })
+  });
+  if (!response.ok) {
+    return "unknown";
+  }
+  const payload = (await response.json()) as { output_text?: string; output?: Array<{ content?: Array<{ text?: string }> }> };
+  const rawText = payload.output_text ?? payload.output?.flatMap((item) => item.content ?? []).map((content) => content.text ?? "").join("") ?? "";
+  const parsed = JSON.parse(rawText) as { category?: unknown };
+  return parseImageCategory(parsed.category);
+}
+
+async function runClassifiedImage(
+  event: LineWebhookEvent,
+  env: Env,
+  userId: string,
+  imageDataUrl: string,
+  category: ImageCategory,
+  nowMs: number
+): Promise<void> {
+  const route = decideImageRoute(category);
+  if (!event.replyToken) {
+    return;
+  }
+  if (route === "ask") {
+    const prompt = buildAmbiguousImageQuickReply();
+    await replyMessages(event.replyToken, [quickReplyMessage(prompt.text, prompt.items)], env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
+  if (route === "yahoo") {
+    const drafts = await callOpenAIForYahooPersonalCalendar(imageDataUrl, new Date(nowMs).toISOString(), env);
+    const outcomes = await applyYahooPersonalCalendarSlots(env, drafts);
+    await savePersonalSlotContext(
+      env,
+      userId,
+      outcomes.flatMap((outcome) => (outcome.action === "saved" ? [{ practice_date: outcome.record.practice_date, start_time: outcome.record.start_time }] : []))
+    );
+    await replyMessages(event.replyToken, [{ type: "text", text: formatYahooPersonalCalendarReply(outcomes) }], env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
+  if (route === "notice") {
+    const transcript = await callOpenAIForPersonalPracticePaymentNotice(imageDataUrl, env);
+    if (!looksLikePersonalPracticePaymentNotice(transcript) && !transcript.includes("個人練習")) {
+      const prompt = buildAmbiguousImageQuickReply();
+      await replyMessages(event.replyToken, [quickReplyMessage(prompt.text, prompt.items)], env.LINE_CHANNEL_ACCESS_TOKEN);
+      return;
+    }
+    const result = await registerPersonalPracticePaymentNotice(env, userId, transcript, "line_image", nowMs);
+    await replyMessages(event.replyToken, [{ type: "text", text: result.message }], env.LINE_CHANNEL_ACCESS_TOKEN);
+    return;
+  }
+  const hint = route === "monthly" ? "これは月謝案内です。" : route === "regular" ? "これは通常練習の連絡です。" : "これは個人練習の連絡です。";
+  await processFreeformText(event, env, `${hint}\n画像の内容を読み取ってください。`, imageDataUrl);
+}
+
+async function handlePersonalCollectionCommand(event: LineWebhookEvent, env: Env, lead?: string): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const today = getJstDateString(event.timestamp ?? Date.now());
+  const slots = await env.DB.prepare(
+    `SELECT id, practice_date, start_time, end_time, practice_location
+     FROM personal_confirmed_slots
+     WHERE rui_participates = 1
+       AND watanabe_is_coordinator = 1
+       AND (
+         (practice_date >= date(?1, '-21 days') AND practice_date <= date(?1, '+45 days'))
+         OR id IN (
+           SELECT r.slot_id
+           FROM personal_slot_receivables r
+           JOIN personal_confirmed_slots s2 ON s2.id = r.slot_id
+           WHERE r.status IN ('open', 'needs_review')
+             AND s2.practice_date >= date(?1, '-60 days')
+         )
+       )
+     ORDER BY practice_date, start_time
+     LIMIT 8`
+  )
+    .bind(today)
+    .all<{ id: number; practice_date: string; start_time: string; end_time: string | null; practice_location: string | null }>();
+  const lines = ["《個人練習｜集金確認》"];
+  if (lead) {
+    lines.push("", lead);
+  }
+  const actions: Array<{ label: string; data: string; displayText: string }> = [];
+  if ((slots.results ?? []).length === 0) {
+    lines.push("", "確認できる取りまとめ枠はありません。");
+  }
+  for (const slot of slots.results ?? []) {
+    const sync = await syncReceivablesForSlot(env, slot.id);
+    lines.push("", formatYahooSlotWhenLabel(slot.practice_date, slot.start_time, slot.end_time), slot.practice_location ?? "場所：不明");
+    if (sync.blockedReason) {
+      lines.push("金額が未確定のため集金状況を作成できません。", "確認が必要：", sync.blockedReason);
+      continue;
+    }
+    const rows = await env.DB.prepare(
+      `SELECT participant_name, expected_amount, status, review_note
+       FROM personal_slot_receivables
+       WHERE slot_id = ?1
+       ORDER BY id`
+    )
+      .bind(slot.id)
+      .all<{ participant_name: string; expected_amount: number | null; status: string; review_note: string | null }>();
+    for (const row of rows.results ?? []) {
+      const amount = typeof row.expected_amount === "number" ? `${row.expected_amount.toLocaleString("ja-JP")}円` : "金額未確定";
+      const state = row.status === "received" ? "受取済" : row.status === "needs_review" ? "要確認" : "未受取";
+      lines.push("", `${row.participant_name.endsWith("さん") ? row.participant_name : `${row.participant_name}さん`}`, amount, state);
+      if (row.review_note) {
+        lines.push(row.review_note);
+      }
+      const commandName = row.status === "received" ? "個人練習未受取" : "個人練習受取済";
+      const command = `${commandName} ${slot.practice_date} ${slot.start_time} ${row.participant_name}`;
+      const label = row.status === "received" ? `${row.participant_name} 未受取に戻す` : `${row.participant_name} 受取済みにする`;
+      if (actions.length < 13) {
+        actions.push({ label, data: command, displayText: label });
+      }
+    }
+  }
+  const message: LineReplyMessage = actions.length > 0 ? quickReplyMessage(lines.join("\n"), actions) : { type: "text", text: lines.join("\n") };
+  await replyMessages(event.replyToken, [message], env.LINE_CHANNEL_ACCESS_TOKEN);
+}
+
+async function applyPersonalCollectionMark(
+  env: Env,
+  command: { action: "received" | "unreceived"; practiceDate: string; startTime: string; participantName: string }
+): Promise<string> {
+  const slot = await env.DB.prepare(
+    `SELECT id FROM personal_confirmed_slots
+     WHERE practice_date = ?1 AND start_time = ?2 AND watanabe_is_coordinator = 1`
+  )
+    .bind(command.practiceDate, command.startTime)
+    .first<{ id: number }>();
+  if (!slot) {
+    return "対象の個人練習が見つかりませんでした。";
+  }
+  const nowIso = new Date().toISOString();
+  if (command.action === "received") {
+    const update = await env.DB.prepare(
+      `UPDATE personal_slot_receivables
+       SET received_at = ?1, received_amount = expected_amount, status = 'received', review_note = NULL, updated_at = ?1
+       WHERE slot_id = ?2 AND participant_name = ?3 AND status != 'needs_review'`
+    )
+      .bind(nowIso, slot.id, command.participantName)
+      .run();
+    if (Number(update.meta.changes ?? 0) === 0) {
+      return "受取済みにできませんでした。金額の確認が必要な場合があります。";
+    }
+    return `${command.participantName}さんを受取済みにしました。`;
+  }
+  await env.DB.prepare(
+    `UPDATE personal_slot_receivables
+     SET received_at = NULL, received_amount = NULL, status = 'open', review_note = NULL, updated_at = ?1
+     WHERE slot_id = ?2 AND participant_name = ?3`
+  )
+    .bind(nowIso, slot.id, command.participantName)
+    .run();
+  return `${command.participantName}さんを未受取に戻しました。`;
+}
+
 async function handleImageMessageEvent(event: LineWebhookEvent, env: Env): Promise<void> {
   console.log({ stage: "pair_image_received" });
   const userId = event.source?.userId;
@@ -12984,6 +13350,7 @@ async function handleImageMessageEvent(event: LineWebhookEvent, env: Env): Promi
     timestamp
   });
   console.log({ stage: "pair_image_saved" });
+  await env.STATE.put(pendingImageKey(userId), JSON.stringify({ messageId, timestamp }), { expirationTtl: PENDING_IMAGE_TTL_SECONDS });
   if (!event.replyToken) {
     return;
   }
@@ -12992,31 +13359,15 @@ async function handleImageMessageEvent(event: LineWebhookEvent, env: Env): Promi
     if (!imageDataUrl) {
       return;
     }
-    const transcript = await callOpenAIForPersonalPracticePaymentNotice(imageDataUrl, env);
-    if (!looksLikePersonalPracticePaymentNotice(transcript)) {
-      return;
-    }
-    const result = await registerPersonalPracticePaymentNotice(env, userId, transcript, "line_image", timestamp);
-    const reply: LineReplyMessage = { type: "text", text: result.message };
-    if (result.status === "registered" && result.noticeId && !result.message.includes("確定できませんでした")) {
-      reply.quickReply = {
-        items: [
-          {
-            type: "action",
-            action: {
-              type: "postback",
-              label: "支払済みにする",
-              data: `action=mark_paid&payment_kind=personal_notice&payment_id=${result.noticeId}`,
-              displayText: "支払済みにする"
-            }
-          }
-        ]
-      };
-    }
-    await replyMessages(event.replyToken, [reply], env.LINE_CHANNEL_ACCESS_TOKEN);
+    const category = await callOpenAIForImageCategory(imageDataUrl, env);
+    await runClassifiedImage(event, env, userId, imageDataUrl, category, timestamp);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "unknown";
-    console.error("Personal practice payment notice image skipped", { errorType });
+    console.error("Image auto route failed", { errorType });
+    if (event.replyToken) {
+      const prompt = buildAmbiguousImageQuickReply();
+      await replyMessages(event.replyToken, [quickReplyMessage(prompt.text, prompt.items)], env.LINE_CHANNEL_ACCESS_TOKEN);
+    }
   }
 }
 
@@ -13980,5 +14331,12 @@ export const TEST_HOOKS = {
   calculatePersonalPracticeFee,
   selectPersonalPracticeFeeTemplate,
   loadPersonalPracticeFeeCalculation,
-  getActiveMonthlyFeeRule
+  getActiveMonthlyFeeRule,
+  classifyPracticeText,
+  decideImageRoute,
+  buildMenuHelpText,
+  planReceivableSync,
+  syncReceivablesForSlot,
+  parsePersonalCollectionCommand,
+  applyPersonalCollectionMark
 };

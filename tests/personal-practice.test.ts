@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import { TEST_HOOKS } from "../src/index";
+import { buildRichMenuAreas, RICH_MENU_HEIGHT, RICH_MENU_LABELS, RICH_MENU_WIDTH } from "../src/rich-menu-layout";
+import { planReceivableSync } from "../src/personal-slot-receivable";
 
 type D1Result = { meta: { changes: number; last_row_id?: number } };
 
@@ -278,6 +280,7 @@ function createTestEnv() {
   sqlite.exec(readFileSync("migrations/0014_personal_practice_fee_templates.sql", "utf8"));
   sqlite.exec(readFileSync("migrations/0015_personal_slot_payment_notices.sql", "utf8"));
   sqlite.exec(readFileSync("migrations/0016_personal_slot_payment_notice_paid_at.sql", "utf8"));
+  sqlite.exec(readFileSync("migrations/0017_personal_slot_receivables.sql", "utf8"));
 
   return {
     raw: sqlite,
@@ -7135,6 +7138,125 @@ window.Chouseisan = {
   if (correctedItem?.payment_kind === "personal_notice") {
     assert.equal(correctedItem.amount, 2400);
   }
+
+  const areas = buildRichMenuAreas();
+  assert.equal(areas.length, 6);
+  assert.deepEqual(RICH_MENU_LABELS, ["Excel", "通常調整さん", "未払い", "引率チェック", "個人練習集金確認", "塁に連絡"]);
+  assert.equal(areas[0]?.action.type, "uri");
+  assert.equal(areas[1]?.action.type === "message" && areas[1].action.text, "通常調整さん");
+  assert.equal(areas[2]?.action.type === "message" && areas[2].action.text, "未払い");
+  assert.equal(areas[3]?.action.type === "message" && areas[3].action.text, "引率チェック");
+  assert.equal(areas[4]?.action.type === "message" && areas[4].action.text, "個人練習集金確認");
+  assert.equal(areas[5]?.action.type === "message" && areas[5].action.text, "塁に連絡");
+  assert.equal(JSON.stringify(areas).includes("個人調整さん"), false);
+  assert.equal(JSON.stringify(areas).includes("個人練習カレンダー"), false);
+  assert.equal(areas[0]?.bounds.y, 0);
+  assert.ok((areas[3]?.bounds.y ?? 0) > 0);
+  assert.equal(areas[2]?.bounds.x, RICH_MENU_WIDTH - areas[2]!.bounds.width);
+  assert.equal(RICH_MENU_WIDTH, 2500);
+  assert.equal(RICH_MENU_HEIGHT, 1686);
+  assert.equal(hooks.decideImageRoute("personal_yahoo_calendar"), "yahoo");
+  assert.equal(hooks.decideImageRoute("personal_payment_notice"), "notice");
+  assert.equal(hooks.decideImageRoute("regular_practice_or_transport"), "regular");
+  assert.equal(hooks.decideImageRoute("monthly_fee_notice"), "monthly");
+  assert.equal(hooks.decideImageRoute("unknown"), "ask");
+  assert.equal(hooks.classifyPracticeText("10/13 個人練習参加費 お一人 2,320円 合計 6,960円"), "personal_notice");
+  assert.equal(hooks.classifyPracticeText("今日の通常練習の配車です"), "regular");
+  assert.equal(hooks.classifyPracticeText("今日の個人練習です"), "personal");
+  assert.equal(hooks.classifyPracticeText("通常練習かつ個人練習の連絡"), "ambiguous");
+  assert.match(hooks.buildMenuHelpText(), /個人練習集金確認/);
+  assert.equal(hooks.buildMenuHelpText().includes("情報源"), false);
+  const kept = planReceivableSync({
+    participantNames: ["渡辺", "重松", "山田"],
+    perPersonAmount: 2100,
+    complete: true,
+    uncertainPoints: [],
+    existing: [{ participant_name: "重松", expected_amount: 2100, received_at: "sent", received_amount: 2100, status: "received", review_note: null }]
+  });
+  assert.deepEqual(kept.upserts.map((row) => row.participant_name), ["重松", "山田"]);
+  assert.equal(kept.upserts[0]?.received_at, "sent");
+  assert.equal(kept.upserts[1]?.expected_amount, 2100);
+  const mismatch = planReceivableSync({
+    participantNames: ["渡辺", "重松"],
+    perPersonAmount: 2400,
+    complete: true,
+    uncertainPoints: [],
+    existing: [{ participant_name: "重松", expected_amount: 2100, received_at: "sent", received_amount: 2100, status: "received", review_note: null }]
+  });
+  assert.equal(mismatch.upserts[0]?.status, "needs_review");
+  assert.equal(mismatch.upserts[0]?.expected_amount, 2100);
+  const blocked = planReceivableSync({
+    participantNames: ["渡辺", "重松"],
+    perPersonAmount: null,
+    complete: false,
+    uncertainPoints: ["使用コート面ごとの施設費"],
+    existing: []
+  });
+  assert.equal(blocked.upserts.length, 0);
+  assert.match(blocked.blockedReason ?? "", /使用コート面/);
+  const updated = planReceivableSync({
+    participantNames: ["山田"],
+    perPersonAmount: 2200,
+    complete: true,
+    uncertainPoints: [],
+    existing: [{ participant_name: "山田", expected_amount: 2100, received_at: null, received_amount: null, status: "open", review_note: null }]
+  });
+  assert.equal(updated.upserts[0]?.expected_amount, 2200);
+  assert.equal(updated.upserts[0]?.status, "open");
+
+  const collectionEnv = createTestEnv();
+  await hooks.applyYahooPersonalCalendarSlots(collectionEnv.env, [
+    yahooDraft({
+      practice_date: "2026-11-08",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "永谷地区センター",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前",
+      court_or_area: "B面"
+    }) as any
+  ]);
+  const collectionSlot = await collectionEnv.env.DB.prepare(
+    `SELECT id FROM personal_confirmed_slots WHERE practice_date = '2026-11-08'`
+  ).first<{ id: number }>();
+  await hooks.syncReceivablesForSlot(collectionEnv.env, collectionSlot!.id);
+  const receivables = await collectionEnv.env.DB.prepare(
+    `SELECT participant_name, expected_amount, status FROM personal_slot_receivables ORDER BY participant_name`
+  ).all<{ participant_name: string; expected_amount: number; status: string }>();
+  assert.deepEqual(receivables.results.map((row) => row.participant_name), ["山田", "重松"]);
+  assert.ok((receivables.results[0]?.expected_amount ?? 0) > 0);
+  assert.equal(receivables.results.every((row) => row.participant_name !== "渡辺"), true);
+  const marked = await hooks.applyPersonalCollectionMark(collectionEnv.env, {
+    action: "received",
+    practiceDate: "2026-11-08",
+    startTime: "13:00",
+    participantName: "重松"
+  });
+  assert.match(marked, /受取済み/);
+  await hooks.applyYahooPersonalCalendarSlots(collectionEnv.env, [
+    yahooDraft({
+      practice_date: "2026-11-08",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "永谷地区センター",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前",
+      court_or_area: "B面"
+    }) as any
+  ]);
+  const receivableAfterResend = await collectionEnv.env.DB.prepare(
+    `SELECT status, received_at FROM personal_slot_receivables WHERE participant_name = '重松'`
+  ).first<{ status: string; received_at: string | null }>();
+  assert.equal(receivableAfterResend?.status, "received");
+  assert.ok(receivableAfterResend?.received_at);
+  const contact = await hooks.buildRuiContactMessages(collectionEnv.env.DB as any, ["2026-11-08"], ["11/8（日）"]);
+  assert.match(contact[0] ?? "", /【個人練習】/);
+  assert.match(contact[0] ?? "", /渡辺家：取りまとめ担当/);
+  const payerContact = await hooks.buildRuiContactMessages(noticeEnv.env.DB as any, ["2026-10-13"], ["10/13（火）"]);
+  assert.match(payerContact[0] ?? "", /2,400円/);
+  assert.match(payerContact[0] ?? "", /未払い|支払済み/);
 
   console.log("personal-practice test: all cases passed");
 }

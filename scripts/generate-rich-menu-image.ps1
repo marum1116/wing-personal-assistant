@@ -16,11 +16,17 @@ $g.TextRenderingHint = "ClearTypeGridFit"
 $g.Clear([System.Drawing.Color]::FromArgb(245, 247, 250))
 
 $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(180, 190, 200), 6)
+$fontSize = 72
+foreach ($label in $labels) {
+  if ([string]$label.Length -ge 8) {
+    $fontSize = 48
+  }
+}
 $fontFamily = "Yu Gothic UI"
 try {
-  $font = New-Object System.Drawing.Font $fontFamily, 72, ([System.Drawing.FontStyle]::Bold)
+  $font = New-Object System.Drawing.Font $fontFamily, $fontSize, ([System.Drawing.FontStyle]::Bold)
 } catch {
-  $font = New-Object System.Drawing.Font "Meiryo UI", 72, ([System.Drawing.FontStyle]::Bold)
+  $font = New-Object System.Drawing.Font "Meiryo UI", $fontSize, ([System.Drawing.FontStyle]::Bold)
 }
 $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(30, 45, 70))
 $sf = New-Object System.Drawing.StringFormat
