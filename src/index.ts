@@ -13510,6 +13510,7 @@ type PersonalSlotFeeLink =
   | { kind: "notice"; amount: number; payee: string; method: string };
 
 type PersonalSlotPaymentNoticeReminder = {
+  id?: number;
   slot_id: number;
   payee_name: string;
   payment_method: string;
@@ -13519,7 +13520,12 @@ type PersonalSlotPaymentNoticeReminder = {
 
 type PersonalSlotReminderPlan = {
   coordinatorSlots: PersonalSlotReminderRow[];
-  paymentSlots: Array<{ slot: PersonalSlotReminderRow; fee: PersonalSlotFeeLink; noticeOverridesExistingPayment?: boolean }>;
+  paymentSlots: Array<{
+    slot: PersonalSlotReminderRow;
+    fee: PersonalSlotFeeLink;
+    noticeId?: number;
+    noticeOverridesExistingPayment?: boolean;
+  }>;
   endTimeUnknownSlotIds: number[];
 };
 
@@ -13655,6 +13661,7 @@ function selectPersonalSlotReminders(
             payee: notice.payee_name,
             method: notice.payment_method
           },
+          noticeId: typeof notice.id === "number" ? notice.id : undefined,
           noticeOverridesExistingPayment: existingAmountDiffers
         });
         continue;
@@ -13918,11 +13925,13 @@ function formatCoordinatorReminder(
 }
 
 function formatPaymentSideReminder(slot: PersonalSlotReminderRow, fee: PersonalSlotFeeLink): string {
+  const when = formatYahooSlotWhenLabel(slot.practice_date, slot.start_time, slot.end_time);
   if (fee.kind === "notice") {
     const payee = formatFamilyHonorific(fee.payee);
     return [
       "【個人練習｜支払い】",
       "",
+      when,
       "個人練習が終了する時間です。",
       "",
       `${payee}へ`,
@@ -13936,6 +13945,7 @@ function formatPaymentSideReminder(slot: PersonalSlotReminderRow, fee: PersonalS
   const lines = [
     "【個人練習｜支払い】",
     "",
+    when,
     "個人練習が終了する時間です。",
     "",
     "取りまとめ担当：",
@@ -13975,7 +13985,7 @@ async function loadPersonalSlotReminderContext(
     .bind(today, tomorrow)
     .all<PersonalSlotFeePayment>();
   const noticeRows = await env.DB.prepare(
-    `SELECT n.slot_id, n.payee_name, n.payment_method, n.participant_amount, n.paid_at
+    `SELECT n.id, n.slot_id, n.payee_name, n.payment_method, n.participant_amount, n.paid_at
      FROM personal_slot_payment_notices n
      JOIN personal_confirmed_slots s ON s.id = n.slot_id
      WHERE s.practice_date IN (?1, ?2)`
@@ -14059,9 +14069,20 @@ async function handlePersonalSlotReminderScheduled(
         notice_amount: target.fee.amount
       });
     }
+    const paymentText = formatPaymentSideReminder(target.slot, target.fee);
+    const paymentMessage: LineReplyMessage =
+      typeof target.noticeId === "number"
+        ? quickReplyMessage(paymentText, [
+            {
+              label: "支払済みにする",
+              data: `action=mark_paid&payment_kind=personal_notice&payment_id=${target.noticeId}`,
+              displayText: "支払済みにする"
+            }
+          ])
+        : { type: "text", text: paymentText };
     const status = await push(
       ownerLineUserId,
-      [{ type: "text", text: formatPaymentSideReminder(target.slot, target.fee) }],
+      [paymentMessage],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
     if (typeof status !== "number") {

@@ -6999,7 +6999,15 @@ window.Chouseisan = {
   const noticeReminder = hooks.formatPaymentSideReminder(savedReminderSlot, noticePlan.paymentSlots[0]!.fee);
   assert.equal(
     noticeReminder,
-    ["【個人練習｜支払い】", "", "個人練習が終了する時間です。", "", "濱田さんへ", "2,320円をPayPayしてください。"].join("\n")
+    [
+      "【個人練習｜支払い】",
+      "",
+      "10/13（火）18:00〜21:00",
+      "個人練習が終了する時間です。",
+      "",
+      "濱田さんへ",
+      "2,320円をPayPayしてください。"
+    ].join("\n")
   );
   await noticeEnv.env.DB.prepare(
     `INSERT INTO payments (
@@ -7556,6 +7564,344 @@ window.Chouseisan = {
       .bind(unpaidOld?.id)
       .run();
   });
+
+  await (async () => {
+    type LineReplyCapture = Array<{
+      type: string;
+      text?: string;
+      quickReply?: { items: Array<{ action: { label: string; data: string } }> };
+    }>;
+    const coordinatorNow = Date.parse("2026-10-14T10:00:00+09:00");
+    const participantNow = Date.parse("2026-10-14T10:05:00+09:00");
+    const standardCoordinatorReminder = [
+      "【明日の個人練習｜取りまとめ】",
+      "",
+      "10/15（木）18:00〜21:00",
+      "永谷地区センター",
+      "",
+      "参加者：",
+      "渡辺、重松、山田",
+      "",
+      "集合：",
+      "18:00 志村家前",
+      "",
+      "交通：",
+      "渡辺 行き志村号（標準） / 帰り志村号（標準）",
+      "重松 行き志村号（標準） / 帰り志村号（標準）",
+      "山田 行き志村号（標準） / 帰り志村号（標準）",
+      "",
+      "【個別練習LINEへ送る文章】",
+      "",
+      "10/15（木）個別練習参加費のご案内です。",
+      "",
+      "【永谷地区センター】18:00〜21:00",
+      "",
+      "⏰志村家前18:00集合",
+      "",
+      "指導料：4,500円",
+      "施設費：540円",
+      "高速代：1,320円",
+      "引率代：600円",
+      "合計：6,960円",
+      "1人あたり：2,320円",
+      "",
+      "当日、渡辺まどかまでPayPayにてお支払いをお願いいたします。",
+      "",
+      "【封筒に書く内容】",
+      "",
+      "日付：10/15",
+      "参加者：渡辺、重松、山田",
+      "",
+      "＜案内内容＞",
+      "永谷地区センター 18:00〜21:00",
+      "集合 18:00 志村家前",
+      "指導料：4,500円",
+      "施設費：540円",
+      "高速代：1,320円",
+      "引率代：600円",
+      "合計：6,960円",
+      "1人あたり：2,320円",
+      "志村さんへ渡す現金：6,960円",
+      "",
+      "【当日の準備】",
+      "",
+      "・志村さんへ渡す現金を用意",
+      "・封筒へ上記内容を記載",
+      "・封筒をしっかり閉じる",
+      "・当日、塁に持たせる"
+    ].join("\n");
+    const standardParticipantReminder = [
+      "【個人練習｜支払い】",
+      "",
+      "10/14（水）7:00〜10:00",
+      "個人練習が終了する時間です。",
+      "",
+      "濱田さんへ",
+      "2,320円をPayPayしてください。"
+    ].join("\n");
+
+    const standardCoordinatorEnv = createTestEnv();
+    await standardCoordinatorEnv.env.STATE.put("owner_line_user_id", "owner-test");
+    await hooks.applyYahooPersonalCalendarSlots(standardCoordinatorEnv.env, [
+      yahooDraft({
+        practice_date: "2026-10-15",
+        start_time: "18:00",
+        end_time: "21:00",
+        practice_location: "永谷地区センター",
+        participant_names: ["渡辺", "重松", "山田"],
+        meeting_time: "18:00",
+        meeting_place: "志村家前",
+        court_or_area: "B面"
+      }) as any
+    ]);
+    const standardCoordinatorSlot = await standardCoordinatorEnv.env.DB.prepare(
+      `SELECT id, coordinator_name, watanabe_is_coordinator FROM personal_confirmed_slots WHERE practice_date = '2026-10-15'`
+    ).first<{ id: number; coordinator_name: string; watanabe_is_coordinator: number }>();
+    assert.equal(standardCoordinatorSlot?.coordinator_name, "渡辺");
+    assert.equal(standardCoordinatorSlot?.watanabe_is_coordinator, 1);
+    const standardFeeTemplates = await standardCoordinatorEnv.env.DB.prepare(`SELECT * FROM personal_practice_fee_templates`).all<any>();
+    const standardFeeVariants = await standardCoordinatorEnv.env.DB.prepare(`SELECT * FROM personal_practice_fee_template_variants`).all<any>();
+    const standardParticipants = await standardCoordinatorEnv.env.DB.prepare(
+      `SELECT participant_name, outbound_transport, outbound_source, return_transport, return_source, escort_fee_override
+       FROM personal_confirmed_slot_participants WHERE slot_id = ?1 ORDER BY participant_order`
+    )
+      .bind(standardCoordinatorSlot?.id)
+      .all<any>();
+    const standardSlotRow = await standardCoordinatorEnv.env.DB.prepare(
+      `SELECT practice_date, start_time, end_time, practice_location, meeting_place, court_or_area
+       FROM personal_confirmed_slots WHERE id = ?1`
+    )
+      .bind(standardCoordinatorSlot?.id)
+      .first<any>();
+    const standardCalculation = hooks.calculatePersonalPracticeFee({
+      slot: { ...standardSlotRow, participant_names: ["渡辺", "重松", "山田"] },
+      participants: standardParticipants.results,
+      templates: standardFeeTemplates.results,
+      variants: standardFeeVariants.results,
+      overrides: []
+    });
+    assert.equal(standardCalculation.status, "complete");
+    assert.equal(standardCalculation.template_facility_key, "nagaya");
+    assert.equal(standardCalculation.total_amount, 6960);
+    assert.equal(standardCalculation.per_person_amount, 2320);
+    const standardCoordinatorMessages: LineReplyCapture[] = [];
+    const standardCoordinatorSent = await hooks.handlePersonalSlotReminderScheduled(
+      { scheduledTime: coordinatorNow },
+      standardCoordinatorEnv.env,
+      {
+        nowMs: coordinatorNow,
+        push: async (_to: string, messages: LineReplyCapture) => {
+          standardCoordinatorMessages.push(messages);
+          return 200;
+        }
+      }
+    );
+    assert.equal(standardCoordinatorSent.coordinatorSent, 1);
+    assert.equal(standardCoordinatorSent.paymentSent, 0);
+    assert.equal(standardCoordinatorMessages[0]?.[0]?.text, standardCoordinatorReminder);
+    const standardReceivables = await standardCoordinatorEnv.env.DB.prepare(
+      `SELECT participant_name, expected_amount, status FROM personal_slot_receivables WHERE slot_id = ?1 ORDER BY participant_name`
+    )
+      .bind(standardCoordinatorSlot?.id)
+      .all<{ participant_name: string; expected_amount: number; status: string }>();
+    assert.deepEqual(
+      standardReceivables.results.map((row) => `${row.participant_name}:${row.expected_amount}:${row.status}`),
+      ["山田:2320:open", "重松:2320:open"]
+    );
+    const standardCollection = await hooks.buildPersonalCollectionMessage(standardCoordinatorEnv.env, coordinatorNow);
+    assert.match(standardCollection.text, /《個人練習｜集金確認》/);
+    assert.match(standardCollection.text, /10\/15（木）18:00〜21:00/);
+    assert.match(standardCollection.text, /重松さん[\s\S]*2,320円[\s\S]*未受取/);
+    assert.match(standardCollection.text, /山田さん[\s\S]*2,320円[\s\S]*未受取/);
+    assert.deepEqual(
+      standardCollection.actions.map((item) => item.label),
+      ["山田 受取済みにする", "重松 受取済みにする"]
+    );
+
+    const standardParticipantEnv = createTestEnv();
+    await standardParticipantEnv.env.STATE.put("owner_line_user_id", "owner-test");
+    await hooks.applyYahooPersonalCalendarSlots(standardParticipantEnv.env, [
+      yahooDraft({
+        practice_date: "2026-10-14",
+        start_time: "07:00",
+        end_time: "10:00",
+        practice_location: "永谷地区センター",
+        participant_names: ["濱田", "渡辺", "西坂"],
+        meeting_time: "07:00",
+        meeting_place: "志村家前",
+        court_or_area: "B面"
+      }) as any
+    ]);
+    const standardParticipantSlot = await standardParticipantEnv.env.DB.prepare(
+      `SELECT id, coordinator_name, watanabe_is_coordinator FROM personal_confirmed_slots WHERE practice_date = '2026-10-14' AND start_time = '07:00'`
+    ).first<{ id: number; coordinator_name: string; watanabe_is_coordinator: number }>();
+    assert.equal(standardParticipantSlot?.coordinator_name, "濱田");
+    assert.equal(standardParticipantSlot?.watanabe_is_coordinator, 0);
+    await standardParticipantEnv.env.DB.prepare(
+      `INSERT INTO personal_slot_payment_notices (
+         slot_id, payee_name, payee_source, payment_method, payment_method_source,
+         participant_amount, total_amount, fee_breakdown_json, court_or_area,
+         source_type, source_text, created_at, updated_at
+       ) VALUES (?1, '濱田', 'explicit_notice', 'PayPay', 'explicit_notice', 2320, 6960, '[]', 'B面', 'line_text', 'fixture', '2026-10-14T01:00:00.000Z', '2026-10-14T01:00:00.000Z')`
+    )
+      .bind(standardParticipantSlot?.id)
+      .run();
+    await standardParticipantEnv.env.DB.prepare(
+      `INSERT INTO payments (
+         practice_date, payment_type, amount, payee, due_date, payment_method, status,
+         billing_scope, direction, source, created_at, updated_at, rule_key, voided_at, needs_review
+       ) VALUES (
+         '2026-10-14', '個人練習代', 2320, '濱田さん', '2026-10-14', 'PayPay', 'unpaid',
+         'event', 'none', '羽魂練習会', '2026-10-14T00:00:00.000Z', '2026-10-14T00:00:00.000Z', 'personal_practice_fee', NULL, 0
+       )`
+    ).run();
+    const standardParticipantMessages: LineReplyCapture[] = [];
+    const standardParticipantSent = await hooks.handlePersonalSlotReminderScheduled(
+      { scheduledTime: participantNow },
+      standardParticipantEnv.env,
+      {
+        nowMs: participantNow,
+        push: async (_to: string, messages: LineReplyCapture) => {
+          standardParticipantMessages.push(messages);
+          return 200;
+        }
+      }
+    );
+    assert.equal(standardParticipantSent.paymentSent, 1);
+    assert.equal(standardParticipantSent.coordinatorSent, 0);
+    const standardParticipantMessage = standardParticipantMessages[0]?.[0];
+    assert.equal(standardParticipantMessage?.text, standardParticipantReminder);
+    const standardNotice = await standardParticipantEnv.env.DB.prepare(
+      `SELECT id FROM personal_slot_payment_notices WHERE slot_id = ?1`
+    )
+      .bind(standardParticipantSlot?.id)
+      .first<{ id: number }>();
+    assert.ok(standardNotice);
+    const standardAction = standardParticipantMessage?.quickReply?.items[0]?.action;
+    assert.equal(standardAction?.label, "支払済みにする");
+    assert.equal(standardAction?.data, `action=mark_paid&payment_kind=personal_notice&payment_id=${standardNotice.id}`);
+    const standardUnpaidBefore = await hooks.getUnifiedUnpaidPayments(standardParticipantEnv.env.DB as any, 20);
+    assert.equal(
+      standardUnpaidBefore.payments.filter((payment) => payment.payment_kind === "personal_notice" || payment.payment_type === "個人練習代").length,
+      1
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
+    try {
+      await hooks.handleMarkPaidPostback(
+        { replyToken: "reply-token", timestamp: participantNow } as any,
+        standardParticipantEnv.env,
+        String(standardNotice.id),
+        "personal_notice"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const standardPaid = await standardParticipantEnv.env.DB.prepare(
+      `SELECT paid_at FROM personal_slot_payment_notices WHERE id = ?1`
+    )
+      .bind(standardNotice.id)
+      .first<{ paid_at: string | null }>();
+    assert.ok(standardPaid?.paid_at);
+    const standardReceivableCount = await standardParticipantEnv.env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM personal_slot_receivables WHERE slot_id = ?1`
+    )
+      .bind(standardParticipantSlot?.id)
+      .first<{ count: number }>();
+    assert.equal(standardReceivableCount?.count, 0);
+    const standardUnpaidAfter = await hooks.getUnifiedUnpaidPayments(standardParticipantEnv.env.DB as any, 20);
+    assert.equal(standardUnpaidAfter.payments.some((payment) => payment.amount === 2320), false);
+    const standardContact = await hooks.buildRuiContactMessages(standardParticipantEnv.env.DB as any, ["2026-10-14"], ["10/14（水）"]);
+    assert.match(standardContact[0] ?? "", /（支払済み）/);
+    const standardResent = await hooks.handlePersonalSlotReminderScheduled(
+      { scheduledTime: participantNow },
+      standardParticipantEnv.env,
+      { nowMs: participantNow, push: async () => 200 }
+    );
+    assert.equal(standardResent.paymentSent, 0);
+    const standardStoredPayment = await standardParticipantEnv.env.DB.prepare(
+      `SELECT status, voided_at, amount FROM payments WHERE practice_date = '2026-10-14' AND payment_type = '個人練習代'`
+    ).first<{ status: string; voided_at: string | null; amount: number }>();
+    assert.equal(standardStoredPayment?.status, "unpaid");
+    assert.equal(standardStoredPayment?.voided_at ?? null, null);
+    assert.equal(standardStoredPayment?.amount, 2320);
+
+    const splitEnv = createTestEnv();
+    await splitEnv.env.STATE.put("owner_line_user_id", "owner-test");
+    for (const startTime of ["07:00", "13:00"]) {
+      await hooks.applyYahooPersonalCalendarSlots(splitEnv.env, [
+        yahooDraft({
+          practice_date: "2026-10-14",
+          start_time: startTime,
+          end_time: startTime === "07:00" ? "10:00" : "16:00",
+          practice_location: "永谷地区センター",
+          participant_names: ["濱田", "渡辺", "西坂"],
+          meeting_time: startTime,
+          meeting_place: "志村家前",
+          court_or_area: "B面"
+        }) as any
+      ]);
+    }
+    const splitSlots = await splitEnv.env.DB.prepare(
+      `SELECT id, start_time FROM personal_confirmed_slots WHERE practice_date = '2026-10-14' ORDER BY start_time`
+    ).all<{ id: number; start_time: string }>();
+    assert.deepEqual(splitSlots.results.map((row) => row.start_time), ["07:00", "13:00"]);
+    for (const slot of splitSlots.results) {
+      const amount = slot.start_time === "07:00" ? 2320 : 1800;
+      await splitEnv.env.DB.prepare(
+        `INSERT INTO personal_slot_payment_notices (
+           slot_id, payee_name, payee_source, payment_method, payment_method_source,
+           participant_amount, total_amount, fee_breakdown_json, source_type, source_text, created_at, updated_at
+         ) VALUES (?1, '濱田', 'explicit_notice', 'PayPay', 'explicit_notice', ?2, ?3, '[]', 'line_text', 'fixture', '2026-10-14T01:00:00.000Z', '2026-10-14T01:00:00.000Z')`
+      )
+        .bind(slot.id, amount, amount * 3)
+        .run();
+    }
+    const splitMessages: LineReplyCapture[] = [];
+    const splitSent = await hooks.handlePersonalSlotReminderScheduled({ scheduledTime: participantNow }, splitEnv.env, {
+      nowMs: participantNow,
+      push: async (_to: string, messages: LineReplyCapture) => {
+        splitMessages.push(messages);
+        return 200;
+      }
+    });
+    assert.equal(splitSent.paymentSent, 1);
+    assert.match(splitMessages[0]?.[0]?.text ?? "", /7:00〜10:00/);
+    const morningNotice = await splitEnv.env.DB.prepare(
+      `SELECT n.id FROM personal_slot_payment_notices n
+       JOIN personal_confirmed_slots s ON s.id = n.slot_id
+       WHERE s.start_time = '07:00'`
+    ).first<{ id: number }>();
+    const afternoonNotice = await splitEnv.env.DB.prepare(
+      `SELECT n.id, n.paid_at FROM personal_slot_payment_notices n
+       JOIN personal_confirmed_slots s ON s.id = n.slot_id
+       WHERE s.start_time = '13:00'`
+    ).first<{ id: number; paid_at: string | null }>();
+    assert.equal(splitMessages[0]?.[0]?.quickReply?.items[0]?.action.data, `action=mark_paid&payment_kind=personal_notice&payment_id=${morningNotice?.id}`);
+    globalThis.fetch = (async () => new Response("{}", { status: 200 })) as typeof fetch;
+    try {
+      await hooks.handleMarkPaidPostback(
+        { replyToken: "reply-token" } as any,
+        splitEnv.env,
+        String(morningNotice?.id),
+        "personal_notice"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const morningPaid = await splitEnv.env.DB.prepare(
+      `SELECT paid_at FROM personal_slot_payment_notices WHERE id = ?1`
+    )
+      .bind(morningNotice?.id)
+      .first<{ paid_at: string | null }>();
+    const afternoonAfter = await splitEnv.env.DB.prepare(
+      `SELECT paid_at FROM personal_slot_payment_notices WHERE id = ?1`
+    )
+      .bind(afternoonNotice?.id)
+      .first<{ paid_at: string | null }>();
+    assert.ok(morningPaid?.paid_at);
+    assert.equal(afternoonAfter?.paid_at ?? null, null);
+  })();
 
   console.log("personal-practice test: all cases passed");
 }
