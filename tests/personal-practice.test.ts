@@ -7093,10 +7093,13 @@ window.Chouseisan = {
     noticeNow
   );
   assert.equal(forwarded.status, "registered");
-  assert.match(forwarded.message, /2,320円/);
-  assert.match(forwarded.message, /永谷地区センター/);
+  assert.match(forwarded.message, /合計：6,960円\n\nお一人：2,320円/);
   const unpaidBefore = await hooks.getUnifiedUnpaidPayments(noticeEnv.env.DB as any, 20);
   const personalUnpaid = unpaidBefore.payments.find((item) => item.payment_kind === "personal_notice");
+  assert.equal(
+    unpaidBefore.payments.some((item) => item.payment_kind === "event" && item.payment_type === "個人練習代"),
+    false
+  );
   assert.equal(personalUnpaid?.payment_kind, "personal_notice");
   if (personalUnpaid?.payment_kind === "personal_notice") {
     assert.equal(personalUnpaid.amount, 2320);

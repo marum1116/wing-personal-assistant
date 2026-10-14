@@ -8316,6 +8316,29 @@ async function getReviewPendingEventPayments(
   };
 }
 
+async function personalNoticeCoveredPracticeDates(db: D1Database): Promise<Set<string>> {
+  const rows = await db
+    .prepare(
+      `SELECT DISTINCT s.practice_date AS practice_date
+       FROM personal_slot_payment_notices n
+       JOIN personal_confirmed_slots s ON s.id = n.slot_id
+       WHERE s.rui_participates = 1
+         AND s.watanabe_is_coordinator = 0`
+    )
+    .all<{ practice_date: string }>();
+  return new Set((rows.results ?? []).map((row) => row.practice_date));
+}
+
+function isPersonalFeeCoveredByNotice(
+  payment: { practice_date: string; payment_type: string },
+  coveredDates: Set<string>
+): boolean {
+  return (
+    coveredDates.has(payment.practice_date) &&
+    (payment.payment_type === "個人練習代" || payment.payment_type === "個人練習差額")
+  );
+}
+
 async function getUnpaidPersonalPracticeNotices(db: D1Database): Promise<UnifiedUnpaidItem[]> {
   const rows = await db
     .prepare(
@@ -8364,8 +8387,27 @@ async function getUnifiedUnpaidPayments(
   const event = await getUnpaidEventPayments(db, limit);
   const monthly = await getUnpaidMonthlyPayments(db, limit);
   const personalNotices = await getUnpaidPersonalPracticeNotices(db);
+  const coveredDates = await personalNoticeCoveredPracticeDates(db);
+  const visibleEvents = event.payments.filter((payment) => !isPersonalFeeCoveredByNotice(payment, coveredDates));
+  const coveredCountRow = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM payments
+       WHERE status = 'unpaid'
+         AND voided_at IS NULL
+         AND needs_review = 0
+         AND payment_type IN ('個人練習代', '個人練習差額')
+         AND practice_date IN (
+           SELECT s.practice_date
+           FROM personal_slot_payment_notices n
+           JOIN personal_confirmed_slots s ON s.id = n.slot_id
+           WHERE s.rui_participates = 1
+             AND s.watanabe_is_coordinator = 0
+         )`
+    )
+    .first<{ count: number }>();
   const merged: UnifiedUnpaidItem[] = [
-    ...event.payments.map((p) => ({
+    ...visibleEvents.map((p) => ({
       payment_kind: "event" as const,
       id: p.id,
       practice_date: p.practice_date,
@@ -8400,7 +8442,7 @@ async function getUnifiedUnpaidPayments(
   });
 
   return {
-    totalCount: event.totalCount + monthly.totalCount + personalNotices.length,
+    totalCount: event.totalCount - Number(coveredCountRow?.count ?? 0) + monthly.totalCount + personalNotices.length,
     payments: merged.slice(0, limit)
   };
 }

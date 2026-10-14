@@ -305,7 +305,9 @@ export function formatPersonalPracticePaymentNoticeReply(
     lines.push("", `合計：${notice.total_amount.toLocaleString("ja-JP")}円`);
   }
   if (notice.participant_amount !== null) {
-    lines.push("", "練習終了時に、", `${payee.endsWith("さん") ? payee : `${payee}さん`}への支払いをリマインドします。`);
+    const amount = notice.participant_amount.toLocaleString("ja-JP");
+    const honorific = payee.endsWith("さん") ? payee : `${payee}さん`;
+    lines.push("", `お一人：${amount}円`, "", "練習終了時に、", `${honorific}へ ${amount}円 の支払いをリマインドします。`);
   }
   if (alreadySent) {
     lines.push("", "この枠の終了時リマインドはすでに送信済みです。");
