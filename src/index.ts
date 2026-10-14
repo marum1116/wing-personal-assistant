@@ -98,12 +98,13 @@ const LEAD_CHECK_MONTH_REV_KV_PREFIX = "lead_check_month_rev:";
 const RUI_MONTHLY_FEE_DISPLAY_NAME = "わたなべ るい";
 const MONTHLY_FEE_PAYMENT_TYPE: MonthlyType = "regular_training_total";
 const MONTHLY_FEE_MARK_NOTE_DONE_ACTION = "mark_monthly_note_done";
-const SAME_GRADE_BOY_FULL_NAMES = ["村中佑史", "山田健太", "丹下洸", "中村詠太"] as const;
+const SAME_GRADE_BOY_FULL_NAMES = ["村中佑史", "山田健太", "丹下洸", "中村詠太", "西坂"] as const;
 const SAME_GRADE_BOY_SURNAME_MAP: Record<(typeof SAME_GRADE_BOY_FULL_NAMES)[number], string> = {
   村中佑史: "村中",
   山田健太: "山田",
   丹下洸: "丹下",
-  中村詠太: "中村"
+  中村詠太: "中村",
+  西坂: "西坂"
 };
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON = "参加確定前の条件付き支払い案内のため、支払い内容の確認待ちです。";
 const CONDITIONAL_PARTICIPATION_REVIEW_REASON_PREFIX = "参加確定前の条件付き支払い案内";
@@ -5260,6 +5261,9 @@ function normalizeSameGradeBoyName(rawName: string): SameGradeBoyFullName | null
   }
   if (normalized.includes("中村")) {
     return "中村詠太";
+  }
+  if (normalized.includes("西坂")) {
+    return "西坂";
   }
   return null;
 }
@@ -11109,9 +11113,9 @@ async function callOpenAIForStructuredResult(
     "配車表画像に『降りる場所』列がある場合は、渡辺塁本人行のそのセルをreturn_dropoff_placeへ必ず入れてください。" +
     "『二ケ領用水ファミマ』『溝の口南口』『向ヶ丘遊園駅』などの固有地名を落とさないでください。" +
     "本人行に降りる場所が空欄ならnullにし、他人行の降車場所を本人へ流用しないでください。" +
-    "same_grade_boysは、村中佑史・山田健太・丹下洸・中村詠太の4名のうち、その日の練習参加が明示または画像で確認できる人だけをフルネーム配列で入れてください。" +
+    "same_grade_boysは、村中佑史・山田健太・丹下洸・中村詠太・西坂の5名のうち、その日の練習参加が明示または画像で確認できる人だけをフルネーム配列で入れてください。" +
     "交通手段が同じかどうかは判定条件にしません。塁本人・保護者・引率者・運転者は含めないでください。" +
-    "4名について参加情報が読み取れない場合はsame_grade_boysをnullにしてください。4名が全員不参加と明確に判断できる場合のみ空配列を返してください。" +
+    "5名について参加情報が読み取れない場合はsame_grade_boysをnullにしてください。5名が全員不参加と明確に判断できる場合のみ空配列を返してください。" +
     "バス引率者の案内のみを根拠にreturn_transport.typeをバスに確定しないでください。" +
     "配車表画像を読むときは、渡辺塁（塁/塁くん/ルイくん）本人が記載された行を最優先し、他人の行の交通手段を本人へ適用しないでください。" +
     "同一表内に『バス』行と『○○号』行が混在する場合でも、本人名がある行の値だけを本人情報として採用してください。" +

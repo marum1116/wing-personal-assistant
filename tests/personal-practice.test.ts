@@ -2726,7 +2726,29 @@ window.Chouseisan = {
   );
   assert.match(contactSameGradeAllText, /一緒：村中、山田、丹下、中村/);
 
-  // 塁に連絡 Case: 対象4名以外は表示しない（不明扱いは行自体を省略）
+  await hooks.saveStructuredResultToD1(
+    contactEnvSameGrade,
+    "羽魂練習会",
+    baseResult({
+      message_kind: "dispatch_confirmed",
+      practice_type: "通常練習",
+      practice_type_basis: "explicit",
+      practice_type_evidence: "通常練習",
+      practice_date: "2026-08-29",
+      same_grade_boys: ["西坂", "西坂さん"]
+    }) as any,
+    "explicit",
+    300
+  );
+  const contactNishizakaText = await hooks.buildRuiContactMessage(
+    contactEnvSameGrade.DB as any,
+    ["2026-08-29"],
+    ["8/29（土）"]
+  );
+  assert.match(contactNishizakaText, /一緒：西坂/);
+  assert.equal((contactNishizakaText.match(/西坂/g) ?? []).length, 1);
+
+  // 塁に連絡 Case: 対象外の名前は表示しない（不明扱いは行自体を省略）
   await hooks.saveStructuredResultToD1(
     contactEnvSameGrade,
     "羽魂練習会",
