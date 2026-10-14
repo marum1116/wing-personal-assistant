@@ -95,6 +95,17 @@ export function buildAmbiguousImageQuickReply(): { text: string; items: Array<{ 
   };
 }
 
+export const LINE_QUICK_REPLY_LIMIT = 13;
+export const LINE_QUICK_REPLY_LABEL_LIMIT = 20;
+
+export function boundQuickReplyItems<T extends { label: string; displayText: string }>(items: T[]): T[] {
+  return items.slice(0, LINE_QUICK_REPLY_LIMIT).map((item) => ({
+    ...item,
+    label: item.label.slice(0, LINE_QUICK_REPLY_LABEL_LIMIT),
+    displayText: item.displayText.slice(0, LINE_QUICK_REPLY_LABEL_LIMIT)
+  }));
+}
+
 export function pendingImageKey(userId: string): string {
   return `pending_line_image:${userId}`;
 }

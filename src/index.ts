@@ -41,6 +41,7 @@ import {
   PENDING_TEXT_TTL_SECONDS,
   pendingImageKey,
   pendingTextKey,
+  boundQuickReplyItems,
   type ImageCategory
 } from "./inbound-routing";
 import { planReceivableSync, type ReceivableSnapshot } from "./personal-slot-receivable";
@@ -13119,11 +13120,11 @@ function quickReplyMessage(text: string, items: Array<{ label: string; data: str
     type: "text",
     text,
     quickReply: {
-      items: items.slice(0, 13).map((item) => ({
+      items: boundQuickReplyItems(items).map((item) => ({
         type: "action",
         action: {
           type: "postback",
-          label: item.label.slice(0, 20),
+          label: item.label,
           data: item.data,
           displayText: item.displayText
         }
@@ -13232,11 +13233,12 @@ async function runClassifiedImage(
   await processFreeformText(event, env, `${hint}\n画像の内容を読み取ってください。`, imageDataUrl);
 }
 
-async function handlePersonalCollectionCommand(event: LineWebhookEvent, env: Env, lead?: string): Promise<void> {
-  if (!event.replyToken) {
-    return;
-  }
-  const today = getJstDateString(event.timestamp ?? Date.now());
+async function buildPersonalCollectionMessage(
+  env: Env,
+  nowMs: number,
+  lead?: string
+): Promise<{ text: string; actions: Array<{ label: string; data: string; displayText: string }> }> {
+  const today = getJstDateString(nowMs);
   const slots = await env.DB.prepare(
     `SELECT id, practice_date, start_time, end_time, practice_location
      FROM personal_confirmed_slots
@@ -13263,7 +13265,7 @@ async function handlePersonalCollectionCommand(event: LineWebhookEvent, env: Env
   }
   const actions: Array<{ label: string; data: string; displayText: string }> = [];
   if ((slots.results ?? []).length === 0) {
-    lines.push("", "確認できる取りまとめ枠はありません。");
+    lines.push("", "現在、渡辺家が取りまとめ担当の対象個人練習はありません。");
   }
   for (const slot of slots.results ?? []) {
     const sync = await syncReceivablesForSlot(env, slot.id);
@@ -13276,7 +13278,7 @@ async function handlePersonalCollectionCommand(event: LineWebhookEvent, env: Env
       `SELECT participant_name, expected_amount, status, review_note
        FROM personal_slot_receivables
        WHERE slot_id = ?1
-       ORDER BY id`
+       ORDER BY participant_name`
     )
       .bind(slot.id)
       .all<{ participant_name: string; expected_amount: number | null; status: string; review_note: string | null }>();
@@ -13290,12 +13292,18 @@ async function handlePersonalCollectionCommand(event: LineWebhookEvent, env: Env
       const commandName = row.status === "received" ? "個人練習未受取" : "個人練習受取済";
       const command = `${commandName} ${slot.practice_date} ${slot.start_time} ${row.participant_name}`;
       const label = row.status === "received" ? `${row.participant_name} 未受取に戻す` : `${row.participant_name} 受取済みにする`;
-      if (actions.length < 13) {
-        actions.push({ label, data: command, displayText: label });
-      }
+      actions.push({ label, data: command, displayText: label });
     }
   }
-  const message: LineReplyMessage = actions.length > 0 ? quickReplyMessage(lines.join("\n"), actions) : { type: "text", text: lines.join("\n") };
+  return { text: lines.join("\n"), actions: boundQuickReplyItems(actions) };
+}
+
+async function handlePersonalCollectionCommand(event: LineWebhookEvent, env: Env, lead?: string): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const built = await buildPersonalCollectionMessage(env, event.timestamp ?? Date.now(), lead);
+  const message: LineReplyMessage = built.actions.length > 0 ? quickReplyMessage(built.text, built.actions) : { type: "text", text: built.text };
   await replyMessages(event.replyToken, [message], env.LINE_CHANNEL_ACCESS_TOKEN);
 }
 
@@ -14338,5 +14346,7 @@ export const TEST_HOOKS = {
   planReceivableSync,
   syncReceivablesForSlot,
   parsePersonalCollectionCommand,
-  applyPersonalCollectionMark
+  applyPersonalCollectionMark,
+  buildPersonalCollectionMessage,
+  boundQuickReplyItems
 };

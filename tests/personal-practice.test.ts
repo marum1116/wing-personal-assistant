@@ -7258,6 +7258,305 @@ window.Chouseisan = {
   assert.match(payerContact[0] ?? "", /2,400円/);
   assert.match(payerContact[0] ?? "", /未払い|支払済み/);
 
+  const collectionNow = Date.parse("2026-11-01T03:00:00.000Z");
+  const classifiedWatanabe = hooks.classifyYahooPersonalCalendarSlot(
+    yahooDraft({
+      practice_date: "2026-11-08",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "中原支援学校",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前"
+    }) as any
+  );
+  assert.equal(classifiedWatanabe.action, "saved");
+  if (classifiedWatanabe.action === "saved") {
+    assert.equal(classifiedWatanabe.record.rui_participates, true);
+    assert.equal(classifiedWatanabe.record.coordinator_name, "渡辺");
+    assert.equal(classifiedWatanabe.record.watanabe_is_coordinator, true);
+  }
+  const flowEnv = createTestEnv();
+  await hooks.applyYahooPersonalCalendarSlots(flowEnv.env, [
+    yahooDraft({
+      practice_date: "2026-11-08",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "中原支援学校",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前"
+    }) as any
+  ]);
+  const flowSlot = await flowEnv.env.DB.prepare(
+    `SELECT id FROM personal_confirmed_slots WHERE practice_date = '2026-11-08' AND start_time = '13:00'`
+  ).first<{ id: number }>();
+  assert.ok(flowSlot);
+  await flowEnv.env.DB.prepare(
+    `INSERT INTO personal_confirmed_slot_fee_overrides (slot_id, fee_type, mode, amount, note, source, updated_at)
+     VALUES (?1, 'facility_fee', 'fixed_amount', 1200, 'test fixture', 'test', '2026-11-01T00:00:00.000Z')`
+  )
+    .bind(flowSlot.id)
+    .run();
+  await hooks.syncReceivablesForSlot(flowEnv.env, flowSlot.id);
+  const flowRows = await flowEnv.env.DB.prepare(
+    `SELECT participant_name, expected_amount, received_at FROM personal_slot_receivables WHERE slot_id = ?1 ORDER BY participant_name`
+  )
+    .bind(flowSlot.id)
+    .all<{ participant_name: string; expected_amount: number; received_at: string | null }>();
+  assert.deepEqual(
+    flowRows.results.map((row) => row.participant_name),
+    ["山田", "重松"]
+  );
+  assert.equal(flowRows.results.every((row) => row.expected_amount === 2100 && row.received_at === null), true);
+  const opened = await hooks.buildPersonalCollectionMessage(flowEnv.env, collectionNow);
+  assert.match(opened.text, /《個人練習｜集金確認》/);
+  assert.match(opened.text, /11\/8（日）13:00〜16:00/);
+  assert.match(opened.text, /中原支援学校/);
+  assert.match(opened.text, /重松さん/);
+  assert.match(opened.text, /山田さん/);
+  assert.match(opened.text, /2,100円/);
+  assert.match(opened.text, /未受取/);
+  assert.equal(opened.actions.length, 2);
+  assert.equal(opened.actions.every((item) => item.data.startsWith("個人練習受取済")), true);
+  const receivedMark = await hooks.applyPersonalCollectionMark(flowEnv.env, {
+    action: "received",
+    practiceDate: "2026-11-08",
+    startTime: "13:00",
+    participantName: "重松"
+  });
+  assert.match(receivedMark, /受取済み/);
+  const flowShigematsu = await flowEnv.env.DB.prepare(
+    `SELECT received_at, received_amount FROM personal_slot_receivables WHERE slot_id = ?1 AND participant_name = '重松'`
+  )
+    .bind(flowSlot.id)
+    .first<{ received_at: string | null; received_amount: number | null }>();
+  assert.ok(flowShigematsu?.received_at);
+  assert.equal(flowShigematsu?.received_amount, 2100);
+  const afterReceived = await hooks.buildPersonalCollectionMessage(flowEnv.env, collectionNow);
+  assert.match(afterReceived.text, /重松さん[\s\S]*2,100円[\s\S]*受取済/);
+  assert.match(afterReceived.text, /山田さん[\s\S]*2,100円[\s\S]*未受取/);
+  const undone = await hooks.applyPersonalCollectionMark(flowEnv.env, {
+    action: "unreceived",
+    practiceDate: "2026-11-08",
+    startTime: "13:00",
+    participantName: "重松"
+  });
+  assert.match(undone, /未受取/);
+  const cleared = await flowEnv.env.DB.prepare(
+    `SELECT received_at FROM personal_slot_receivables WHERE slot_id = ?1 AND participant_name = '重松'`
+  )
+    .bind(flowSlot.id)
+    .first<{ received_at: string | null }>();
+  assert.equal(cleared?.received_at ?? null, null);
+  const afterUndo = await hooks.buildPersonalCollectionMessage(flowEnv.env, collectionNow);
+  assert.doesNotMatch(afterUndo.text, /受取済/);
+  await hooks.applyPersonalCollectionMark(flowEnv.env, {
+    action: "received",
+    practiceDate: "2026-11-08",
+    startTime: "13:00",
+    participantName: "重松"
+  });
+  const keptReceivedAt = (
+    await flowEnv.env.DB.prepare(
+      `SELECT received_at FROM personal_slot_receivables WHERE slot_id = ?1 AND participant_name = '重松'`
+    )
+      .bind(flowSlot.id)
+      .first<{ received_at: string }>()
+  )?.received_at;
+  await hooks.applyYahooPersonalCalendarSlots(flowEnv.env, [
+    yahooDraft({
+      practice_date: "2026-11-08",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "中原支援学校",
+      participant_names: ["渡辺", "重松", "山田"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前"
+    }) as any
+  ]);
+  const flowAfterResend = await flowEnv.env.DB.prepare(
+    `SELECT COUNT(*) AS count, MAX(CASE WHEN participant_name = '重松' THEN received_at END) AS received_at
+     FROM personal_slot_receivables WHERE slot_id = ?1`
+  )
+    .bind(flowSlot.id)
+    .first<{ count: number; received_at: string | null }>();
+  assert.equal(flowAfterResend?.count, 2);
+  assert.equal(flowAfterResend?.received_at, keptReceivedAt);
+  await flowEnv.env.DB.prepare(
+    `UPDATE personal_confirmed_slot_fee_overrides SET amount = 1500 WHERE slot_id = ?1 AND fee_type = 'facility_fee'`
+  )
+    .bind(flowSlot.id)
+    .run();
+  await hooks.syncReceivablesForSlot(flowEnv.env, flowSlot.id);
+  const raised = await flowEnv.env.DB.prepare(
+    `SELECT participant_name, expected_amount, status FROM personal_slot_receivables WHERE slot_id = ?1 AND participant_name = '山田'`
+  )
+    .bind(flowSlot.id)
+    .first<{ expected_amount: number; status: string }>();
+  assert.equal(raised?.expected_amount, 2200);
+  assert.equal(raised?.status, "open");
+  const flowMismatch = await flowEnv.env.DB.prepare(
+    `SELECT expected_amount, received_amount, received_at, status, review_note
+     FROM personal_slot_receivables WHERE slot_id = ?1 AND participant_name = '重松'`
+  )
+    .bind(flowSlot.id)
+    .first<{ expected_amount: number; received_amount: number; received_at: string | null; status: string; review_note: string | null }>();
+  assert.equal(flowMismatch?.expected_amount, 2100);
+  assert.equal(flowMismatch?.received_amount, 2100);
+  assert.ok(flowMismatch?.received_at);
+  assert.equal(flowMismatch?.status, "needs_review");
+  const mismatchView = await hooks.buildPersonalCollectionMessage(flowEnv.env, collectionNow);
+  assert.match(mismatchView.text, /2,200円/);
+  assert.match(mismatchView.text, /要確認/);
+  assert.match(mismatchView.text, /受取済みの金額 2100円 と、再計算の 2200円 が違います/);
+
+  await hooks.applyYahooPersonalCalendarSlots(flowEnv.env, [
+    yahooDraft({
+      practice_date: "2026-11-10",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "中原支援学校",
+      participant_names: ["渡辺", "重松", "山田", "藤田"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前"
+    }) as any
+  ]);
+  const incompleteSlot = await flowEnv.env.DB.prepare(
+    `SELECT id FROM personal_confirmed_slots WHERE practice_date = '2026-11-10'`
+  ).first<{ id: number }>();
+  assert.ok(incompleteSlot);
+  const incompleteRows = await flowEnv.env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM personal_slot_receivables WHERE slot_id = ?1 OR expected_amount = 0`
+  )
+    .bind(incompleteSlot.id)
+    .first<{ count: number }>();
+  assert.equal(incompleteRows?.count, 0);
+  const incompleteView = await hooks.buildPersonalCollectionMessage(flowEnv.env, collectionNow);
+  assert.match(incompleteView.text, /金額が未確定/);
+  assert.match(incompleteView.text, /確認が必要/);
+
+  for (const startTime of ["09:00", "13:00"]) {
+    await hooks.applyYahooPersonalCalendarSlots(flowEnv.env, [
+      yahooDraft({
+        practice_date: "2026-11-09",
+        start_time: startTime,
+        end_time: "16:00",
+        practice_location: "中原支援学校",
+        participant_names: ["渡辺", "重松", "山田"],
+        meeting_time: "08:30",
+        meeting_place: "志村家前"
+      }) as any
+    ]);
+    const slot = await flowEnv.env.DB.prepare(
+      `SELECT id FROM personal_confirmed_slots WHERE practice_date = '2026-11-09' AND start_time = ?1`
+    )
+      .bind(startTime)
+      .first<{ id: number }>();
+    assert.ok(slot);
+    await flowEnv.env.DB.prepare(
+      `INSERT INTO personal_confirmed_slot_fee_overrides (slot_id, fee_type, mode, amount, note, source, updated_at)
+       VALUES (?1, 'facility_fee', 'fixed_amount', 1200, 'test fixture', 'test', '2026-11-01T00:00:00.000Z')`
+    )
+      .bind(slot.id)
+      .run();
+    await hooks.syncReceivablesForSlot(flowEnv.env, slot.id);
+  }
+  await hooks.applyPersonalCollectionMark(flowEnv.env, {
+    action: "received",
+    practiceDate: "2026-11-09",
+    startTime: "13:00",
+    participantName: "重松"
+  });
+  const morningOpen = await flowEnv.env.DB.prepare(
+    `SELECT status FROM personal_slot_receivables r
+     JOIN personal_confirmed_slots s ON s.id = r.slot_id
+     WHERE s.practice_date = '2026-11-09' AND s.start_time = '09:00' AND r.participant_name = '重松'`
+  ).first<{ status: string }>();
+  const afternoonReceived = await flowEnv.env.DB.prepare(
+    `SELECT status FROM personal_slot_receivables r
+     JOIN personal_confirmed_slots s ON s.id = r.slot_id
+     WHERE s.practice_date = '2026-11-09' AND s.start_time = '13:00' AND r.participant_name = '重松'`
+  ).first<{ status: string }>();
+  assert.equal(morningOpen?.status, "open");
+  assert.equal(afternoonReceived?.status, "received");
+
+  await hooks.applyYahooPersonalCalendarSlots(flowEnv.env, [
+    yahooDraft({
+      practice_date: "2026-11-12",
+      start_time: "13:00",
+      end_time: "16:00",
+      practice_location: "中原支援学校",
+      participant_names: ["渡辺", "重松", "山田", "藤田", "佐藤", "村中"],
+      meeting_time: "12:30",
+      meeting_place: "志村家前"
+    }) as any
+  ]);
+  const sixSlot = await flowEnv.env.DB.prepare(
+    `SELECT id FROM personal_confirmed_slots WHERE practice_date = '2026-11-12'`
+  ).first<{ id: number }>();
+  const sixCount = await flowEnv.env.DB.prepare(
+    `SELECT COUNT(*) AS count FROM personal_slot_receivables WHERE slot_id = ?1`
+  )
+    .bind(sixSlot?.id)
+    .first<{ count: number }>();
+  assert.equal(sixCount?.count, 0);
+  const manyActions = hooks.boundQuickReplyItems(
+    Array.from({ length: 20 }, (_, index) => ({
+      label: `参加者${index}さんを受取済みにするボタン`,
+      data: `個人練習受取済 2026-11-12 13:00 参加者${index}`,
+      displayText: `参加者${index}さんを受取済みにするボタン`
+    }))
+  );
+  assert.equal(manyActions.length, 13);
+  assert.equal(manyActions.every((item) => item.label.length <= 20 && item.displayText.length <= 20), true);
+
+  const windowEnv = createTestEnv();
+  const insertWindowSlot = async (date: string, label: string) => {
+    await windowEnv.env.DB.prepare(
+      `INSERT INTO personal_confirmed_slots (
+         practice_date, start_time, end_time, practice_location, participant_names_json, meeting_time, meeting_place,
+         coordinator_name, rui_participates, watanabe_is_coordinator, source, created_at, updated_at
+       ) VALUES (?1, '13:00', '16:00', ?2, '["渡辺"]', '12:30', '志村家前', '渡辺', 1, 1, 'test', '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z')`
+    )
+      .bind(date, label)
+      .run();
+    return windowEnv.env.DB.prepare(`SELECT id FROM personal_confirmed_slots WHERE practice_date = ?1`).bind(date).first<{ id: number }>();
+  };
+  await insertWindowSlot("2026-12-20", "未来枠");
+  await insertWindowSlot("2027-01-20", "遠未来");
+  const unpaidOld = await insertWindowSlot("2026-10-01", "未収枠");
+  const tooOld = await insertWindowSlot("2026-09-01", "古すぎ");
+  const settledOld = await insertWindowSlot("2026-10-10", "精算済");
+  for (const slot of [unpaidOld, tooOld, settledOld]) {
+    assert.ok(slot);
+    await windowEnv.env.DB.prepare(
+      `INSERT INTO personal_slot_receivables (
+         slot_id, participant_name, expected_amount, received_at, received_amount, status, review_note, created_at, updated_at
+       ) VALUES (?1, '重松', 2100, ?2, ?3, ?4, NULL, '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z')`
+    )
+      .bind(
+        slot.id,
+        slot === settledOld ? "2026-10-10T10:00:00.000Z" : null,
+        slot === settledOld ? 2100 : null,
+        slot === settledOld ? "received" : "open"
+      )
+      .run();
+  }
+  const windowView = await hooks.buildPersonalCollectionMessage(windowEnv.env, Date.parse("2026-11-08T03:00:00.000Z"));
+  assert.match(windowView.text, /未来枠/);
+  assert.match(windowView.text, /未収枠/);
+  assert.doesNotMatch(windowView.text, /遠未来|古すぎ|精算済/);
+  await assert.rejects(async () => {
+    await windowEnv.env.DB.prepare(
+      `INSERT INTO personal_slot_receivables (
+         slot_id, participant_name, expected_amount, status, created_at, updated_at
+       ) VALUES (?1, '重松', 2100, 'open', '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z')`
+    )
+      .bind(unpaidOld?.id)
+      .run();
+  });
+
   console.log("personal-practice test: all cases passed");
 }
 
