@@ -277,6 +277,7 @@ function createTestEnv() {
   `);
   sqlite.exec(readFileSync("migrations/0014_personal_practice_fee_templates.sql", "utf8"));
   sqlite.exec(readFileSync("migrations/0015_personal_slot_payment_notices.sql", "utf8"));
+  sqlite.exec(readFileSync("migrations/0016_personal_slot_payment_notice_paid_at.sql", "utf8"));
 
   return {
     raw: sqlite,
@@ -7059,6 +7060,78 @@ window.Chouseisan = {
     "SELECT payment_reminder_sent_at AS sent_at FROM personal_confirmed_slots WHERE practice_date = '2026-10-13'"
   ).first<{ sent_at: string }>();
   assert.equal(sentAfter?.sent_at, sentBefore?.sent_at);
+
+  const forwardedNotice = `@渡辺 まどか @Yuri.N
+
+おはようございます(おはよう)
+
+10/13(火)18:00-21:00 個人練習参加費のお知らせです
+
+【永谷地区センター】
+
+指導料　　1,500×3=4,500円
+施設費      B面　　　　540円
+高速代往復　660×2=1,320円
+引率代往復　100×2×3人=600円
+合計　　　　6,960円
+
+🔶お一人　2,320円
+
+⏰志村家18時集合になります
+
+当日，濱田までPayPayお願いいたします`;
+  assert.equal(hooks.looksLikePersonalPracticePaymentNotice(forwardedNotice), true);
+  assert.equal(hooks.looksLikePersonalPracticePaymentNotice("個人練習支払い"), false);
+  assert.equal(hooks.looksLikePersonalPracticePaymentNotice("未払い"), false);
+  assert.equal(hooks.looksLikePersonalPracticePaymentNotice("個人練習カレンダー"), false);
+  assert.equal(hooks.looksLikePersonalPracticePaymentNotice("行きバス"), false);
+  const forwarded = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    forwardedNotice,
+    "line_text",
+    noticeNow
+  );
+  assert.equal(forwarded.status, "registered");
+  assert.match(forwarded.message, /2,320円/);
+  assert.match(forwarded.message, /永谷地区センター/);
+  const unpaidBefore = await hooks.getUnifiedUnpaidPayments(noticeEnv.env.DB as any, 20);
+  const personalUnpaid = unpaidBefore.payments.find((item) => item.payment_kind === "personal_notice");
+  assert.equal(personalUnpaid?.payment_kind, "personal_notice");
+  if (personalUnpaid?.payment_kind === "personal_notice") {
+    assert.equal(personalUnpaid.amount, 2320);
+    assert.equal(personalUnpaid.payee, "濱田");
+    const marked = await hooks.markPersonalSlotPaymentNoticePaid(noticeEnv.env.DB as any, personalUnpaid.id);
+    assert.equal(marked.outcome, "updated");
+  }
+  const unpaidAfter = await hooks.getUnifiedUnpaidPayments(noticeEnv.env.DB as any, 20);
+  assert.equal(unpaidAfter.payments.some((item) => item.payment_kind === "personal_notice"), false);
+  const paymentUntouched = await noticeEnv.env.DB.prepare(
+    "SELECT amount, status FROM payments WHERE practice_date = '2026-10-13'"
+  ).first<{ amount: number; status: string }>();
+  assert.equal(paymentUntouched?.amount, 1700);
+  assert.equal(paymentUntouched?.status, "unpaid");
+  const paidNoticeSkipped = hooks.selectPersonalSlotReminders(
+    jstInstant("2026-10-13", "21:00"),
+    [{ ...savedReminderSlot, payment_reminder_sent_at: null }],
+    [],
+    [{ slot_id: savedReminderSlot.id, payee_name: "濱田", payment_method: "PayPay", participant_amount: 2320, paid_at: "paid" }]
+  );
+  assert.equal(paidNoticeSkipped.paymentSlots.length, 0);
+  const correctedAfterPaid = await hooks.registerPersonalPracticePaymentNotice(
+    noticeEnv.env,
+    "notice-user",
+    forwardedNotice.replace("2,320円", "2,400円"),
+    "line_text",
+    noticeNow
+  );
+  assert.equal(correctedAfterPaid.status, "registered");
+  const unpaidCorrected = await hooks.getUnifiedUnpaidPayments(noticeEnv.env.DB as any, 20);
+  const correctedItem = unpaidCorrected.payments.find((item) => item.payment_kind === "personal_notice");
+  assert.equal(correctedItem?.payment_kind, "personal_notice");
+  if (correctedItem?.payment_kind === "personal_notice") {
+    assert.equal(correctedItem.amount, 2400);
+  }
 
   console.log("personal-practice test: all cases passed");
 }

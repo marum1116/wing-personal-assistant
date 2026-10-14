@@ -47,6 +47,21 @@ export function splitPersonalPracticePaymentCommand(inputText: string): "image" 
   return rest.length === 0 ? "image" : "text";
 }
 
+export function looksLikePersonalPracticePaymentNotice(inputText: string): boolean {
+  const trimmed = inputText.trim();
+  if (!trimmed || splitPersonalPracticePaymentCommand(trimmed)) {
+    return false;
+  }
+  if (trimmed.startsWith("個人練習カレンダー") || trimmed.startsWith("個人練習補足")) {
+    return false;
+  }
+  const compact = trimmed.replace(/\s+/gu, "");
+  if (!compact.includes("個人練習") || !compact.includes("参加費") || !compact.includes("円")) {
+    return false;
+  }
+  return /お一人|おひとり|1人分|１人分|一人あたり|1人あたり|１人あたり|合計/u.test(trimmed);
+}
+
 function pad2(value: number): string {
   return String(value).padStart(2, "0");
 }

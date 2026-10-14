@@ -22,6 +22,7 @@ import {
 } from "./personal-practice-fee";
 import {
   formatPersonalPracticePaymentNoticeReply,
+  looksLikePersonalPracticePaymentNotice,
   parsePersonalPracticePaymentNotice,
   resolvePaymentNoticeSlot,
   splitPersonalPracticePaymentCommand,
@@ -336,6 +337,20 @@ type UnifiedUnpaidItem =
       due_date: string | null;
       payment_method: PaymentMethod | null;
       breakdown_text: string | null;
+      sort_date: string;
+    }
+  | {
+      payment_kind: "personal_notice";
+      id: number;
+      practice_date: string;
+      start_time: string;
+      end_time: string | null;
+      practice_location: string | null;
+      payment_type: string;
+      amount: number;
+      payee: string | null;
+      due_date: null;
+      payment_method: string | null;
       sort_date: string;
     };
 
@@ -4977,9 +4992,19 @@ function buildUnifiedPaymentItemLine(item: UnifiedUnpaidItem, index: number): st
   const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
   const prefix = circledNumbers[index] ?? `${index + 1}.`;
 
-  if (item.payment_kind === "event") {
-    const amountPart = typeof item.amount === "number" ? ` ${item.amount}円` : "";
-    const lines = [`${prefix} ${formatDateForLine(item.practice_date)} ${item.payment_type}${amountPart}`];
+  if (item.payment_kind === "event" || item.payment_kind === "personal_notice") {
+    const amountText = typeof item.amount === "number"
+      ? item.payment_kind === "personal_notice"
+        ? item.amount.toLocaleString("ja-JP")
+        : String(item.amount)
+      : "";
+    const amountPart = amountText ? ` ${amountText}円` : "";
+    const title = item.payment_kind === "personal_notice" ? "個人練習" : item.payment_type;
+    const lines = [`${prefix} ${formatDateForLine(item.practice_date)} ${title}${amountPart}`];
+    if (item.payment_kind === "personal_notice") {
+      const when = `${formatYahooClockForLine(item.start_time)}${item.end_time ? `〜${formatYahooClockForLine(item.end_time)}` : ""}`;
+      lines.push(`　${item.practice_location ?? "場所：不明"} ${when}`);
+    }
     if (item.payee) {
       lines.push(`　支払先：${item.payee}`);
     }
@@ -5070,6 +5095,22 @@ function buildReviewPendingNoticeMessage(payments: ReviewPendingPaymentRow[]): L
 }
 
 function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
+  if (payment.payment_kind === "personal_notice") {
+    const when = `${formatYahooClockForLine(payment.start_time)}${payment.end_time ? `〜${formatYahooClockForLine(payment.end_time)}` : ""}`;
+    const lines = [
+      "支払済みにしました。",
+      "",
+      `${formatDateForLine(payment.practice_date)} 個人練習 ${payment.amount.toLocaleString("ja-JP")}円`,
+      `${payment.practice_location ?? "場所：不明"} ${when}`
+    ];
+    if (payment.payee) {
+      lines.push(`支払先：${payment.payee}`);
+    }
+    if (payment.payment_method) {
+      lines.push(`支払方法：${payment.payment_method}`);
+    }
+    return lines.join("\n");
+  }
   if (payment.payment_kind === "event") {
     const amountPart = typeof payment.amount === "number" ? ` ${payment.amount}円` : "";
     const lines = ["支払済みにしました。", "", `${formatDateForLine(payment.practice_date)} ${payment.payment_type}${amountPart}`];
@@ -5099,7 +5140,7 @@ function buildPaidConfirmationMessage(payment: UnifiedUnpaidItem): string {
 }
 
 function buildMarkPaidQuickReplyItems(
-  payments: Array<{ id: number; payment_kind?: "event" | "monthly" }>,
+  payments: Array<{ id: number; payment_kind?: "event" | "monthly" | "personal_notice" }>,
   maxItems: number
 ): LineQuickReply["items"] {
   const circledNumbers = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩"];
@@ -8275,12 +8316,54 @@ async function getReviewPendingEventPayments(
   };
 }
 
+async function getUnpaidPersonalPracticeNotices(db: D1Database): Promise<UnifiedUnpaidItem[]> {
+  const rows = await db
+    .prepare(
+      `SELECT n.id AS id, s.practice_date AS practice_date, s.start_time AS start_time,
+              s.end_time AS end_time, s.practice_location AS practice_location,
+              n.participant_amount AS amount, n.payee_name AS payee, n.payment_method AS payment_method
+       FROM personal_slot_payment_notices n
+       JOIN personal_confirmed_slots s ON s.id = n.slot_id
+       WHERE n.paid_at IS NULL
+         AND n.participant_amount IS NOT NULL
+         AND n.participant_amount > 0
+         AND s.rui_participates = 1
+         AND s.watanabe_is_coordinator = 0
+       ORDER BY s.practice_date, s.start_time`
+    )
+    .all<{
+      id: number;
+      practice_date: string;
+      start_time: string;
+      end_time: string | null;
+      practice_location: string | null;
+      amount: number;
+      payee: string | null;
+      payment_method: string | null;
+    }>();
+  return (rows.results ?? []).map((row) => ({
+    payment_kind: "personal_notice" as const,
+    id: row.id,
+    practice_date: row.practice_date,
+    start_time: row.start_time,
+    end_time: row.end_time,
+    practice_location: row.practice_location,
+    payment_type: "個人練習",
+    amount: row.amount,
+    payee: row.payee,
+    due_date: null,
+    payment_method: row.payment_method,
+    sort_date: row.practice_date
+  }));
+}
+
 async function getUnifiedUnpaidPayments(
   db: D1Database,
   limit: number
 ): Promise<{ totalCount: number; payments: UnifiedUnpaidItem[] }> {
   const event = await getUnpaidEventPayments(db, limit);
   const monthly = await getUnpaidMonthlyPayments(db, limit);
+  const personalNotices = await getUnpaidPersonalPracticeNotices(db);
   const merged: UnifiedUnpaidItem[] = [
     ...event.payments.map((p) => ({
       payment_kind: "event" as const,
@@ -8304,21 +8387,83 @@ async function getUnifiedUnpaidPayments(
       payment_method: p.payment_method,
       breakdown_text: p.breakdown_text,
       sort_date: p.due_date ?? `${p.billing_month}-99`
-    }))
+    })),
+    ...personalNotices
   ];
 
   merged.sort((a, b) => {
-    const aDueNull = a.due_date === null ? 1 : 0;
-    const bDueNull = b.due_date === null ? 1 : 0;
+    const aDueNull = a.payment_kind === "personal_notice" || a.due_date !== null ? 0 : 1;
+    const bDueNull = b.payment_kind === "personal_notice" || b.due_date !== null ? 0 : 1;
     if (aDueNull !== bDueNull) return aDueNull - bDueNull;
     if (a.sort_date !== b.sort_date) return a.sort_date.localeCompare(b.sort_date);
     return a.id - b.id;
   });
 
   return {
-    totalCount: event.totalCount + monthly.totalCount,
+    totalCount: event.totalCount + monthly.totalCount + personalNotices.length,
     payments: merged.slice(0, limit)
   };
+}
+
+async function markPersonalSlotPaymentNoticePaid(
+  db: D1Database,
+  noticeId: number
+): Promise<{ outcome: "updated" | "already_paid" | "not_found"; payment?: Extract<UnifiedUnpaidItem, { payment_kind: "personal_notice" }> }> {
+  const row = await db
+    .prepare(
+      `SELECT n.id AS id, n.paid_at AS paid_at, n.participant_amount AS amount, n.payee_name AS payee,
+              n.payment_method AS payment_method, s.practice_date AS practice_date, s.start_time AS start_time,
+              s.end_time AS end_time, s.practice_location AS practice_location
+       FROM personal_slot_payment_notices n
+       JOIN personal_confirmed_slots s ON s.id = n.slot_id
+       WHERE n.id = ?1
+       LIMIT 1`
+    )
+    .bind(noticeId)
+    .first<{
+      id: number;
+      paid_at: string | null;
+      amount: number | null;
+      payee: string | null;
+      payment_method: string | null;
+      practice_date: string;
+      start_time: string;
+      end_time: string | null;
+      practice_location: string | null;
+    }>();
+  if (!row || typeof row.amount !== "number") {
+    return { outcome: "not_found" };
+  }
+  const payment: Extract<UnifiedUnpaidItem, { payment_kind: "personal_notice" }> = {
+    payment_kind: "personal_notice",
+    id: row.id,
+    practice_date: row.practice_date,
+    start_time: row.start_time,
+    end_time: row.end_time,
+    practice_location: row.practice_location,
+    payment_type: "個人練習",
+    amount: row.amount,
+    payee: row.payee,
+    due_date: null,
+    payment_method: row.payment_method,
+    sort_date: row.practice_date
+  };
+  if (row.paid_at) {
+    return { outcome: "already_paid", payment };
+  }
+  const now = new Date().toISOString();
+  const updateResult = await db
+    .prepare(
+      `UPDATE personal_slot_payment_notices
+       SET paid_at = ?1, updated_at = ?1
+       WHERE id = ?2 AND paid_at IS NULL`
+    )
+    .bind(now, noticeId)
+    .run();
+  if (Number(updateResult.meta.changes ?? 0) > 0) {
+    return { outcome: "updated", payment };
+  }
+  return { outcome: "already_paid", payment };
 }
 
 async function markEventPaymentPaid(
@@ -11202,7 +11347,35 @@ async function handleMarkPaidPostback(
     return;
   }
 
-  const paymentKind = paymentKindRaw === "monthly" ? "monthly" : "event";
+  const paymentKind = paymentKindRaw === "monthly" ? "monthly" : paymentKindRaw === "personal_notice" ? "personal_notice" : "event";
+  if (paymentKind === "personal_notice") {
+    const markResult = await markPersonalSlotPaymentNoticePaid(env.DB, paymentId);
+    console.log({ stage: "mark_paid_success", updated: markResult.outcome === "updated" });
+    if (markResult.outcome === "not_found" || !markResult.payment) {
+      const lineStatus = await replyMessages(
+        event.replyToken,
+        [{ type: "text", text: "該当する支払いが見つかりませんでした。" }],
+        env.LINE_CHANNEL_ACCESS_TOKEN
+      );
+      if (typeof lineStatus === "number") {
+        console.log({ stage: "line_reply_success", status: lineStatus });
+      }
+      return;
+    }
+    const unpaid = await getUnifiedUnpaidPayments(env.DB, MAX_UNPAID_DISPLAY_COUNT);
+    const messages: LineReplyMessage[] = [
+      {
+        type: "text",
+        text: markResult.outcome === "already_paid" ? "この支払いはすでに支払済みです。" : buildPaidConfirmationMessage(markResult.payment)
+      },
+      buildUnpaidListMessage(unpaid.payments, unpaid.totalCount)
+    ];
+    const lineStatus = await replyMessages(event.replyToken, messages, env.LINE_CHANNEL_ACCESS_TOKEN);
+    if (typeof lineStatus === "number") {
+      console.log({ stage: "line_reply_success", status: lineStatus });
+    }
+    return;
+  }
   if (paymentKind === "monthly") {
     const markResult = await markMonthlyPaymentPaid(env.DB, paymentId);
     console.log({ stage: "mark_paid_success", updated: markResult.outcome === "updated" });
@@ -12240,7 +12413,7 @@ async function registerPersonalPracticePaymentNotice(
   rawText: string,
   sourceType: "line_text" | "line_image",
   nowMs: number
-): Promise<{ status: "needs_confirmation" | "registered"; message: string }> {
+): Promise<{ status: "needs_confirmation" | "registered"; message: string; noticeId: number | null }> {
   const slots = await env.DB.prepare(
     `SELECT id, practice_date, start_time, end_time, practice_location, coordinator_name, watanabe_is_coordinator, payment_reminder_sent_at
      FROM personal_confirmed_slots
@@ -12256,13 +12429,14 @@ async function registerPersonalPracticePaymentNotice(
   if (parsed.status !== "parsed") {
     return {
       status: "needs_confirmation",
+      noticeId: null,
       message: parsed.status === "needs_image" ? "《確認が必要》\n\n料金案内の本文がありません。" : parsed.message
     };
   }
   const recent = await loadPersonalSlotContext(env, userId, nowMs);
   const target = resolvePaymentNoticeSlot(parsed.notice, slotRows, recent?.slots ?? null);
   if (!target.ok) {
-    return { status: "needs_confirmation", message: target.message };
+    return { status: "needs_confirmation", noticeId: null, message: target.message };
   }
   const notice: PersonalPracticePaymentNoticeDraft = {
     ...parsed.notice,
@@ -12287,7 +12461,11 @@ async function registerPersonalPracticePaymentNotice(
       court_or_area = excluded.court_or_area,
       source_type = excluded.source_type,
       source_text = excluded.source_text,
-      updated_at = excluded.updated_at`
+      updated_at = excluded.updated_at,
+      paid_at = CASE
+        WHEN personal_slot_payment_notices.participant_amount IS NOT excluded.participant_amount THEN NULL
+        ELSE personal_slot_payment_notices.paid_at
+      END`
   )
     .bind(
       target.slot.id,
@@ -12304,8 +12482,14 @@ async function registerPersonalPracticePaymentNotice(
       nowIso
     )
     .run();
+  const saved = await env.DB.prepare(
+    `SELECT id FROM personal_slot_payment_notices WHERE slot_id = ?1`
+  )
+    .bind(target.slot.id)
+    .first<{ id: number }>();
   return {
     status: "registered",
+    noticeId: saved?.id ?? null,
     message: formatPersonalPracticePaymentNoticeReply(
       formatYahooSlotWhenLabel(target.slot.practice_date, target.slot.start_time, target.slot.end_time),
       target.slot.practice_location,
@@ -12321,7 +12505,8 @@ async function handlePersonalPracticePaymentCommand(event: LineWebhookEvent, env
   if (!userId || !event.replyToken) {
     return;
   }
-  const route = splitPersonalPracticePaymentCommand(inputText);
+  const explicitRoute = splitPersonalPracticePaymentCommand(inputText);
+  const route = explicitRoute ?? (looksLikePersonalPracticePaymentNotice(inputText) ? "text" : null);
   if (!route) {
     return;
   }
@@ -12344,7 +12529,23 @@ async function handlePersonalPracticePaymentCommand(event: LineWebhookEvent, env
       rawText = await callOpenAIForPersonalPracticePaymentNotice(imageDataUrl, env);
     }
     const result = await registerPersonalPracticePaymentNotice(env, userId, rawText, sourceType, nowMs);
-    await replyMessages(event.replyToken, [{ type: "text", text: result.message }], env.LINE_CHANNEL_ACCESS_TOKEN);
+    const reply: LineReplyMessage = { type: "text", text: result.message };
+    if (result.status === "registered" && result.noticeId && !result.message.includes("確定できませんでした")) {
+      reply.quickReply = {
+        items: [
+          {
+            type: "action",
+            action: {
+              type: "postback",
+              label: "支払済みにする",
+              data: `action=mark_paid&payment_kind=personal_notice&payment_id=${result.noticeId}`,
+              displayText: "支払済みにする"
+            }
+          }
+        ]
+      };
+    }
+    await replyMessages(event.replyToken, [reply], env.LINE_CHANNEL_ACCESS_TOKEN);
   } catch (error) {
     const errorType = error instanceof Error ? error.name : "unknown";
     console.error("Personal practice payment notice parse failed", { errorType });
@@ -12413,7 +12614,7 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
     await handleYahooPersonalCalendarCommand(event, env);
     return;
   }
-  if (splitPersonalPracticePaymentCommand(inputText)) {
+  if (splitPersonalPracticePaymentCommand(inputText) || looksLikePersonalPracticePaymentNotice(inputText)) {
     await handlePersonalPracticePaymentCommand(event, env, inputText);
     return;
   }
@@ -12741,6 +12942,40 @@ async function handleImageMessageEvent(event: LineWebhookEvent, env: Env): Promi
     timestamp
   });
   console.log({ stage: "pair_image_saved" });
+  if (!event.replyToken) {
+    return;
+  }
+  try {
+    const imageDataUrl = await fetchLineImageDataUrl(messageId, env);
+    if (!imageDataUrl) {
+      return;
+    }
+    const transcript = await callOpenAIForPersonalPracticePaymentNotice(imageDataUrl, env);
+    if (!looksLikePersonalPracticePaymentNotice(transcript)) {
+      return;
+    }
+    const result = await registerPersonalPracticePaymentNotice(env, userId, transcript, "line_image", timestamp);
+    const reply: LineReplyMessage = { type: "text", text: result.message };
+    if (result.status === "registered" && result.noticeId && !result.message.includes("確定できませんでした")) {
+      reply.quickReply = {
+        items: [
+          {
+            type: "action",
+            action: {
+              type: "postback",
+              label: "支払済みにする",
+              data: `action=mark_paid&payment_kind=personal_notice&payment_id=${result.noticeId}`,
+              displayText: "支払済みにする"
+            }
+          }
+        ]
+      };
+    }
+    await replyMessages(event.replyToken, [reply], env.LINE_CHANNEL_ACCESS_TOKEN);
+  } catch (error) {
+    const errorType = error instanceof Error ? error.name : "unknown";
+    console.error("Personal practice payment notice image skipped", { errorType });
+  }
 }
 
 async function processEventInBackground(event: LineWebhookEvent, env: Env): Promise<void> {
@@ -12878,6 +13113,7 @@ type PersonalSlotPaymentNoticeReminder = {
   payee_name: string;
   payment_method: string;
   participant_amount: number | null;
+  paid_at?: string | null;
 };
 
 type PersonalSlotReminderPlan = {
@@ -12993,6 +13229,9 @@ function selectPersonalSlotReminders(
     if (nowMinutes >= endMinutes && nowMinutes < endMinutes + PERSONAL_SLOT_PAYMENT_REMINDER_WINDOW_MINUTES) {
       const linked = resolvePersonalSlotFeeLink(slot.practice_date, slots, payments);
       const notice = notices.find((item) => item.slot_id === slot.id) ?? null;
+      if (notice?.paid_at) {
+        continue;
+      }
       if (notice && typeof notice.participant_amount === "number" && notice.participant_amount > 0) {
         const slotsOnDate = slots.filter(
           (item) => item.practice_date === slot.practice_date && Number(item.rui_participates) === 1
@@ -13335,7 +13574,7 @@ async function loadPersonalSlotReminderContext(
     .bind(today, tomorrow)
     .all<PersonalSlotFeePayment>();
   const noticeRows = await env.DB.prepare(
-    `SELECT n.slot_id, n.payee_name, n.payment_method, n.participant_amount
+    `SELECT n.slot_id, n.payee_name, n.payment_method, n.participant_amount, n.paid_at
      FROM personal_slot_payment_notices n
      JOIN personal_confirmed_slots s ON s.id = n.slot_id
      WHERE s.practice_date IN (?1, ?2)`
@@ -13667,6 +13906,7 @@ export const TEST_HOOKS = {
   saveStructuredResultToD1,
   confirmParticipationAndReleaseConditionalFees,
   getUnifiedUnpaidPayments,
+  markPersonalSlotPaymentNoticePaid,
   getReviewPendingEventPayments,
   markEventPaymentPaid,
   markMonthlyPaymentPaid,
@@ -13685,6 +13925,7 @@ export const TEST_HOOKS = {
   formatPaymentSideReminder,
   classifyScheduledTrigger,
   splitPersonalPracticePaymentCommand,
+  looksLikePersonalPracticePaymentNotice,
   parsePersonalPracticePaymentNotice,
   resolvePaymentNoticeSlot,
   registerPersonalPracticePaymentNotice,
