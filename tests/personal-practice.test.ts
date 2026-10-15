@@ -281,6 +281,7 @@ function createTestEnv() {
   sqlite.exec(readFileSync("migrations/0015_personal_slot_payment_notices.sql", "utf8"));
   sqlite.exec(readFileSync("migrations/0016_personal_slot_payment_notice_paid_at.sql", "utf8"));
   sqlite.exec(readFileSync("migrations/0017_personal_slot_receivables.sql", "utf8"));
+  sqlite.exec(readFileSync("migrations/0018_regular_late_participations.sql", "utf8"));
 
   return {
     raw: sqlite,
@@ -7923,6 +7924,277 @@ window.Chouseisan = {
       .first<{ paid_at: string | null }>();
     assert.ok(morningPaid?.paid_at);
     assert.equal(afternoonAfter?.paid_at ?? null, null);
+  })();
+
+  await (async () => {
+    const dayBefore = Date.parse("2026-10-19T10:00:00+09:00");
+    const morning = Date.parse("2026-10-20T07:30:00+09:00");
+    const eight = Date.parse("2026-10-20T08:00:00+09:00");
+    const lateMorning = Date.parse("2026-10-20T10:00:00+09:00");
+    const monday = "2026-10-19";
+    const tuesday = "2026-10-20";
+    const { raw, env } = createTestEnv();
+    const nowIso = "2026-10-01T00:00:00.000Z";
+    const insertPractice = (date: string, attendance: string, practiceType: string) => {
+      raw
+        .prepare(
+          `INSERT INTO practices (
+             practice_date, attendance, outbound_type, return_type, source, practice_type,
+             practice_location, meeting_time, meeting_place, created_at, updated_at
+           ) VALUES (?1, ?2, 'バス', 'バス', '羽魂練習会', ?3, '永谷地区センター', '18:00', '志村家前', ?4, ?4)`
+        )
+        .run(date, attendance, practiceType, nowIso);
+    };
+    insertPractice(monday, "不参加", "通常練習");
+    insertPractice(tuesday, "不参加", "通常練習");
+    insertPractice("2026-10-22", "参加", "個人練習");
+    raw
+      .prepare(
+        `INSERT INTO monthly_fee_rules (
+           year_month, version, is_active, payment_date, payee, payment_method, source, received_at,
+           total_amount, memo_text, payment_reminder_text, created_at, updated_at
+         ) VALUES ('2026-10', 1, 1, '2026-10-25', '吉村', 'PayPay', 'test', ?1, 10000, 'memo', 'pay', ?1, ?1)`
+      )
+      .run(nowIso);
+    const ruleId = (raw.prepare("SELECT id FROM monthly_fee_rules WHERE year_month = '2026-10'").get() as { id: number }).id;
+    for (const [code, price] of [
+      ["mon", 800],
+      ["thu", 800],
+      ["sun", 800],
+      ["tue", 1250]
+    ] as const) {
+      raw
+        .prepare(
+          `INSERT INTO monthly_fee_weekday_rates (rule_id, weekday_code, unit_price, created_at, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?4)`
+        )
+        .run(ruleId, code, price, nowIso);
+    }
+    raw
+      .prepare(
+        `INSERT INTO monthly_fee_extra_charges (rule_id, item_name, amount, created_at, updated_at)
+         VALUES (?1, '見守り代', 500, ?2, ?2)`
+      )
+      .run(ruleId, nowIso);
+    raw
+      .prepare(
+        `INSERT INTO monthly_payments (
+           billing_month, monthly_type, amount, payee, due_date, payment_method, status, source, created_at, updated_at
+         ) VALUES ('2026-10', 'regular_training_total', 10000, '吉村', '2026-10-25', 'PayPay', 'unpaid', 'test', ?1, ?1)`
+      )
+      .run(nowIso);
+    raw
+      .prepare(
+        `INSERT INTO payments (
+           practice_date, payment_type, amount, payee, payment_method, status, billing_scope, direction, source, created_at, updated_at
+         ) VALUES ('2026-10-18', '車同乗代', 300, '山田', '現金', 'unpaid', 'event', 'outbound', 'test', ?1, ?1)`
+      )
+      .run(nowIso);
+    const monthlyBefore = raw.prepare("SELECT amount, status FROM monthly_payments WHERE billing_month = '2026-10'").get() as {
+      amount: number;
+      status: string;
+    };
+    const replies: Array<{ text?: string; quickReply?: { items: Array<{ action: { label: string; data: string } }> } }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        messages?: Array<{ text?: string; quickReply?: { items: Array<{ action: { label: string; data: string } }> } }>;
+      };
+      replies.push(...(body.messages ?? []));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const send = (text: string, timestamp: number) =>
+      hooks.handleRegularLateParticipationCommand(
+        { replyToken: "late-reply", timestamp, message: { type: "text", text } } as any,
+        env,
+        hooks.parseRegularLateParticipationCommand(text, timestamp) ?? ""
+      );
+    try {
+      assert.equal(hooks.parseRegularLateParticipationCommand("10/20 追加参加", dayBefore), tuesday);
+      assert.equal(hooks.parseRegularLateParticipationCommand("10/20 追加参加取消", dayBefore), null);
+      await send("10/21 追加参加", dayBefore);
+      assert.match(replies.at(-1)?.text ?? "", /通常練習を確認できませんでした/);
+      assert.equal(
+        (raw.prepare("SELECT COUNT(*) AS count FROM payments WHERE rule_key = 'regular_late_participation'").get() as { count: number }).count,
+        0
+      );
+      await send("10/22 追加参加", dayBefore);
+      assert.match(replies.at(-1)?.text ?? "", /通常練習を確認できませんでした/);
+      await send("10/20 追加参加", dayBefore);
+      assert.match(replies.at(-1)?.text ?? "", /追加参加として登録しました/);
+      assert.match(replies.at(-1)?.text ?? "", /1,250円/);
+      assert.match(replies.at(-1)?.text ?? "", /支払先：吉村/);
+      assert.match(replies.at(-1)?.text ?? "", /方法：PayPay/);
+      assert.equal(replies.at(-1)?.quickReply, undefined);
+      await send("10/20 追加参加", dayBefore);
+      assert.equal(
+        (raw.prepare("SELECT COUNT(*) AS count FROM regular_late_participations").get() as { count: number }).count,
+        1
+      );
+      assert.equal(
+        (raw.prepare("SELECT COUNT(*) AS count FROM payments WHERE rule_key = 'regular_late_participation'").get() as { count: number }).count,
+        1
+      );
+      await send("10/19 追加参加", dayBefore);
+      const mondayPayment = raw.prepare("SELECT amount, payee, payment_method FROM payments WHERE practice_date = '2026-10-19'").get() as {
+        amount: number;
+        payee: string;
+        payment_method: string;
+      };
+      assert.equal(mondayPayment.amount, 800);
+      assert.equal(mondayPayment.payee, "吉村");
+      assert.equal(mondayPayment.payment_method, "PayPay");
+      const monthlyAfter = raw.prepare("SELECT amount, status FROM monthly_payments WHERE billing_month = '2026-10'").get() as {
+        amount: number;
+        status: string;
+      };
+      assert.deepEqual(monthlyAfter, monthlyBefore);
+      assert.equal(
+        (raw.prepare("SELECT attendance FROM practices WHERE practice_date = '2026-10-20'").get() as { attendance: string }).attendance,
+        "不参加"
+      );
+      const contact = await hooks.buildRuiContactMessages(env.DB as any, [tuesday], ["10/20（火）"]);
+      assert.match(contact[0] ?? "", /参加：追加参加/);
+      assert.match(contact[0] ?? "", /永谷地区センター/);
+      assert.match(contact[0] ?? "", /志村家前/);
+      const unpaid = await hooks.getUnifiedUnpaidPayments(env.DB as any, 10);
+      const lateItems = unpaid.payments.filter((item) => item.payment_kind === "event" && item.payment_type === "通常練習・追加参加分");
+      assert.equal(lateItems.length, 2);
+      assert.equal(unpaid.payments.some((item) => item.payment_kind === "event" && item.payment_type === "車同乗代"), true);
+      await env.STATE.put("owner_line_user_id", "OWNER");
+      replies.length = 0;
+      await hooks.handleMonthlyFeeReminderScheduled({ scheduledTime: eight, cron: "0 23 * * *" } as any, env);
+      const tuesdayReminder = replies.find((message) => (message.text ?? "").includes("10/20"));
+      assert.match(tuesdayReminder?.text ?? "", /【通常練習｜追加参加分】/);
+      assert.match(tuesdayReminder?.text ?? "", /1,250円/);
+      assert.match(tuesdayReminder?.text ?? "", /吉村へ/);
+      assert.match(tuesdayReminder?.text ?? "", /PayPay/);
+      assert.equal(tuesdayReminder?.quickReply?.items[0]?.action.label, "支払済みにする");
+      assert.match(tuesdayReminder?.quickReply?.items[0]?.action.data ?? "", /payment_kind=event/);
+      const reminderCount = replies.filter((message) => (message.text ?? "").includes("【通常練習｜追加参加分】")).length;
+      assert.equal(reminderCount, 1);
+      replies.length = 0;
+      await hooks.handleMonthlyFeeReminderScheduled({ scheduledTime: eight, cron: "0 23 * * *" } as any, env);
+      assert.equal(replies.filter((message) => (message.text ?? "").includes("【通常練習｜追加参加分】")).length, 0);
+      const tuesdayPayment = raw
+        .prepare("SELECT id, status FROM payments WHERE practice_date = '2026-10-20' AND rule_key = 'regular_late_participation'")
+        .get() as { id: number; status: string };
+      await hooks.handleMarkPaidPostback({ replyToken: "paid" } as any, env, String(tuesdayPayment.id), "event");
+      const paid = raw.prepare("SELECT status FROM payments WHERE id = ?1").get(tuesdayPayment.id) as { status: string };
+      assert.equal(paid.status, "paid");
+      const unpaidAfter = await hooks.getUnifiedUnpaidPayments(env.DB as any, 10);
+      assert.equal(
+        unpaidAfter.payments.some((item) => item.payment_kind === "event" && item.practice_date === tuesday),
+        false
+      );
+      replies.length = 0;
+      await hooks.handleMonthlyFeeReminderScheduled({ scheduledTime: Date.parse("2026-10-20T08:05:00+09:00"), cron: "0 23 * * *" } as any, env);
+      assert.equal(replies.filter((message) => (message.text ?? "").includes("10/20")).length, 0);
+      await send("10/20 追加参加", lateMorning);
+      assert.match(replies.at(-1)?.text ?? "", /支払済みです/);
+      assert.equal(paid.status, "paid");
+      assert.equal(
+        (raw.prepare("SELECT COUNT(*) AS count FROM payments WHERE practice_date = '2026-10-20' AND rule_key = 'regular_late_participation'").get() as { count: number }).count,
+        1
+      );
+
+      const { raw: sameDayRaw, env: sameDayEnv } = createTestEnv();
+      sameDayRaw
+        .prepare(
+          `INSERT INTO practices (
+             practice_date, attendance, outbound_type, return_type, source, practice_type, created_at, updated_at
+           ) VALUES ('2026-10-20', '不明', '不明', '不明', '羽魂練習会', '通常練習', ?1, ?1)`
+        )
+        .run(nowIso);
+      sameDayRaw
+        .prepare(
+          `INSERT INTO monthly_fee_rules (
+             year_month, version, is_active, payment_date, payee, payment_method, source, received_at,
+             total_amount, memo_text, payment_reminder_text, created_at, updated_at
+           ) VALUES ('2026-10', 1, 1, '2026-10-25', '佐藤', '現金', 'test', ?1, 8000, 'memo', 'pay', ?1, ?1)`
+        )
+        .run(nowIso);
+      const sameRule = (sameDayRaw.prepare("SELECT id FROM monthly_fee_rules").get() as { id: number }).id;
+      sameDayRaw
+        .prepare(`INSERT INTO monthly_fee_weekday_rates (rule_id, weekday_code, unit_price, created_at, updated_at) VALUES (?1, 'tue', 1250, ?2, ?2)`)
+        .run(sameRule, nowIso);
+      replies.length = 0;
+      await hooks.handleRegularLateParticipationCommand(
+        { replyToken: "same-day", timestamp: lateMorning } as any,
+        sameDayEnv,
+        tuesday
+      );
+      assert.match(replies.at(-1)?.text ?? "", /【通常練習｜追加参加分】/);
+      assert.match(replies.at(-1)?.text ?? "", /佐藤へ/);
+      assert.match(replies.at(-1)?.text ?? "", /現金/);
+      assert.equal(replies.at(-1)?.quickReply?.items[0]?.action.label, "支払済みにする");
+      await sameDayEnv.STATE.put("owner_line_user_id", "OWNER");
+      const beforeCron = replies.length;
+      await hooks.handleMonthlyFeeReminderScheduled({ scheduledTime: lateMorning, cron: "0 23 * * *" } as any, sameDayEnv);
+      assert.equal(replies.length, beforeCron);
+      replies.length = 0;
+      await hooks.handleRegularLateParticipationCommand(
+        { replyToken: "early", timestamp: morning } as any,
+        sameDayEnv,
+        tuesday
+      );
+      assert.match(replies.at(-1)?.text ?? "", /追加参加として登録しました/);
+      assert.equal(replies.at(-1)?.quickReply, undefined);
+
+      const { raw: missingRaw, env: missingEnv } = createTestEnv();
+      missingRaw
+        .prepare(
+          `INSERT INTO practices (
+             practice_date, attendance, outbound_type, return_type, source, practice_type, created_at, updated_at
+           ) VALUES ('2026-10-20', '不参加', '不明', '不明', '羽魂練習会', '通常練習', ?1, ?1)`
+        )
+        .run(nowIso);
+      await hooks.handleRegularLateParticipationCommand(
+        { replyToken: "missing-rule", timestamp: dayBefore } as any,
+        missingEnv,
+        tuesday
+      );
+      assert.match(replies.at(-1)?.text ?? "", /参加費または支払先を確定できません/);
+      assert.equal(
+        (missingRaw.prepare("SELECT COUNT(*) AS count FROM payments").get() as { count: number }).count,
+        0
+      );
+      missingRaw
+        .prepare(
+          `INSERT INTO monthly_fee_rules (
+             year_month, version, is_active, payment_date, payee, payment_method, source, received_at,
+             total_amount, memo_text, payment_reminder_text, created_at, updated_at
+           ) VALUES ('2026-10', 1, 1, '2026-10-25', NULL, 'PayPay', 'test', ?1, 1000, 'memo', 'pay', ?1, ?1)`
+        )
+        .run(nowIso);
+      const noPayeeRule = (missingRaw.prepare("SELECT id FROM monthly_fee_rules").get() as { id: number }).id;
+      missingRaw
+        .prepare(`INSERT INTO monthly_fee_weekday_rates (rule_id, weekday_code, unit_price, created_at, updated_at) VALUES (?1, 'tue', 1250, ?2, ?2)`)
+        .run(noPayeeRule, nowIso);
+      await hooks.handleRegularLateParticipationCommand(
+        { replyToken: "no-payee", timestamp: dayBefore } as any,
+        missingEnv,
+        tuesday
+      );
+      assert.equal((missingRaw.prepare("SELECT COUNT(*) AS count FROM payments").get() as { count: number }).count, 0);
+      missingRaw.prepare("UPDATE monthly_fee_rules SET payee = '吉村'").run();
+      missingRaw.prepare("DELETE FROM monthly_fee_weekday_rates").run();
+      missingRaw
+        .prepare(`INSERT INTO monthly_fee_weekday_rates (rule_id, weekday_code, unit_price, created_at, updated_at) VALUES (?1, 'tue', 1250, ?2, ?2)`)
+        .run(noPayeeRule, nowIso);
+      missingRaw
+        .prepare(`INSERT INTO monthly_fee_weekday_rates (rule_id, weekday_code, unit_price, created_at, updated_at) VALUES (?1, 'tue', 1300, ?2, ?2)`)
+        .run(noPayeeRule, nowIso);
+      await hooks.handleRegularLateParticipationCommand(
+        { replyToken: "ambiguous", timestamp: dayBefore } as any,
+        missingEnv,
+        tuesday
+      );
+      assert.equal((missingRaw.prepare("SELECT COUNT(*) AS count FROM payments").get() as { count: number }).count, 0);
+      assert.equal(hooks.classifyScheduledTrigger("*/15 * * * *", 8), "personal_slots");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   })();
 
   console.log("personal-practice test: all cases passed");

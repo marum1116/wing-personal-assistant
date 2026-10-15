@@ -8008,11 +8008,14 @@ async function getPracticeByDateAndSource(
   return row ?? null;
 }
 
-function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow | null): string[] {
+function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow | null, lateParticipation = false): string[] {
   const lines: string[] = [`【${headerLabel}】`];
   if (!practice) {
     lines.push("練習情報なし");
     return lines;
+  }
+  if (lateParticipation) {
+    lines.push("参加：追加参加");
   }
 
   lines.push(`練習場所：${resolveContactPracticeLocation(practice)}`);
@@ -8131,10 +8134,14 @@ async function buildRuiContactMessages(
     const practiceDate = dates[i];
     const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
     const practice = await getPracticeForRuiContact(db, practiceDate);
+    const lateParticipation = await db
+      .prepare(`SELECT id FROM regular_late_participations WHERE practice_date = ?1 LIMIT 1`)
+      .bind(practiceDate)
+      .first<{ id: number }>();
     const personalBlocks = await buildPersonalRuiContactBlocks(db, practiceDate);
     const parts: string[] = [];
     if (practice) {
-      parts.push(buildRuiContactPracticeBlock(headerLabel, practice).join("\n"));
+      parts.push(buildRuiContactPracticeBlock(headerLabel, practice, Boolean(lateParticipation)).join("\n"));
     } else if (personalBlocks.length === 0) {
       parts.push(buildRuiContactPracticeBlock(headerLabel, null).join("\n"));
     } else {
@@ -8194,6 +8201,133 @@ function parseParticipationConfirmCommand(inputText: string, nowMs: number): str
     return null;
   }
   return ymd;
+}
+
+const LATE_PARTICIPATION_PAYMENT_TYPE = "通常練習・追加参加分";
+const LATE_PARTICIPATION_RULE_KEY = "regular_late_participation";
+const LATE_PARTICIPATION_SOURCE = "explicit_command";
+
+function parseRegularLateParticipationCommand(inputText: string, nowMs: number): string | null {
+  const matched = /^(\d{1,2})\/(\d{1,2})\s+追加参加$/.exec(inputText.trim());
+  if (!matched) {
+    return null;
+  }
+  const now = new Date(nowMs);
+  const year = Number(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Tokyo",
+      year: "numeric"
+    }).format(now)
+  );
+  const month = Number(matched[1]);
+  const day = Number(matched[2]);
+  const ymd = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  if (!parseYmdAsUtcDate(ymd)) {
+    return null;
+  }
+  return ymd;
+}
+
+function weekdayCodeForPracticeDate(practiceDate: string): WeekdayCode | null {
+  const parsed = parseYmdAsUtcDate(practiceDate);
+  if (!parsed) {
+    return null;
+  }
+  return UTC_DAY_TO_WEEKDAY_CODE[parsed.getUTCDay()] ?? null;
+}
+
+async function resolveLateParticipationFee(
+  db: D1Database,
+  practiceDate: string
+): Promise<{ ok: true; amount: number; payee: string; paymentMethod: PaymentMethod } | { ok: false }> {
+  const rule = await getActiveMonthlyFeeRule(db, practiceDate.slice(0, 7));
+  if (!rule || !isConcreteText(rule.payee) || !rule.payment_method || rule.payment_method === "不明") {
+    return { ok: false };
+  }
+  const weekday = weekdayCodeForPracticeDate(practiceDate);
+  if (!weekday) {
+    return { ok: false };
+  }
+  const rates = await db
+    .prepare(
+      `SELECT unit_price
+       FROM monthly_fee_weekday_rates
+       WHERE rule_id = ?1
+         AND weekday_code = ?2`
+    )
+    .bind(rule.id, weekday)
+    .all<{ unit_price: number }>();
+  const prices = [...new Set((rates.results ?? []).map((row) => row.unit_price))];
+  if (prices.length !== 1 || typeof prices[0] !== "number" || prices[0] <= 0) {
+    return { ok: false };
+  }
+  return { ok: true, amount: prices[0], payee: rule.payee, paymentMethod: rule.payment_method };
+}
+
+function formatLateParticipationRegistered(input: {
+  practiceDate: string;
+  amount: number;
+  payee: string;
+  paymentMethod: string;
+}): string {
+  return [
+    `${formatYmdWithJapaneseWeekday(input.practiceDate)}の通常練習を`,
+    "追加参加として登録しました。",
+    "",
+    `追加参加分：${formatYen(input.amount)}`,
+    `支払先：${input.payee}`,
+    `方法：${input.paymentMethod}`,
+    "",
+    "当日に支払いをお知らせします。"
+  ].join("\n");
+}
+
+function formatLateParticipationReminder(input: {
+  practiceDate: string;
+  amount: number;
+  payee: string;
+  paymentMethod: string;
+}): string {
+  return [
+    "【通常練習｜追加参加分】",
+    "",
+    `${formatYmdWithJapaneseWeekday(input.practiceDate)}の追加参加分です。`,
+    "",
+    `${input.payee}へ`,
+    `${formatYen(input.amount)}を${input.paymentMethod}してください。`
+  ].join("\n");
+}
+
+function formatLateParticipationUnresolved(practiceDate: string): string {
+  const month = Number(practiceDate.slice(5, 7));
+  return [
+    `${formatDateForLine(practiceDate)}の追加参加を確認しました。`,
+    `ただし、${month}月の月謝案内から参加費または支払先を確定できません。`,
+    "月謝案内を確認してください。"
+  ].join("\n");
+}
+
+async function loadLateParticipationPayment(
+  db: D1Database,
+  paymentId: number
+): Promise<{
+  id: number;
+  amount: number | null;
+  payee: string | null;
+  payment_method: string | null;
+  status: string;
+} | null> {
+  return await db
+    .prepare(
+      `SELECT id, amount, payee, payment_method, status
+       FROM payments
+       WHERE id = ?1
+         AND voided_at IS NULL
+         AND rule_key = ?2
+       LIMIT 1`
+    )
+    .bind(paymentId, LATE_PARTICIPATION_RULE_KEY)
+    .first();
 }
 
 function formatConditionalParticipationPaymentForLine(payment: {
@@ -8773,6 +8907,7 @@ async function getReminderTargets(
            reminder_sent_on IS NULL
            OR reminder_sent_on <> ?1
          )
+         AND IFNULL(rule_key, '') <> 'regular_late_participation'
        ORDER BY (due_date IS NULL) ASC, due_date ASC, practice_date ASC, id ASC`
     )
     .bind(todayJst, yesterdayJst)
@@ -9175,6 +9310,7 @@ async function handleMonthlyFeeReminderScheduled(
     await markMonthlyFeeNoteReminderSentOn(env.DB, target.id, todayJst);
   }
 
+  await remindRegularLateParticipations(env, todayJst);
   const paymentTargets = await getMonthlyFeePaymentReminderTargets(env.DB, todayJst);
   if (paymentTargets.length === 0) {
     console.log({ stage: "monthly_fee_reminder_no_payment_targets", noteTargetCount: noteTargets.length });
@@ -11432,6 +11568,245 @@ async function replyUnpaidList(
   };
 }
 
+async function ensureLateParticipationPayment(
+  db: D1Database,
+  practiceDate: string,
+  fee: { amount: number; payee: string; paymentMethod: PaymentMethod },
+  nowIso: string
+): Promise<number> {
+  const inserted = await db
+    .prepare(
+      `INSERT INTO payments (
+         practice_date, payment_type, amount, payee, due_date, payment_method, status,
+         billing_scope, direction, source, rule_key, needs_review, created_at, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'unpaid', 'event', 'none', ?7, ?8, 0, ?9, ?9)`
+    )
+    .bind(
+      practiceDate,
+      LATE_PARTICIPATION_PAYMENT_TYPE,
+      fee.amount,
+      fee.payee,
+      practiceDate,
+      fee.paymentMethod,
+      LATE_PARTICIPATION_SOURCE,
+      LATE_PARTICIPATION_RULE_KEY,
+      nowIso
+    )
+    .run();
+  const createdId = Number(inserted.meta.last_row_id ?? 0);
+  if (createdId > 0) {
+    return createdId;
+  }
+  const row = await db
+    .prepare(
+      `SELECT id FROM payments
+       WHERE practice_date = ?1 AND rule_key = ?2 AND voided_at IS NULL
+       ORDER BY id DESC LIMIT 1`
+    )
+    .bind(practiceDate, LATE_PARTICIPATION_RULE_KEY)
+    .first<{ id: number }>();
+  if (!row) {
+    throw new Error("late_participation_payment_insert_failed");
+  }
+  return row.id;
+}
+
+async function handleRegularLateParticipationCommand(
+  event: LineWebhookEvent,
+  env: Env,
+  practiceDate: string
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const nowMs = event.timestamp ?? Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const practice = await env.DB
+    .prepare(
+      `SELECT practice_date
+       FROM practices
+       WHERE practice_date = ?1
+         AND practice_type = '通常練習'
+       LIMIT 1`
+    )
+    .bind(practiceDate)
+    .first<{ practice_date: string }>();
+  if (!practice) {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: `${formatDateForLine(practiceDate)}の通常練習を確認できませんでした。\n日付を確認してください。` }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const existing = await env.DB
+    .prepare(
+      `SELECT id, payment_id, reminder_sent_at
+       FROM regular_late_participations
+       WHERE practice_date = ?1
+       LIMIT 1`
+    )
+    .bind(practiceDate)
+    .first<{ id: number; payment_id: number | null; reminder_sent_at: string | null }>();
+  let payment = existing?.payment_id ? await loadLateParticipationPayment(env.DB, existing.payment_id) : null;
+  if (payment?.status === "paid") {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: `${formatYmdWithJapaneseWeekday(practiceDate)}の追加参加は登録済みです。\nこの追加参加分は支払済みです。` }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const fee = await resolveLateParticipationFee(env.DB, practiceDate);
+  if (!payment && fee.ok) {
+    const paymentId = await ensureLateParticipationPayment(env.DB, practiceDate, fee, nowIso);
+    if (existing) {
+      await env.DB
+        .prepare(`UPDATE regular_late_participations SET payment_id = ?1, updated_at = ?2 WHERE id = ?3`)
+        .bind(paymentId, nowIso, existing.id)
+        .run();
+    } else {
+      await env.DB
+        .prepare(
+          `INSERT INTO regular_late_participations (
+             practice_date, recorded_at, source, payment_id, created_at, updated_at
+           ) VALUES (?1, ?2, ?3, ?4, ?2, ?2)`
+        )
+        .bind(practiceDate, nowIso, LATE_PARTICIPATION_SOURCE, paymentId)
+        .run();
+    }
+    payment = await loadLateParticipationPayment(env.DB, paymentId);
+  } else if (!existing) {
+    await env.DB
+      .prepare(
+        `INSERT INTO regular_late_participations (
+           practice_date, recorded_at, source, payment_id, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, NULL, ?2, ?2)`
+      )
+      .bind(practiceDate, nowIso, LATE_PARTICIPATION_SOURCE)
+      .run();
+  }
+
+  if (!payment || typeof payment.amount !== "number" || !isConcreteText(payment.payee) || !isConcreteText(payment.payment_method)) {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: formatLateParticipationUnresolved(practiceDate) }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+
+  const latest = await env.DB
+    .prepare(`SELECT reminder_sent_at FROM regular_late_participations WHERE practice_date = ?1 LIMIT 1`)
+    .bind(practiceDate)
+    .first<{ reminder_sent_at: string | null }>();
+  const remindNow =
+    practiceDate === getJstDateString(nowMs) &&
+    getJstHourMinute(nowMs).hour >= 8 &&
+    !latest?.reminder_sent_at;
+  const summary = {
+    practiceDate,
+    amount: payment.amount,
+    payee: payment.payee,
+    paymentMethod: payment.payment_method
+  };
+  if (remindNow) {
+    await replyMessages(
+      event.replyToken,
+      [
+        quickReplyMessage(formatLateParticipationReminder(summary), [
+          {
+            label: "支払済みにする",
+            data: `action=mark_paid&payment_kind=event&payment_id=${payment.id}`,
+            displayText: "支払済みにする"
+          }
+        ])
+      ],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    await env.DB
+      .prepare(`UPDATE regular_late_participations SET reminder_sent_at = ?1, updated_at = ?1 WHERE practice_date = ?2`)
+      .bind(nowIso, practiceDate)
+      .run();
+    await env.DB
+      .prepare(`UPDATE payments SET reminder_sent_on = ?1, updated_at = ?2 WHERE id = ?3`)
+      .bind(getJstDateString(nowMs), nowIso, payment.id)
+      .run();
+    return;
+  }
+  await replyMessages(
+    event.replyToken,
+    [{ type: "text", text: formatLateParticipationRegistered(summary) }],
+    env.LINE_CHANNEL_ACCESS_TOKEN
+  );
+}
+
+async function remindRegularLateParticipations(env: Env, todayJst: string): Promise<void> {
+  const ownerLineUserId = await env.STATE.get("owner_line_user_id");
+  if (!ownerLineUserId) {
+    return;
+  }
+  const due = await env.DB
+    .prepare(
+      `SELECT l.practice_date AS practice_date, p.id AS payment_id, p.amount AS amount, p.payee AS payee, p.payment_method AS payment_method
+       FROM regular_late_participations l
+       INNER JOIN payments p ON p.id = l.payment_id
+       WHERE l.practice_date = ?1
+         AND l.reminder_sent_at IS NULL
+         AND p.status = 'unpaid'
+         AND p.voided_at IS NULL
+         AND p.rule_key = ?2`
+    )
+    .bind(todayJst, LATE_PARTICIPATION_RULE_KEY)
+    .all<{
+      practice_date: string;
+      payment_id: number;
+      amount: number | null;
+      payee: string | null;
+      payment_method: string | null;
+    }>();
+  for (const row of due.results ?? []) {
+    if (typeof row.amount !== "number" || !isConcreteText(row.payee) || !isConcreteText(row.payment_method)) {
+      continue;
+    }
+    const sentAt = new Date().toISOString();
+    const status = await pushLineMessages(
+      ownerLineUserId,
+      [
+        quickReplyMessage(
+          formatLateParticipationReminder({
+            practiceDate: row.practice_date,
+            amount: row.amount,
+            payee: row.payee,
+            paymentMethod: row.payment_method
+          }),
+          [
+            {
+              label: "支払済みにする",
+              data: `action=mark_paid&payment_kind=event&payment_id=${row.payment_id}`,
+              displayText: "支払済みにする"
+            }
+          ]
+        )
+      ],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    if (typeof status !== "number") {
+      continue;
+    }
+    await env.DB
+      .prepare(`UPDATE regular_late_participations SET reminder_sent_at = ?1, updated_at = ?1 WHERE practice_date = ?2 AND reminder_sent_at IS NULL`)
+      .bind(sentAt, row.practice_date)
+      .run();
+    await env.DB
+      .prepare(`UPDATE payments SET reminder_sent_on = ?1, updated_at = ?2 WHERE id = ?3`)
+      .bind(todayJst, sentAt, row.payment_id)
+      .run();
+  }
+}
+
 async function handleParticipationConfirmCommand(
   event: LineWebhookEvent,
   env: Env,
@@ -12763,6 +13138,11 @@ async function handleTextMessageEvent(event: LineWebhookEvent, env: Env): Promis
   const chouseisanSyncCommand = parseChouseisanSyncCommand(inputText);
   if (chouseisanSyncCommand) {
     await handleChouseisanSyncCommand(event, env, chouseisanSyncCommand);
+    return;
+  }
+  const lateParticipationDate = parseRegularLateParticipationCommand(inputText, event.timestamp ?? Date.now());
+  if (lateParticipationDate) {
+    await handleRegularLateParticipationCommand(event, env, lateParticipationDate);
     return;
   }
   const participationConfirmDate = parseParticipationConfirmCommand(inputText, event.timestamp ?? Date.now());
@@ -14344,6 +14724,8 @@ export const TEST_HOOKS = {
   handleMarkPaidPostback,
   handlePaymentReminderScheduled,
   handleMonthlyFeeReminderScheduled,
+  parseRegularLateParticipationCommand,
+  handleRegularLateParticipationCommand,
   handlePersonalSlotReminderScheduled,
   selectPersonalSlotReminders,
   resolvePersonalSlotFeeLink,
