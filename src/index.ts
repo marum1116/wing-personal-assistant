@@ -413,6 +413,8 @@ type PracticeTypeHintRecord = {
   regular: boolean;
   personal: boolean;
   updated_at: string;
+  rui_attendance?: RuiAttendStatus | "conflict";
+  occurrence_source?: "chouseisan" | "explicit_late_participation";
   sources?: {
     regular?: {
       url: string;
@@ -5944,6 +5946,12 @@ async function syncChouseisanSchedule(
   });
   const year = prefetched?.year ?? inferYearFromChouseisan(snapshot, nowMs);
   const nextDates = [...new Set(snapshot.choices.map((choice) => parseChoiceDateToYmd(choice.choice, year)).filter((value): value is string => !!value))];
+  const ruiAttendanceByDate = new Map<string, RuiAttendStatus | "conflict">();
+  if (kind === "regular") {
+    for (const day of normalizeRuiCalendarDays(snapshot, year).days) {
+      ruiAttendanceByDate.set(day.practiceDate, day.conflict ? "conflict" : day.attendance);
+    }
+  }
   console.log({
     stage: "chouseisan_parse_complete",
     kind,
@@ -5990,6 +5998,8 @@ async function syncChouseisanSchedule(
       regular: kind === "regular" ? true : existing?.regular ?? false,
       personal: kind === "personal" ? true : existing?.personal ?? false,
       updated_at: nowIso,
+      rui_attendance: kind === "regular" ? ruiAttendanceByDate.get(date) ?? existing?.rui_attendance : existing?.rui_attendance,
+      occurrence_source: existing?.occurrence_source ?? (kind === "regular" ? "chouseisan" : undefined),
       sources: {
         ...(existing?.sources ?? {}),
         ...(kind === "regular"
@@ -8008,6 +8018,35 @@ async function getPracticeByDateAndSource(
   return row ?? null;
 }
 
+function contactFieldLabel(practice: PracticeRow, raw: string | null, resolved: string): string {
+  if (practice.source === "explicit_late_participation" && !isConcreteText(raw)) {
+    return "未登録";
+  }
+  return resolved;
+}
+
+function buildLateParticipationContactBlock(
+  headerLabel: string,
+  payment: { amount: number | null; payee: string | null; payment_method: string | null } | null
+): string[] {
+  const lines = [
+    `【${headerLabel}】`,
+    "参加：追加参加",
+    "練習時間：未登録",
+    "練習場所：未登録",
+    "集合：未登録",
+    "行き：未登録",
+    "帰り：未登録"
+  ];
+  if (payment && typeof payment.amount === "number") {
+    lines.push(`追加参加分：${formatYen(payment.amount)}`);
+    const payee = isConcreteText(payment.payee) ? payment.payee : "支払先未登録";
+    const method = isConcreteText(payment.payment_method) ? payment.payment_method : "方法未登録";
+    lines.push(`→ ${payee} / ${method}`);
+  }
+  return lines;
+}
+
 function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow | null, lateParticipation = false): string[] {
   const lines: string[] = [`【${headerLabel}】`];
   if (!practice) {
@@ -8016,12 +8055,15 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
   }
   if (lateParticipation) {
     lines.push("参加：追加参加");
+    lines.push(`練習時間：${contactFieldLabel(practice, practice.practice_time, resolvePracticeTimeLabel(practice))}`);
   }
 
-  lines.push(`練習場所：${resolveContactPracticeLocation(practice)}`);
-  lines.push(`集合：${resolveContactMeetingLabel(practice)}`);
+  lines.push(`練習場所：${contactFieldLabel(practice, practice.practice_location, resolveContactPracticeLocation(practice))}`);
+  lines.push(`集合：${contactFieldLabel(practice, practice.meeting_time ?? practice.meeting_place, resolveContactMeetingLabel(practice))}`);
 
-  const outboundLabel = isConcreteTransportType(practice.outbound_type)
+  const outboundLabel = practice.source === "explicit_late_participation" && !isConcreteTransportType(practice.outbound_type)
+    ? "未登録"
+    : isConcreteTransportType(practice.outbound_type)
     ? transportToLineLabel({ type: practice.outbound_type, person: practice.outbound_person ?? null })
     : "不明";
   lines.push(`行き：${outboundLabel}`);
@@ -8030,7 +8072,9 @@ function buildRuiContactPracticeBlock(headerLabel: string, practice: PracticeRow
     lines.push(sameGradeBoysLine);
   }
 
-  const returnLabel = isConcreteTransportType(practice.return_type)
+  const returnLabel = practice.source === "explicit_late_participation" && !isConcreteTransportType(practice.return_type)
+    ? "未登録"
+    : isConcreteTransportType(practice.return_type)
     ? returnTransportLabelForLine({ type: practice.return_type, person: practice.return_person ?? null })
     : "不明";
   lines.push(`帰り：${returnLabel}`);
@@ -8135,13 +8179,28 @@ async function buildRuiContactMessages(
     const headerLabel = labels[i] ?? formatYmdWithJapaneseWeekday(practiceDate);
     const practice = await getPracticeForRuiContact(db, practiceDate);
     const lateParticipation = await db
-      .prepare(`SELECT id FROM regular_late_participations WHERE practice_date = ?1 LIMIT 1`)
+      .prepare(
+        `SELECT l.id AS id, p.amount AS amount, p.payee AS payee, p.payment_method AS payment_method
+         FROM regular_late_participations l
+         LEFT JOIN payments p ON p.id = l.payment_id
+         WHERE l.practice_date = ?1
+         LIMIT 1`
+      )
       .bind(practiceDate)
-      .first<{ id: number }>();
+      .first<{ id: number; amount: number | null; payee: string | null; payment_method: string | null }>();
     const personalBlocks = await buildPersonalRuiContactBlocks(db, practiceDate);
     const parts: string[] = [];
     if (practice) {
-      parts.push(buildRuiContactPracticeBlock(headerLabel, practice, Boolean(lateParticipation)).join("\n"));
+      const block = buildRuiContactPracticeBlock(headerLabel, practice, Boolean(lateParticipation));
+      if (lateParticipation && typeof lateParticipation.amount === "number") {
+        block.push(`追加参加分：${formatYen(lateParticipation.amount)}`);
+        const payee = isConcreteText(lateParticipation.payee) ? lateParticipation.payee : "支払先未登録";
+        const method = isConcreteText(lateParticipation.payment_method) ? lateParticipation.payment_method : "方法未登録";
+        block.push(`→ ${payee} / ${method}`);
+      }
+      parts.push(block.join("\n"));
+    } else if (lateParticipation) {
+      parts.push(buildLateParticipationContactBlock(headerLabel, lateParticipation).join("\n"));
     } else if (personalBlocks.length === 0) {
       parts.push(buildRuiContactPracticeBlock(headerLabel, null).join("\n"));
     } else {
@@ -8149,7 +8208,7 @@ async function buildRuiContactMessages(
     }
     parts.push(...personalBlocks);
     dayBlocks.push({
-      hasPlan: practice !== null || personalBlocks.length > 0,
+      hasPlan: practice !== null || lateParticipation !== null || personalBlocks.length > 0,
       text: parts.join("\n\n")
     });
   }
@@ -11611,16 +11670,7 @@ async function ensureLateParticipationPayment(
   return row.id;
 }
 
-async function handleRegularLateParticipationCommand(
-  event: LineWebhookEvent,
-  env: Env,
-  practiceDate: string
-): Promise<void> {
-  if (!event.replyToken) {
-    return;
-  }
-  const nowMs = event.timestamp ?? Date.now();
-  const nowIso = new Date(nowMs).toISOString();
+async function isKnownRegularPracticeDate(env: Env, practiceDate: string): Promise<boolean> {
   const practice = await env.DB
     .prepare(
       `SELECT practice_date
@@ -11631,10 +11681,110 @@ async function handleRegularLateParticipationCommand(
     )
     .bind(practiceDate)
     .first<{ practice_date: string }>();
-  if (!practice) {
+  if (practice) {
+    return true;
+  }
+  const hint = await loadPracticeTypeHintRecord(env, practiceDate);
+  return hint?.regular === true;
+}
+
+async function confirmExplicitRegularOccurrence(env: Env, practiceDate: string, nowIso: string): Promise<void> {
+  const existingHint = await loadPracticeTypeHintRecord(env, practiceDate);
+  const nextHint: PracticeTypeHintRecord = {
+    regular: true,
+    personal: existingHint?.personal ?? false,
+    updated_at: nowIso,
+    rui_attendance: existingHint?.rui_attendance,
+    occurrence_source: existingHint?.occurrence_source ?? "explicit_late_participation",
+    sources: existingHint?.sources
+  };
+  await savePracticeTypeHintRecord(env, practiceDate, nextHint);
+  const index = await loadPracticeTypeHintIndex(env, "regular");
+  if (!index.includes(practiceDate)) {
+    await savePracticeTypeHintIndex(env, "regular", [...index, practiceDate]);
+  }
+  await env.DB
+    .prepare(
+      `INSERT INTO practices (
+         practice_date, attendance, outbound_type, return_type, source,
+         practice_type, practice_type_basis, created_at, updated_at
+       ) VALUES (?1, '不明', '不明', '不明', 'explicit_late_participation', '通常練習', 'explicit', ?2, ?2)
+       ON CONFLICT(practice_date) DO NOTHING`
+    )
+    .bind(practiceDate, nowIso)
+    .run();
+}
+
+async function handleRegularLateParticipationPostback(
+  event: LineWebhookEvent,
+  env: Env,
+  action: string,
+  practiceDate: string | null
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  if (!practiceDate || !parseYmdAsUtcDate(practiceDate)) {
     await replyMessages(
       event.replyToken,
-      [{ type: "text", text: `${formatDateForLine(practiceDate)}の通常練習を確認できませんでした。\n日付を確認してください。` }],
+      [{ type: "text", text: "追加する通常練習の日付を確認できませんでした。" }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  if (action === "cancel_regular_late_participation") {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: `${formatDateForLine(practiceDate)}の追加参加登録をやめました。` }],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  await confirmExplicitRegularOccurrence(env, practiceDate, new Date(event.timestamp ?? Date.now()).toISOString());
+  await handleRegularLateParticipationCommand(event, env, practiceDate);
+}
+
+async function handleRegularLateParticipationCommand(
+  event: LineWebhookEvent,
+  env: Env,
+  practiceDate: string
+): Promise<void> {
+  if (!event.replyToken) {
+    return;
+  }
+  const nowMs = event.timestamp ?? Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const known = await isKnownRegularPracticeDate(env, practiceDate);
+  if (!known) {
+    await replyMessages(
+      event.replyToken,
+      [
+        quickReplyMessage(`${formatDateForLine(practiceDate)}の通常練習は、\n現在Botに登録されていません。\n\n追加された通常練習として登録しますか？`, [
+          {
+            label: "登録する",
+            data: `action=confirm_regular_late_participation&practice_date=${practiceDate}`,
+            displayText: "登録する"
+          },
+          {
+            label: "やめる",
+            data: `action=cancel_regular_late_participation&practice_date=${practiceDate}`,
+            displayText: "やめる"
+          }
+        ])
+      ],
+      env.LINE_CHANNEL_ACCESS_TOKEN
+    );
+    return;
+  }
+  const hint = await loadPracticeTypeHintRecord(env, practiceDate);
+  const existingLate = await env.DB
+    .prepare(`SELECT payment_id FROM regular_late_participations WHERE practice_date = ?1 LIMIT 1`)
+    .bind(practiceDate)
+    .first<{ payment_id: number | null }>();
+  if (hint?.rui_attendance === "circle" && !existingLate?.payment_id) {
+    await replyMessages(
+      event.replyToken,
+      [{ type: "text", text: `${formatYmdWithJapaneseWeekday(practiceDate)}は、すでに月謝対象の参加日です。` }],
       env.LINE_CHANNEL_ACCESS_TOKEN
     );
     return;
@@ -12096,6 +12246,10 @@ async function handlePostbackEvent(event: LineWebhookEvent, env: Env): Promise<v
   const postbackData = event.postback?.data ?? "";
   const params = new URLSearchParams(postbackData);
   const action = params.get("action");
+  if (action === "confirm_regular_late_participation" || action === "cancel_regular_late_participation") {
+    await handleRegularLateParticipationPostback(event, env, action, params.get("practice_date"));
+    return;
+  }
   if (action === "mark_paid") {
     await handleMarkPaidPostback(event, env, params.get("payment_id"), params.get("payment_kind"));
     return;
@@ -14726,6 +14880,7 @@ export const TEST_HOOKS = {
   handleMonthlyFeeReminderScheduled,
   parseRegularLateParticipationCommand,
   handleRegularLateParticipationCommand,
+  handleRegularLateParticipationPostback,
   handlePersonalSlotReminderScheduled,
   selectPersonalSlotReminders,
   resolvePersonalSlotFeeLink,
